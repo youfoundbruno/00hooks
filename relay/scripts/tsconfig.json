@@ -1,0 +1,20 @@
+{
+  // The idle-cost script runs under Node (type stripping), not in workerd: its own type check, with
+  // the DOM lib for fetch and WebCrypto instead of the Workers runtime types.
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": [],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": false,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "files": ["idle-cost.ts"]
+}

@@ -223,11 +223,16 @@ describe("receiving", () => {
     const dev = await newAccount();
     const { hook } = await createHook(dev, { preset: "unverified" });
     const other = await createHook(dev, { preset: "unverified" });
+    // The limiter counts in wall-clock-aligned 10 s windows: start early in one, so all 61
+    // requests land in the same window.
+    const intoWindow = Date.now() % 10_000;
+    if (intoWindow > 6_000) await new Promise((r) => setTimeout(r, 10_000 - intoWindow + 50));
     const statuses: number[] = [];
     for (let i = 0; i < 61; i++) statuses.push((await post(hook.id, `{"i":${i}}`)).status);
     expect(statuses.slice(0, 60).every((s) => s === 200)).toBe(true);
     expect(statuses[60]).toBe(429);
     const limited = await post(hook.id, "{}");
+    expect(limited.status).toBe(429);
     expect(limited.headers.get("Retry-After")).toBe("10");
     expect(await limited.json()).toMatchObject({ error: "rate_limited" });
     // Per hook: another hook on the same account is unaffected.

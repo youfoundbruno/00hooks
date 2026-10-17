@@ -13,6 +13,8 @@ export default defineConfig({
           // Test-only values; real ones come from `wrangler secret put` (see .dev.vars.example).
           SECRETS_KEY: "dGVzdC1vbmx5LWtleS10ZXN0LW9ubHkta2V5LTAwMDA=",
           HASH_PEPPER: "test-only-pepper",
+          // Signups open, whatever a local .dev.vars says (the gated case is tested explicitly).
+          SIGNUP_TOKEN: "",
           TEST_MIGRATIONS: await readD1Migrations("./migrations"),
         },
       },

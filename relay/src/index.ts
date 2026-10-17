@@ -10,11 +10,13 @@ import { receive } from "./receive.ts";
 import { ack, openStream } from "./stream.ts";
 import { VERSION } from "./version.ts";
 
+// The main module may export only handlers and Durable Object classes: workerd refuses anything
+// else (a plain constant here stops the Worker from starting).
 export { AccountObject } from "./account-object.ts";
 
-export const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 1;
 /** Management requests are small JSON; anything bigger is refused before it's hashed. */
-export const API_BODY_LIMIT = 64 * 1024;
+const API_BODY_LIMIT = 64 * 1024;
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
