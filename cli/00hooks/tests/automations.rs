@@ -110,6 +110,14 @@ automations:
     relay.push_events(1..=3);
     let child = spawn_runner(&dir);
     wait_for("two lines", || ns(&log).len() >= 2).await;
+    // Stopped with a kill below: wait for the three runs to be closed, not just acted on.
+    let finished = |dir: &Path| {
+        lines(&dir.join("runner/runs.jsonl"))
+            .iter()
+            .filter(|l| l["t"] == "end")
+            .count()
+    };
+    wait_for("three finished runs", || finished(&dir) >= 3).await;
     // A second runner for the same state folder is refused.
     let out = run(&dir, &["run"]).await;
     assert_eq!(out.status.code(), Some(1));
@@ -224,6 +232,85 @@ automations:
     );
     let out = run(&dir, &["kinds", "clear", "--all"]).await;
     assert!(text(&out.stdout).contains("Forgot 1 kind"));
+}
+
+/// Run until the process stops by itself (a test crash point), and return its stderr.
+async fn run_until_crash(home: &Path, point: &str) -> Output {
+    let home = home.to_path_buf();
+    let point = point.to_string();
+    tokio::task::spawn_blocking(move || {
+        cmd(&home)
+            .arg("run")
+            .env("HOOKS_TEST_CRASH", point)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_around_the_start_record_neither_loses_nor_repeats_an_event() {
+    let relay = MockRelay::start().await;
+    let home = TempHome::new("cli-crash");
+    let dir: PathBuf = home.0.clone();
+    relay.with(|s| s.client_home = Some(dir.clone()));
+    let out = run(&dir, &["login", "--relay", &relay.url]).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let log = dir.join("out/pushes.jsonl");
+    std::fs::write(
+        dir.join("automations.yaml"),
+        format!(
+            r#"version: 1
+notify: none
+automations:
+  - name: Every push
+    when: {{ hook: hk_1, kinds: [push] }}
+    then:
+      - write: {{ append: {}, line: {{ n: "{{{{payload.n}}}}" }} }}
+"#,
+            log.display()
+        ),
+    )
+    .unwrap();
+
+    // 1. A crash after the stream handed the event over, before the runner recorded its start.
+    //    Without the confirmed handover the stream had already marked it handed over, so it was
+    //    never run: the at-most-once gap.
+    relay.push_events(1..=1);
+    let out = run_until_crash(&dir, "after-handover").await;
+    assert_eq!(out.status.code(), Some(86), "{}", text(&out.stderr));
+    assert!(ns(&log).is_empty());
+    relay.with(|s| assert_eq!(s.acked, 1, "recorded locally, so acknowledged"));
+    // Restarted, it is handed over again and runs, once.
+    let child = spawn_runner(&dir);
+    wait_for("event 1 to run", || ns(&log) == vec![1]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stderr = stop(child);
+    assert_eq!(ns(&log), vec![1], "{stderr}");
+
+    // 2. A crash after the start record, before the action ran and before the confirm.
+    relay.push_events(2..=2);
+    let out = run_until_crash(&dir, "after-start").await;
+    assert_eq!(out.status.code(), Some(86), "{}", text(&out.stderr));
+    // Restarted, it is handed over again, found already handled, and not run twice: the run is
+    // closed as interrupted and can be replayed by hand.
+    relay.push_events(3..=3);
+    let child = spawn_runner(&dir);
+    wait_for("event 3 to run", || ns(&log) == vec![1, 3]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stderr = stop(child);
+    assert_eq!(ns(&log), vec![1, 3], "{stderr}");
+    assert!(stderr.contains("was interrupted"), "{stderr}");
+    assert!(stderr.contains("already handled"), "{stderr}");
+
+    // 3. Nothing is handed over a third time: the confirms made it to the inbox.
+    let child = spawn_runner(&dir);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let stderr = stop(child);
+    assert!(!stderr.contains("already handled"), "{stderr}");
+    assert_eq!(ns(&log), vec![1, 3]);
+    relay.with(|s| assert!(s.violations.is_empty(), "{:?}", s.violations));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

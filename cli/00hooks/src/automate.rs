@@ -126,6 +126,16 @@ fn flush(runner: &mut Runner) {
     }
 }
 
+/// Tests only (debug builds): stop the process dead at a named point, as a crash would, to prove
+/// what a crash there leaves behind: `HOOKS_TEST_CRASH=after-handover` or `after-start`. It exits
+/// at once, without running destructors or finishing anything in flight (not `abort`, so the OS
+/// files no crash report for each test run).
+fn crash_point(name: &str) {
+    if cfg!(debug_assertions) && std::env::var("HOOKS_TEST_CRASH").is_ok_and(|v| v == name) {
+        std::process::exit(86);
+    }
+}
+
 /// `00hooks run`: listen and act, until stopped.
 pub async fn run(file: Option<PathBuf>) -> CliResult {
     let ctx = Ctx::load()?;
@@ -192,7 +202,16 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
         .state
         .open_events()
         .map_err(|e| Failure::new(sentence(&e.to_string())))?;
-    let mut sub = subscribe(ctx.client.clone(), events, SubscribeOptions::default());
+    // Confirmed handover: an event counts as handed over only once the runner has recorded its
+    // start, so a crash in between hands it over again on the next start instead of losing it.
+    let mut sub = subscribe(
+        ctx.client.clone(),
+        events,
+        SubscribeOptions {
+            confirm: true,
+            ..SubscribeOptions::default()
+        },
+    );
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     #[cfg(unix)]
@@ -245,7 +264,24 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
                 });
             }
             StreamEvent::Hook(e) => {
-                let record = runner.handle(&e).await;
+                crash_point("after-handover");
+                let mut unconfirmed = None;
+                let record = runner
+                    .handle_confirming(&e, &mut |id| {
+                        crash_point("after-start");
+                        if let Err(e) = sub.confirm(id) {
+                            unconfirmed = Some(e.to_string());
+                        }
+                    })
+                    .await;
+                if let Some(why) = unconfirmed {
+                    err(format!(
+                        "Couldn't mark event {} as handled in the stream's inbox ({}); if this \
+                         runner restarts it is handed over again and found already handled.",
+                        e.id,
+                        sanitize(&why, false)
+                    ));
+                }
                 flush(&mut runner);
                 for l in describe_run(&record) {
                     err(l);

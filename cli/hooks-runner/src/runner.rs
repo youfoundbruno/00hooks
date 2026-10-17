@@ -267,8 +267,25 @@ impl Runner {
 
     /// Handle one event from the stream. Never fails: what went wrong is in the record.
     pub async fn handle(&mut self, e: &Event) -> RunRecord {
+        self.handle_confirming(e, &mut |_| {}).await
+    }
+
+    /// Handle one event from a stream subscribed with `SubscribeOptions { confirm: true }`.
+    /// `confirm` is called with the event's id once it is settled here: its run's start is
+    /// recorded (fsynced), or it was dropped as a duplicate or a loop. The caller passes it on to
+    /// `Subscription::confirm`. It isn't called when the start couldn't be recorded, so the event
+    /// stays in the stream's inbox and comes back after a restart instead of being lost.
+    ///
+    /// Together with the run log's own memory of every event that started a run, an event is run
+    /// at most once and, short of a disk that refuses writes, at least once: a crash before the
+    /// start record hands it over again; a crash after it finds it already handled.
+    pub async fn handle_confirming(
+        &mut self,
+        e: &Event,
+        confirm: &mut (dyn FnMut(&str) + Send),
+    ) -> RunRecord {
         self.reload_if_changed();
-        let rec = self.process(e, false).await;
+        let rec = self.process(e, false, confirm).await;
         if !rec.replay {
             self.count_catch_up(&rec).await;
         }
@@ -283,7 +300,7 @@ impl Runner {
                 "no recorded event {event_id}; `00hooks runs` lists the ones that can be replayed"
             ))
         })?;
-        Ok(self.process(&e, true).await)
+        Ok(self.process(&e, true, &mut |_| {}).await)
     }
 
     fn dropped(&self, e: &Event, note: String) -> RunRecord {
@@ -314,9 +331,15 @@ impl Runner {
         rec
     }
 
-    async fn process(&mut self, e: &Event, replay: bool) -> RunRecord {
+    async fn process(
+        &mut self,
+        e: &Event,
+        replay: bool,
+        confirm: &mut (dyn FnMut(&str) + Send),
+    ) -> RunRecord {
         // At least once from the relay, at most once here.
         if !replay && self.runs.seen(&e.id) {
+            confirm(&e.id);
             let rec = self.dropped(e, "already handled; not run twice".into());
             return self.finish(rec);
         }
@@ -331,6 +354,7 @@ impl Runner {
             .and_then(|h| h.trim().parse().ok())
             .unwrap_or(0);
         if header(ORIGIN_HEADER) == Some(self.opts.origin.as_str()) {
+            confirm(&e.id);
             let rec = self.dropped(
                 e,
                 "our own call coming back (00hooks-origin); dropped to prevent a loop".into(),
@@ -338,6 +362,7 @@ impl Runner {
             return self.finish(rec);
         }
         if hop > HOP_LIMIT {
+            confirm(&e.id);
             let rec = self.dropped(e, format!("it has passed through {hop} automations (more than {HOP_LIMIT}); dropped as a loop"));
             return self.finish(rec);
         }
@@ -347,7 +372,13 @@ impl Runner {
         let hook_name = self.names.get(&e.hook_id).cloned();
         let started_at = now_ms();
         let run = match self.runs.begin(e, &kind, replay) {
-            Ok(r) => r,
+            Ok(r) => {
+                // The start is on disk: from here a crash finds it handled, never runs it twice.
+                if !replay {
+                    confirm(&e.id);
+                }
+                r
+            }
             Err(err) => {
                 // Without a durable start we can't promise at most once: don't act.
                 let mut rec =

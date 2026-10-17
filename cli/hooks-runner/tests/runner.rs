@@ -871,3 +871,57 @@ automations: []
             .any(|l| l.contains("previous automations stay in force"))
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_are_confirmed_after_their_start_is_on_disk_and_replays_never() {
+    let yaml = r#"
+automations:
+  - name: Log
+    when: { hook: github, kinds: [push] }
+    then:
+      - write: { append: $DIR/log.jsonl, line: { id: "{{event.id}}" } }
+"#;
+    let mut s = setup("confirm", yaml);
+    let runs = s.dir.0.join("runner/runs.jsonl");
+    let log = s.dir.0.join("log.jsonl");
+    let e = event(1, "push", &json!({}));
+    let mut confirmed: Vec<(String, bool, usize)> = Vec::new();
+    let rec = s
+        .runner
+        .handle_confirming(&e, &mut |id| {
+            // At the confirm, the run's start is already in the run log and nothing has run yet.
+            let started = read_lines(&runs)
+                .iter()
+                .any(|l| l["t"] == "start" && l["eventId"] == id);
+            confirmed.push((id.to_string(), started, read_lines(&log).len()));
+        })
+        .await;
+    assert_eq!(rec.status, RunStatus::Ok);
+    assert_eq!(confirmed, vec![("evt_0001".to_string(), true, 0)]);
+    assert_eq!(read_lines(&log).len(), 1);
+
+    // Handed over again (a crash before the stream heard the confirm): confirmed, not run.
+    let mut again = Vec::new();
+    let rec = s
+        .runner
+        .handle_confirming(&e, &mut |id| again.push(id.to_string()))
+        .await;
+    assert_eq!(rec.status, RunStatus::Dropped);
+    assert_eq!(again, vec!["evt_0001"]);
+    assert_eq!(read_lines(&log).len(), 1);
+
+    // A loop is settled too: dropped, and confirmed so it isn't handed over again.
+    let echo = event_with(2, "push", &json!({}), true, &[("00hooks-origin", "dev_me")]);
+    let mut looped = Vec::new();
+    let rec = s
+        .runner
+        .handle_confirming(&echo, &mut |id| looped.push(id.to_string()))
+        .await;
+    assert_eq!(rec.status, RunStatus::Dropped);
+    assert_eq!(looped, vec!["evt_0002"]);
+
+    // A replay runs from the archive and confirms nothing.
+    let rec = s.runner.replay("evt_0001").await.unwrap();
+    assert!(rec.replay);
+    assert_eq!(read_lines(&log).len(), 2);
+}

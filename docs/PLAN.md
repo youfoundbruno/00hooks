@@ -283,6 +283,10 @@ AI actions:
 ### 5.3 Reliability
 
 - Every event gets a **run record**: matched automations, each action's result, timings, errors.
+- **Exactly once into the run log**: the runner takes events from the stream with a confirmed
+  handover (`SubscribeOptions { confirm: true }`) and confirms each one only after its run's start
+  record is fsynced. A crash before that hands the event over again on restart; a crash after it
+  finds the event already handled and closes the run as interrupted (replay runs it by hand).
 - **Retries** with backoff for failed actions that are safe to retry (notify, call a URL with an
   idempotency key); never for commands unless the automation says they're idempotent.
 - **Replay** any recorded event from the run history.
