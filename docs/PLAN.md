@@ -110,7 +110,7 @@ can take the WebSocket directly. The bridge:
 - sends `retry: 5000`, a first `ready` event and a final `closed {code}`;
 - shapes bursts: per-hook coalescing is *not* done (every event matters here), but a token bucket
   (50/s, burst 100) protects slow clients, and past a 256 KB backlog the stream sends one
-  `resync {through}` instead of queueing, and the CLI catches up from its cursor;
+  `resync {after}` instead of queueing, and the CLI catches up from its cursor;
 - closes with clear codes: `4401` revoked, `4408` too slow, `4409` replaced by a newer connection of
   the same device.
 

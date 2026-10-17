@@ -25,13 +25,19 @@ The canonical string is these lines joined with `\n`:
 
 ```
 00hooks-v1
-<host, lowercase, with :port when not default>
+<X-00h-Device>
+<host: exactly the Host header, lowercase, IPv6 in brackets, :port only when not the default>
 <METHOD>
 <path and query, exactly as sent>
 <X-00h-Time>
 <X-00h-Nonce>
 <hex sha256 of the raw body; of the empty string when there is none>
 ```
+
+The device id is signed so a signature can't be presented as another device's. The relay builds the
+host and path lines from the request URL it received (`new URL(request.url)`), which matches what the
+client sent because Workers don't rewrite the path or query. `POST /v1/enrolments` and
+`POST /v1/hooks/<id>/rotate` have no body, so their last line is the empty string's hash.
 
 The relay refuses (`401`, body `{"error":"…"}`, never saying which check failed in detail):
 - a time more than 300 s from its clock;
@@ -55,16 +61,18 @@ Ed25519 is deterministic, so the signature is fixed.
 |---|---|
 | private key seed (hex) | `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f` |
 | public key | `A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg` |
+| `X-00h-Device` | `dev_0123456789abcdefghjkmnpq` |
 | request | `POST https://relay.example.com/v1/hooks?limit=10` |
 | `X-00h-Time` | `1792233600000` |
 | `X-00h-Nonce` | `AAECAwQFBgcICQoLDA0ODw` (the bytes `00`…`0f`) |
 | body (exact bytes) | `{"name":"ci","verify":{"preset":"github"}}` |
 | body sha256 | `871ec9aaacf62bacee0fb97ada9c29fed342cd0d7a3a07731570385a03c17a4c` |
 
-The canonical string (seven lines, `\n` between them, no trailing newline):
+The canonical string (eight lines, `\n` between them, no trailing newline):
 
 ```
 00hooks-v1
+dev_0123456789abcdefghjkmnpq
 relay.example.com
 POST
 /v1/hooks?limit=10
@@ -74,7 +82,7 @@ AAECAwQFBgcICQoLDA0ODw
 ```
 
 `X-00h-Signature`:
-`OlQhu7X6asl-UprVxIhRjftd-Hl-KN6hOcQdDgiJlLacZL6pbTwK3-E-TOtNaqW7wOTr2QkRirJfp0O8hDOaAQ`
+`_nBVrNWhRGN_JWnxbDBmQjNFDXz5APg0zqD6eCXe7EeJptiP0-Xb1czIn-r0p9faavla1rF7dhbtotQ3OTR1DA`
 
 With no body, the last line is the hash of the empty string,
 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
@@ -144,7 +152,7 @@ stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM), never returned af
   "eventType": "pull_request",
   "contentType": "application/json",
   "headers": { "x-github-event": "pull_request", "x-github-delivery": "…" },
-  "body": "<base64 of the raw bytes>"
+  "body": "<standard base64 (RFC 4648 §4, with padding) of the raw bytes>"
 }
 ```
 
@@ -199,10 +207,14 @@ data: {…event…}
 | `4409` | a newer stream for this device replaced this one | stop (another process is listening) |
 | `1012` | the relay is restarting (deploy) | reconnect with jitter |
 
-- **Reconnecting**: on any drop without a terminal code, reconnect after `retry` plus jitter, backing
-  off to 30 s; 70 s without a byte (heartbeats included) counts as a drop. Re-sign every attempt (fresh
-  time and nonce).
+- **Reconnecting**: on any drop without a terminal code, wait a random time between half and all of
+  `min(30 s, retry × 2^attempt)`, never under 1 s, then reconnect; `attempt` resets after `ready`.
+  70 s without a byte (heartbeats included) counts as a drop. Re-sign every attempt (fresh time and
+  nonce).
 - **One stream per device**: a second stream for the same device replaces the first (`4409`).
+  *(phase 1)* a probe mode (`?probe=1`) that answers `ready` and closes without replacing the live
+  stream, for `00hooks doctor`; and per-hook delivery, so a device receives only the hooks routed to
+  it (today every device receives every hook and filters locally).
 
 How the relay serves it (informative): the Worker holds the SSE response and connects to the
 account's Durable Object over a WebSocket that the object accepts with the hibernation API, so the
