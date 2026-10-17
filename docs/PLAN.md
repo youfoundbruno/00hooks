@@ -230,11 +230,23 @@ automations can be built later by picking real fields instead of typing paths.
 
 ### 5.1 Matching
 
-An automation's **trigger** is a hook plus optional filters:
-- the provider's event type (`pull_request.opened`, `checkout.session.completed`);
-- simple conditions on fields (`payload.action == "opened"`, `payload.amount > 5000`,
-  `payload.repository.name in [...]`), in a small expression language that can't run code;
+An automation's **trigger is one or more kinds** from the catalogue (§5.0), plus optional filters:
+- **kinds**: *When GitHub sends “pull_request”*, picked from a menu of the kinds actually seen, with
+  their counts and last-seen times. Several kinds can share one automation (*“issues” or
+  “issue_comment”*), and *any kind from this hook* is a choice too. Choosing a kind that hasn't been
+  seen yet is possible by typing it, for services you're setting up now; it's marked *not seen yet*.
+- **filters on that kind's fields**, chosen from its field tree with the sample's values as hints
+  (`action is opened`, `pull_request.additions > 500`, `repository.full_name is one of [...]`), in a
+  small expression language that can't run code;
 - verified only (the default).
+
+The catalogue also gives two triggers of its own, useful with a *notify me* action:
+- **a new kind arrived** on a hook or channel (*tell me when Stripe starts sending something new*);
+- **a kind changed shape** (*tell me when GitHub's pull_request payload gains or loses fields*), so an
+  automation that depends on a field hears about it before it breaks.
+
+When a kind's shape changes, the automations and screen rules that use a field it lost are listed
+with a warning, rather than silently never matching again.
 
 ### 5.2 Actions
 
