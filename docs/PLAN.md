@@ -110,7 +110,7 @@ can take the WebSocket directly. The bridge:
 - sends `retry: 5000`, a first `ready` event and a final `closed {code}`;
 - shapes bursts: per-hook coalescing is *not* done (every event matters here), but a token bucket
   (50/s, burst 100) protects slow clients, and past a 256 KB backlog the stream sends one
-  `resync {through}` instead of queueing, and the CLI catches up from its cursor;
+  `resync {after}` instead of queueing, and the CLI catches up from its cursor;
 - closes with clear codes: `4401` revoked, `4408` too slow, `4409` replaced by a newer connection of
   the same device.
 
@@ -203,13 +203,50 @@ a self-hosted one are interchangeable.
 
 ## 5. Running automations on your machine
 
+### 5.0 The event catalogue
+
+The first time a new kind of event arrives, its structure is saved, so filters, field rules (§6a) and
+automations can be built later by picking real fields instead of typing paths.
+
+- **A kind** is the hook (or messaging channel) plus the provider's event type (`pull_request`,
+  `checkout.session.completed`), or, when there is none, the payload's shape hash (its field paths and
+  types, not values).
+- **What's kept for each kind**:
+  - its **field tree**: every path with its type (`repository.full_name: string`,
+    `pull_request.additions: number`, `labels[]: object`) and how often it's present;
+  - **one sample event**, the first one, so the builder can show real values next to each field;
+  - for short, repeating fields (status, action, currency), the **values seen**, up to 20, so a filter
+    can offer "action is one of opened / closed / reopened" as a menu;
+  - first seen, last seen and a count.
+- **Kept on your machine only**, in the runner's store (or 00next's), never at the relay. Samples and
+  seen values are content, so each kind has *Clear sample*, the whole catalogue can be cleared, and a
+  hook can be set to keep structure only (no sample, no values) for sensitive sources.
+- **Noticed, not noisy**: a new kind shows up once in the Automations screen as *New from GitHub:
+  "issues.labeled"*, with *Add an automation* and *Add a screen rule* right there, and it's marked when
+  a known kind gains or loses fields (*shape changed on 14 Oct: added `pull_request.auto_merge`*).
+- **Used everywhere a field is chosen**: the automation builder's filters, the screen's field rules,
+  and templates (`{{payload.pull_request.title}}` with autocomplete and the sample's value as a
+  preview). Filters on a field a kind no longer has are flagged instead of silently never matching.
+
 ### 5.1 Matching
 
-An automation's **trigger** is a hook plus optional filters:
-- the provider's event type (`pull_request.opened`, `checkout.session.completed`);
-- simple conditions on fields (`payload.action == "opened"`, `payload.amount > 5000`,
-  `payload.repository.name in [...]`), in a small expression language that can't run code;
+An automation's **trigger is one or more kinds** from the catalogue (§5.0), plus optional filters:
+- **kinds**: *When GitHub sends “pull_request”*, picked from a menu of the kinds actually seen, with
+  their counts and last-seen times. Several kinds can share one automation (*“issues” or
+  “issue_comment”*), and *any kind from this hook* is a choice too. Choosing a kind that hasn't been
+  seen yet is possible by typing it, for services you're setting up now; it's marked *not seen yet*.
+- **filters on that kind's fields**, chosen from its field tree with the sample's values as hints
+  (`action is opened`, `pull_request.additions > 500`, `repository.full_name is one of [...]`), in a
+  small expression language that can't run code;
 - verified only (the default).
+
+The catalogue also gives two triggers of its own, useful with a *notify me* action:
+- **a new kind arrived** on a hook or channel (*tell me when Stripe starts sending something new*);
+- **a kind changed shape** (*tell me when GitHub's pull_request payload gains or loses fields*), so an
+  automation that depends on a field hears about it before it breaks.
+
+When a kind's shape changes, the automations and screen rules that use a field it lost are listed
+with a warning, rather than silently never matching again.
 
 ### 5.2 Actions
 
@@ -309,6 +346,120 @@ messages: only replies"). Automations, messaging routes and routines pick a prof
 - **Templates**: ready-made automations (*GitHub PR → review agent*, *Stripe payment → thank-you email
   draft + notify me*, *Form submission → task*, *Uptime alert → notify me*).
 
+## 6a. The screen: a firewall for everything that comes from outside
+
+An optional firewall that decides what happens to each incoming item **before** any automation or
+agent sees it. It covers webhooks and, in 00next, incoming messages and the outside content routines
+fetch. It runs in two places, each doing what it's best at:
+
+| Where | What it does | Why there |
+|---|---|---|
+| **Edge** (the relay) | cheap, deterministic, private checks: origin, rules, rate, and fingerprints of things you blocked | drops floods and known junk before it's stored or streamed; works with sealing, because it only uses metadata and fingerprints taken during verification |
+| **Harness** (the CLI's runner, or 00next) | the same rules and similarity memory, plus an optional **AI evaluator** | sees the full content with no third party in between, can use your own models (or a local one), and is the last stop before an agent |
+
+The AI never runs at the edge: content would leave the sealed path, and the relay operator would be in
+the loop.
+
+### Verdicts
+
+Every item gets one of three verdicts:
+
+- **Pass**: delivered to automations as usual.
+- **Quarantine**: kept aside, not acted on, with a notification ("2 webhooks held for review"). From
+  the quarantine list you **Release** it (it runs now) or **Drop** it.
+- **Drop**: discarded. At the edge, the provider still gets `200` so it doesn't retry (forged
+  signatures keep their `401`); in the harness it's recorded as dropped with the reason.
+
+Each decision you make can be turned into a rule with **Always** ("always pass/quarantine/drop items
+like this") and any rule switched **Off**. Learned rules show what they matched on and when, and expire
+unless they keep matching (default 90 days).
+
+### What it looks at
+
+1. **Origin**: for webhooks, the IP, network (ASN), country and TLS fingerprint the edge sees, and
+   whether the IP is in the provider's published ranges (GitHub and Stripe publish theirs); for
+   messages, the sender, channel and whether they're a known person. An unexpected origin for a
+   provider is a signal, not a verdict, except where you make it one.
+2. **Rules**: allow and block lists (IPs, networks, countries, senders), header and field conditions
+   (`payload.sender.login in [...]`, `body size > 200 KB`), time windows, per-hook or per-channel
+   rates. Deterministic and explainable: the reason shown is the rule's name.
+3. **Similarity to what you blocked**: when you drop or quarantine something, the screen keeps a
+   fingerprint, never the content:
+   - the **shape**: a hash of the payload's field structure (keys and types, not values);
+   - the **text**: a MinHash signature of its normalised text (word 5-grams);
+   - the **origin** features above.
+
+   A new item that's close enough to a blocked one (Jaccard ≥ 0.8 by default, adjustable) gets the
+   same verdict, with the reason "similar to an item you dropped on 12 October". Fingerprints can be
+   synced to the edge *(optional)*, so repeats are dropped before they're even delivered; a MinHash
+   signature reveals almost nothing about the text it came from.
+4. **Field rules: blocking on content.** Sometimes the value is the point: a sender's address, a
+   repository, a product id, a phrase. When you drop or quarantine an item, the item opens with its
+   fields listed, and you tick the ones to block on. For each, choose how it matches:
+
+   | Match | Example | Notes |
+   |---|---|---|
+   | is | `sender.email` is `promo@deals.example` | case-folded and trimmed first |
+   | domain is | `sender.email` domain is `deals.example` | for addresses and URLs |
+   | contains | `message.text` contains `free crypto` | words, case-insensitive |
+   | pattern | `order.note` matches `/bit\.ly\/\w+/` | a regular expression, with a time limit |
+   | similar text | `message.text` is like this one | MinHash on that one field, so a long template with a changed name still matches |
+   | one of | `repository.full_name` is one of a list you keep | for allow lists too |
+
+   The fields come from the event catalogue (§5.0), so a rule can also be written before anything is
+   blocked, by picking a kind and its fields. Field rules keep the values you chose, because that is
+   what they match on. Only the ticked
+   fields' values are kept, never the rest of the item, and they stay **in the harness** (your
+   machine), shown in plain text in the rule so you can see exactly what's blocked. A rule can also
+   be pushed to the edge *(optional)*: `is`, `domain is` and `one of` go as keyed hashes (the relay
+   compares a hash of the incoming field and never stores the value), while `contains`, `pattern` and
+   `similar text` need the relay to see the words, so pushing one of those says so and asks first.
+   Rules can combine conditions (`sender.domain is X` **and** `message.text contains Y`) and say
+   *pass*, *quarantine* or *drop*, so the same tool builds allow rules ("always pass `repository`
+   one of my repos").
+5. **The AI evaluator** *(optional)*, only for items the rules and similarity didn't settle, through a
+   **Decisions API** (bounded questions with typed answers and probabilities):
+   - `verdict`: *choice* of `pass`, `quarantine`, `drop`;
+   - `injection`: *yes/no*, whether it tries to instruct an AI;
+   - `spam`: *score* from 0 to 4;
+   - `matches_purpose`: *yes/no*, whether it fits what this hook or channel is for (from the
+     automation's own description).
+
+   The item is the **state**, framed as untrusted data, plus the hook's or channel's purpose. Thresholds
+   turn probabilities into verdicts (default: drop when `drop` ≥ 0.9; quarantine when `pass` < 0.7 or
+   `injection` ≥ 0.5; otherwise pass). Verdicts are cached by fingerprint, so a repeated item isn't
+   evaluated twice.
+
+### Keeping the evaluator itself safe
+
+- It can only **answer typed questions**: it has no tools and no output that becomes an action. The
+  worst a manipulated evaluator can do is pass something, and passing never grants anything: the
+  item still meets its automation's access profile, approvals and budgets (§6.2).
+- **If it fails or times out**, the screen falls back to a per-source default (quarantine for anything
+  bound for an agent, pass for plain notifications), never to silently passing.
+- **Providers**: any Decisions endpoint (OpenRouter's, and others as they appear), any chat model through
+  a structured-output adapter, or a **local model** for full privacy. Requests to hosted models ask for
+  zero data retention and no training on the data where the provider supports it, and a model that
+  can't offer that is refused when the source is marked sensitive.
+- **Cost** is visible per source (evaluations today, and what they cost on your account), with a daily
+  cap after which items fall back to the default verdict.
+
+### Optional and paid
+
+Everything above is in the open-source code and works with your own model accounts. A hosted relay can
+offer extras as **entitlements** the server announces (never hard-coded in the clients): edge
+reputation lists (networks and fingerprints seen abusing many accounts, shared only as hashes),
+fingerprint sync across devices, longer quarantine retention and evaluator credits. Self-hosted relays
+simply don't announce them.
+
+### In 00next
+
+One **Screen** settings page per source type (webhooks, each messaging channel, routines that fetch
+outside content): on or off, the rules, the learned rules with their matches, the evaluator (model,
+thresholds, fallback, daily cap) and a **Quarantine** list shared by all of them, with Release, Drop,
+Always and a preview of the item as untrusted text. The screen runs before the access profile's
+responder is ever woken, so a dropped message costs no agent turn.
+
 ## 7. Phases
 
 | # | Phase | Exit test |
@@ -318,6 +469,7 @@ messages: only replies"). Automations, messaging routes and routines pick a prof
 | 2 | CLI `run` with plain actions, run records, retries, rate limits, service install | a Stripe test event sends a notification and appends a line to a file, at most once |
 | 3 | 00next: hooks-client in the node, Access profiles + egress broker, Automations screen, agent actions | a GitHub PR event wakes a responder agent that can reach only api.github.com and comments with an approved token, and the supervisor never ran |
 | 4 | messaging and routines use access profiles; templates; email-in hooks *(suggestion)* | an inbound Telegram message is answered by a Replier-profile agent that cannot reach any other site |
+| 5 | the screen: rules and similarity at the edge and in the harness, quarantine with Release/Drop/Always, the Decisions-API evaluator, local-model option, entitlements for hosted extras | a flood of near-identical junk is dropped at the edge after one Drop + Always; a prompt-injection message is quarantined before any agent runs; the evaluator failing quarantines instead of passing |
 
 ## 8. Decisions to make
 

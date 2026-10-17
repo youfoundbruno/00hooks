@@ -1,0 +1,32 @@
+[package]
+name = "hooks-client"
+description = "The 00hooks client library: device keys, signed requests, the event stream and a crash-safe local store."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22"
+dirs = "7"
+ed25519-dalek = "3"
+getrandom = "0.3"
+keyring = "4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["time", "macros"] }
+url = "2"
+
+[dev-dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
