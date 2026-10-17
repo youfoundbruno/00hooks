@@ -20,3 +20,6 @@ coverage/
 .vscode/*
 !.vscode/extensions.json
 *.swp
+
+# A deploy config with account-specific ids (relay/wrangler.deploy.jsonc)
+relay/wrangler.deploy.jsonc
