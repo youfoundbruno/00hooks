@@ -196,6 +196,16 @@ signature itself with the secret kept in your keychain. The relay then never see
 cost of accepting some junk at the edge. Routing at the relay only ever uses plaintext metadata (hook
 id, provider, event type), and that metadata is visible to the operator.
 
+**The local trust boundary.** Sealing ends at the device: once opened, an event is plaintext on your
+machine. The client's inbox holds opened events until they are handed over (`inbox.jsonl` in the
+state directory), and the runner keeps the newest 1,000 events (`events.jsonl`), the catalogue's
+samples and the run details under `<HOOKS_HOME>/runner/`, every file 0600 in a 0700 folder. So the
+protection at rest on your machine is the operating system's: your user account, disk encryption,
+backups you choose. Strict hooks' secrets and the sealing keys sit in the keychain (or a 0600 file).
+*(later: `--seal-at-rest`)* the runner could keep its stored events sealed to the device's own
+sealing key and open them only to run or show them, so a copy of the state folder alone reads
+nothing; the cost is a key-store access per read, and no plain `grep` through history.
+
 ### 4.5 Self-hosting
 
 `pnpm deploy` in `relay/` with your own Cloudflare account: a Worker, one Durable Object class, Rate

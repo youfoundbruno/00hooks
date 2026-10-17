@@ -8,7 +8,8 @@ and streams it to the `00hooks` CLI on your Mac or Linux machine, where it runs 
 notify you, call a URL, run an allowed command, or hand it to an AI agent that can only do what you
 allowed.
 
-> Status: planning. The design and security model are in [`docs/PLAN.md`](docs/PLAN.md).
+> Status: the relay, the CLI and the automation runner work (phases 0–2); the design and security
+> model are in [`docs/PLAN.md`](docs/PLAN.md), the wire contract in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ## Why
 
@@ -28,6 +29,23 @@ allowed.
   it: [`relay/README.md`](relay/README.md).
 - `cli/`: the `00hooks` CLI, the `hooks-client` library and the `hooks-runner` automation runner
   (Rust), also embedded by [00next](https://github.com/youfoundbruno/00next).
+
+## Hooks, keys and the audit
+
+```
+00hooks login --relay https://relay.example.com          pair this computer (signing + sealing keys)
+00hooks hooks create --name ci --preset github             the URL and, once, the secret
+00hooks hooks create --name pay --preset stripe --secret-stdin   providers that issue their own secret
+00hooks hooks create --name pay --preset stripe --strict --secret-stdin
+                                                           verify here: the relay never holds it
+00hooks hooks secret <hook> --secret-stdin                 a strict hook's secret on another computer
+00hooks devices seal-key                                   a sealing key for a login from before sealing
+00hooks keys create --name ci --scope hooks:read           an API key for CI (never the stream)
+00hooks audit                                              hooks, devices and keys changed; failures counted
+```
+
+Presets: `github`, `standard-webhooks`, `standard-webhooks-ed25519`, `stripe`, `slack`, `linear`,
+`shopify`, `twilio`, `hmac`, `token`, `unverified` (PROTOCOL §3 says what each one signs).
 
 ## Automations
 

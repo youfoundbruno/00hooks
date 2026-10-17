@@ -6,6 +6,16 @@
 //! delivery rule: **record** it in the local store, **acknowledge** it to the relay, then **hand it
 //! over**, skipping any id that was handed over before.
 //!
+//! Events arrive sealed (PROTOCOL §5). When the client has an [`crate::Opener`]
+//! ([`Client::set_opener`]), each one is checked and opened before it is recorded, so the store and
+//! the consumer only ever see opened events; one that doesn't open, or arrives unsealed, is
+//! quarantined.
+//!
+//! By default an event is marked handed-over as [`Subscription::next`] returns it (at most once to
+//! the consumer). With [`SubscribeOptions::confirm`], it is marked only when the consumer calls
+//! [`Subscription::confirm`] after recording it itself; until then it stays in the store's inbox and
+//! a restart hands it over again, with the same id (at least once; the consumer dedupes by id).
+//!
 //! An acknowledgement that fails is kept and retried with backoff while newer events keep flowing
 //! (acks are cumulative, so the next one covers it too). A `hook` message that can't be read is
 //! recorded raw in the store's quarantine and reported, never skipped silently.
@@ -36,6 +46,10 @@ pub struct SubscribeOptions {
     /// Sleeping; replaced by a fake clock in tests.
     pub clock: Arc<dyn Clock>,
     pub jitter: Jitter,
+    /// Hand over, then confirm: an event is marked handed-over only when the consumer calls
+    /// [`Subscription::confirm`] with its id (after its own durable record), not when `next`
+    /// returns it. Off by default.
+    pub confirm: bool,
 }
 
 impl Default for SubscribeOptions {
@@ -46,11 +60,15 @@ impl Default for SubscribeOptions {
             max_backoff: Duration::from_secs(30),
             clock: Arc::new(TokioClock),
             jitter: Jitter::from_entropy(),
+            confirm: false,
         }
     }
 }
 
 /// What the stream yields.
+// `Hook` is the big variant and the common one: boxing it would change the API the runner matches
+// on for one move per event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     /// Connected: the relay resumes after `after`; `head` is its newest seq.
@@ -109,6 +127,8 @@ pub struct Subscription {
     ack_failures: u32,
     /// When to retry `unacked`.
     ack_retry: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    /// The retry timer fired; the retry runs (and survives a cancelled `next`) until it completes.
+    retry_due: bool,
     then: Option<Then>,
     finished: bool,
 }
@@ -141,6 +161,7 @@ pub fn subscribe(client: Client, store: EventStore, opts: SubscribeOptions) -> S
         unacked: None,
         ack_failures: 0,
         ack_retry: None,
+        retry_due: false,
         then: None,
         finished: false,
     }
@@ -162,6 +183,23 @@ impl Subscription {
 
     pub fn into_store(self) -> EventStore {
         self.store
+    }
+
+    /// With [`SubscribeOptions::confirm`]: the consumer has durably recorded event `id`, so it is
+    /// never handed over again. Confirming an id twice, or one never handed over, does nothing harmful.
+    pub fn confirm(&mut self, id: &str) -> Result<()> {
+        self.store.mark_delivered(id)
+    }
+
+    /// Opens a `hook` event with the client's opener; without one, sealed events can't be read.
+    fn open(&self, e: Event) -> std::result::Result<Event, String> {
+        match self.client.opener() {
+            Some(op) => op.open(e),
+            None if e.sealed.is_some() => {
+                Err("the event is sealed and this client has no sealing key configured".to_string())
+            }
+            None => Ok(e),
+        }
     }
 
     fn fail(&mut self, e: Error) -> Option<Result<StreamEvent>> {
@@ -237,7 +275,9 @@ impl Subscription {
                     if self.store.is_seen(&e.id) {
                         continue;
                     }
-                    if let Err(err) = self.store.mark_delivered(&e.id) {
+                    if !self.opts.confirm
+                        && let Err(err) = self.store.mark_delivered(&e.id)
+                    {
                         return self.fail(err);
                     }
                 }
@@ -248,13 +288,26 @@ impl Subscription {
             }
 
             // 2. Acknowledge what was recorded (with anything still unacknowledged: acks are
-            //    cumulative), then release it, whether or not the relay took the ack.
-            if let Some(through) = self.ack_through.take() {
+            //    cumulative), then release it, whether or not the relay took the ack. Nothing is
+            //    cleared before the await: a `next` cancelled mid-ack (a `select!`, a timeout) leaves
+            //    the ack and its batch pending, and the next call sends it again.
+            if let Some(through) = self.ack_through {
                 let through = through.max(self.unacked.unwrap_or(0));
                 if let Err(e) = self.acknowledge(through).await {
                     return self.fail(e);
                 }
+                self.ack_through = None;
+                self.retry_due = false;
                 self.out.extend(self.awaiting_ack.drain(..));
+                continue;
+            }
+            if self.retry_due {
+                if let Some(through) = self.unacked
+                    && let Err(e) = self.acknowledge(through).await
+                {
+                    return self.fail(e);
+                }
+                self.retry_due = false;
                 continue;
             }
 
@@ -283,7 +336,7 @@ impl Subscription {
                 }
                 let cursor = self.store.cursor();
                 let last = (cursor > 0).then_some(cursor);
-                match self.client.open_stream(last).await {
+                match self.client.open_stream(last, false).await {
                     Ok(resp) => {
                         self.conn = Some(resp);
                         self.parser = SseParser::default();
@@ -318,11 +371,7 @@ impl Subscription {
                 }
                 Read::RetryAck => {
                     self.ack_retry = None;
-                    if let Some(through) = self.unacked
-                        && let Err(e) = self.acknowledge(through).await
-                    {
-                        return self.fail(e);
-                    }
+                    self.retry_due = true;
                 }
                 Read::Chunk(Ok(None)) => {
                     self.schedule_reconnect(false, "the relay closed the connection".into());
@@ -365,11 +414,31 @@ impl Subscription {
                 "ready" => match serde_json::from_str::<Ready>(&ev.data) {
                     Ok(r) => {
                         self.backoff.reset();
+                        if let Some(op) = self.client.opener() {
+                            match &r.seal_kid {
+                                None => batch.push(StreamEvent::Warning(
+                                    "the relay holds no sealing key for this device, so new \
+                                     events reach it only as gaps; run `00hooks devices seal-key`"
+                                        .into(),
+                                )),
+                                Some(kid) if !op.holds(kid) => {
+                                    batch.push(StreamEvent::Warning(format!(
+                                        "the relay seals this device's events to key {kid}, \
+                                         which this computer doesn't hold; run `00hooks devices \
+                                         seal-key`"
+                                    )))
+                                }
+                                _ => {}
+                            }
+                        }
                         batch.push(StreamEvent::Ready(r));
                     }
                     Err(e) => batch.push(warn_unreadable("ready", ev.id.as_deref(), &e)),
                 },
-                "hook" => match serde_json::from_str::<Event>(&ev.data) {
+                "hook" => match serde_json::from_str::<Event>(&ev.data)
+                    .map_err(|e| e.to_string())
+                    .and_then(|e| self.open(e))
+                {
                     Ok(e) => {
                         hooks.push(e.clone());
                         batch.push(StreamEvent::Hook(e));
@@ -383,7 +452,7 @@ impl Subscription {
                             raw_id: if seq.is_none() { ev.id.clone() } else { None },
                             event: kind.to_string(),
                             data: ev.data.clone(),
-                            error: e.to_string(),
+                            error: e,
                         };
                         let path = self.store.quarantine(&q)?;
                         quarantined_to = quarantined_to.max(seq.unwrap_or(0));
@@ -482,13 +551,11 @@ fn describe_close(c: &Closed) -> String {
     }
 }
 
-/// Open the stream, wait for `ready`, and close it, recording nothing (for `00hooks doctor`).
-///
-/// Opening a stream replaces any other stream of the same device (PROTOCOL §6, `4409`), so callers
-/// should not probe while a listener for this device is running.
+/// Probe the stream (`?probe=1`, PROTOCOL §6): the relay answers `ready` and ends, recording nothing
+/// and without replacing a listener's stream (for `00hooks doctor`).
 pub async fn probe(client: &Client, timeout: Duration) -> Result<Ready> {
     let attempt = async {
-        let mut resp = client.open_stream(None).await?;
+        let mut resp = client.open_stream(None, true).await?;
         let mut parser = SseParser::default();
         while let Some(chunk) = resp.chunk().await? {
             let items = parser

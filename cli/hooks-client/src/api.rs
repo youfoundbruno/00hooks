@@ -1,7 +1,7 @@
 //! The relay's HTTP API (PROTOCOL §2, §3, §7), with signed requests and clock-skew correction.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::{Method, StatusCode};
@@ -10,6 +10,7 @@ use serde_json::json;
 use url::Url;
 
 use crate::keys::DeviceKey;
+use crate::seal::Opener;
 use crate::signing::{new_nonce, sign_with};
 use crate::types::*;
 use crate::{Error, Result};
@@ -38,6 +39,8 @@ struct Inner {
     device: Option<(String, DeviceKey)>,
     /// Relay time minus our time, learned from a `clock_skew` refusal.
     offset_ms: AtomicI64,
+    /// Opens this device's sealed events; a subscription uses it before recording anything.
+    opener: RwLock<Option<Arc<Opener>>>,
 }
 
 enum Auth<'a> {
@@ -128,6 +131,7 @@ impl Client {
                 base: url.as_str().trim_end_matches('/').to_string(),
                 device,
                 offset_ms: AtomicI64::new(0),
+                opener: RwLock::new(None),
             }),
         })
     }
@@ -139,6 +143,16 @@ impl Client {
 
     pub fn device_id(&self) -> Option<&str> {
         self.inner.device.as_ref().map(|(id, _)| id.as_str())
+    }
+
+    /// Give the client what opens this device's sealed events (PROTOCOL §5). A [`crate::subscribe`]d
+    /// stream then hands over opened events, and refuses unsealed ones.
+    pub fn set_opener(&self, opener: Opener) {
+        *self.inner.opener.write().expect("opener lock") = Some(Arc::new(opener));
+    }
+
+    pub fn opener(&self) -> Option<Arc<Opener>> {
+        self.inner.opener.read().expect("opener lock").clone()
     }
 
     /// Relay time minus this computer's time, as learned from a `clock_skew` refusal (0 until then).
@@ -261,14 +275,19 @@ impl Client {
         self.call(Method::GET, "/v1/info", None, Auth::None).await
     }
 
-    /// `POST /v1/accounts`: a new account whose first device has `public_key`.
+    /// `POST /v1/accounts`: a new account whose first device has `public_key` (and, from
+    /// protocol 2, the sealing key `seal_key`).
     pub async fn create_account(
         &self,
         device_name: &str,
         public_key: &str,
+        seal_key: Option<&str>,
         signup_token: Option<&str>,
     ) -> Result<Joined> {
-        let body = json!({ "deviceName": device_name, "publicKey": public_key });
+        let mut body = json!({ "deviceName": device_name, "publicKey": public_key });
+        if let Some(k) = seal_key {
+            body["sealKey"] = json!(k);
+        }
         let auth = match signup_token {
             Some(t) => Auth::Bearer(t),
             None => Auth::None,
@@ -289,8 +308,12 @@ impl Client {
         code: &str,
         device_name: &str,
         public_key: &str,
+        seal_key: Option<&str>,
     ) -> Result<Joined> {
-        let body = json!({ "code": code, "deviceName": device_name, "publicKey": public_key });
+        let mut body = json!({ "code": code, "deviceName": device_name, "publicKey": public_key });
+        if let Some(k) = seal_key {
+            body["sealKey"] = json!(k);
+        }
         self.call(
             Method::POST,
             "/v1/enrolments/redeem",
@@ -317,6 +340,83 @@ impl Client {
         check_id("dev_", id)?;
         self.call_empty(Method::DELETE, &format!("/v1/devices/{id}"))
             .await
+    }
+
+    /// `PUT /v1/devices/<id>/seal-key`: this device's sealing key; returns its kid.
+    pub async fn set_seal_key(&self, seal_key: &str) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            kid: String,
+        }
+        let id = self
+            .device_id()
+            .ok_or_else(|| Error::Invalid("this request needs a device; log in first".into()))?
+            .to_string();
+        let r: R = self
+            .call(
+                Method::PUT,
+                &format!("/v1/devices/{id}/seal-key"),
+                Some(json!({ "sealKey": seal_key })),
+                Auth::Signed,
+            )
+            .await?;
+        Ok(r.kid)
+    }
+
+    /// `POST /v1/keys`: an API key; its token is in the answer only.
+    pub async fn create_key(
+        &self,
+        name: &str,
+        scopes: &[String],
+        expires_in_days: Option<u32>,
+    ) -> Result<CreatedKey> {
+        let mut body = json!({ "name": name, "scopes": scopes });
+        if let Some(d) = expires_in_days {
+            body["expiresInDays"] = json!(d);
+        }
+        self.call(Method::POST, "/v1/keys", Some(body), Auth::Signed)
+            .await
+    }
+
+    /// `GET /v1/keys`.
+    pub async fn keys(&self) -> Result<Vec<ApiKey>> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            keys: Vec<ApiKey>,
+        }
+        let r: R = self
+            .call(Method::GET, "/v1/keys", None, Auth::Signed)
+            .await?;
+        Ok(r.keys)
+    }
+
+    /// `DELETE /v1/keys/<id>`.
+    pub async fn revoke_key(&self, id: &str) -> Result<()> {
+        check_id("key_", id)?;
+        self.call_empty(Method::DELETE, &format!("/v1/keys/{id}"))
+            .await
+    }
+
+    /// `GET /v1/audit`.
+    pub async fn audit(&self, since: Option<i64>, limit: Option<u32>) -> Result<Vec<AuditEntry>> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            entries: Vec<AuditEntry>,
+        }
+        let mut q = Vec::new();
+        if let Some(s) = since {
+            q.push(format!("since={s}"));
+        }
+        if let Some(l) = limit {
+            q.push(format!("limit={l}"));
+        }
+        let path = if q.is_empty() {
+            "/v1/audit".to_string()
+        } else {
+            format!("/v1/audit?{}", q.join("&"))
+        };
+        let r: R = self.call(Method::GET, &path, None, Auth::Signed).await?;
+        Ok(r.entries)
     }
 
     /// `POST /v1/hooks`. `verify` is `{ "preset": …, …fields }`.
@@ -394,17 +494,27 @@ impl Client {
         Ok(r.acked)
     }
 
-    /// `GET /v1/stream`: the raw response, after checking it is an event stream.
+    /// `GET /v1/stream` (or, with `probe`, `?probe=1`): the raw response, after checking it is an
+    /// event stream.
     pub(crate) async fn open_stream(
         &self,
         last_event_id: Option<u64>,
+        probe: bool,
     ) -> Result<reqwest::Response> {
-        let mut extra = vec![("Accept", "text/event-stream".to_string())];
+        let mut extra = vec![
+            ("Accept", "text/event-stream".to_string()),
+            ("X-00h-Protocol", crate::PROTOCOL_VERSION.to_string()),
+        ];
         if let Some(id) = last_event_id {
             extra.push(("Last-Event-ID", id.to_string()));
         }
+        let path = if probe {
+            "/v1/stream?probe=1"
+        } else {
+            "/v1/stream"
+        };
         let resp = self
-            .send(Method::GET, "/v1/stream", None, Auth::Signed, &extra, None)
+            .send(Method::GET, path, None, Auth::Signed, &extra, None)
             .await?;
         let status = resp.status();
         if !status.is_success() {

@@ -3,9 +3,13 @@
 use std::io::{BufRead, IsTerminal};
 
 use hooks_client::api::{check_id, system_now_ms};
-use hooks_client::{Client, Config, DeviceKey, Error, KeychainStore, PROTOCOL_VERSION, StateDir};
+use hooks_client::{
+    Client, Config, DeviceKey, Error, KeychainStore, PROTOCOL_VERSION, SealKey, StateDir,
+};
 
-use crate::ctx::{CliResult, Ctx, Failure, explain, key_store, open_state, preferred_key_store};
+use crate::ctx::{
+    CliResult, Ctx, Failure, explain, key_store, open_state, preferred_key_store, sentence,
+};
 use crate::output::{date_time, sanitize, table};
 
 /// Where an enrolment code comes from: never the command line.
@@ -141,13 +145,20 @@ pub async fn login(args: Login) -> CliResult {
         })?;
     let anon = Client::new(&relay).map_err(|e| Failure::new(e.to_string()))?;
     let info = anon.info().await.map_err(|e| explain(e, &relay))?;
-    if info.protocol != PROTOCOL_VERSION {
+    if !info.serves(PROTOCOL_VERSION) {
         return Err(Failure::new(format!(
             "The relay at {relay} speaks protocol {}, and this 00hooks speaks {PROTOCOL_VERSION}. \
-             Update 00hooks.",
-            info.protocol
+             Update {}.",
+            info.protocol,
+            if info.protocol > PROTOCOL_VERSION {
+                "00hooks"
+            } else {
+                "the relay"
+            }
         )));
     }
+    // Every envelope is checked against this key from now on (PROTOCOL §2, §5).
+    let relay_key = pinnable_relay_key(&info, &relay)?;
     let joining = args.code != CodeSource::None;
     if !joining && args.signup_token.is_none() && !info.signup_open {
         return Err(Failure::new(
@@ -165,6 +176,7 @@ pub async fn login(args: Login) -> CliResult {
 
     let name = args.name.clone().unwrap_or_else(default_device_name);
     let key = DeviceKey::generate().map_err(|e| Failure::new(e.to_string()))?;
+    let seal = SealKey::generate().map_err(|e| Failure::new(e.to_string()))?;
     let key_name = random_key_name()?;
 
     // Keep the key before telling the relay about it, so a device never exists without its key.
@@ -180,21 +192,36 @@ pub async fn login(args: Login) -> CliResult {
         key.save(store.as_ref(), &key_name)
             .map_err(|e| Failure::new(format!("Couldn't save the device key: {e}.")))?;
     }
+    if let Err(e) = seal.save(store.as_ref()) {
+        let _ = store.delete(&key_name);
+        return Err(Failure::new(format!("Couldn't save the sealing key: {e}.")));
+    }
 
     let joined = match &code {
         Some(code) => {
-            anon.redeem_enrolment(code.trim(), &name, &key.public_key())
-                .await
+            anon.redeem_enrolment(
+                code.trim(),
+                &name,
+                &key.public_key(),
+                Some(&seal.public_key()),
+            )
+            .await
         }
         None => {
-            anon.create_account(&name, &key.public_key(), args.signup_token.as_deref())
-                .await
+            anon.create_account(
+                &name,
+                &key.public_key(),
+                Some(&seal.public_key()),
+                args.signup_token.as_deref(),
+            )
+            .await
         }
     };
     let joined = match joined {
         Ok(j) => j,
         Err(e) => {
             let _ = store.delete(&key_name);
+            let _ = store.delete(&SealKey::store_name(&seal.kid()));
             return Err(explain_join(e, &relay, joining));
         }
     };
@@ -213,7 +240,11 @@ pub async fn login(args: Login) -> CliResult {
                 old.device_id
             ),
         }
-        let _ = key_store(&old.key_store, &state).delete(&old.key_name);
+        let old_store = key_store(&old.key_store, &state);
+        let _ = old_store.delete(&old.key_name);
+        for kid in &old.seal_kids {
+            let _ = old_store.delete(&SealKey::store_name(kid));
+        }
     }
     state.reset().map_err(|e| Failure::new(e.to_string()))?;
     let config = Config {
@@ -223,6 +254,8 @@ pub async fn login(args: Login) -> CliResult {
         device_name: name.clone(),
         key_store: kind.to_string(),
         key_name,
+        relay_key: Some(relay_key.clone()),
+        seal_kids: vec![seal.kid()],
     };
     state
         .save_config(&config)
@@ -239,10 +272,65 @@ pub async fn login(args: Login) -> CliResult {
         joined.device_id,
         sanitize(&name, false)
     );
-    eprintln!("The device key is kept in {}.", store.describe());
+    eprintln!(
+        "The device keys are kept in {}. Events are sealed to this computer's key {}, and \
+         checked against the relay's key {relay_key}.",
+        store.describe(),
+        seal.kid()
+    );
     if info.signup_open && !joining && args.signup_token.is_none() {
         eprintln!("Note: this relay lets anyone sign up; that's meant for development only.");
     }
+    Ok(())
+}
+
+/// The relay key to pin from `/v1/info`; refuses a relay that can't sign envelopes.
+fn pinnable_relay_key(info: &hooks_client::Info, relay: &str) -> CliResult<String> {
+    let key = info.relay_key.clone().ok_or_else(|| {
+        Failure::new(format!(
+            "The relay at {relay} publishes no envelope-signing key (relayKey), so it can't \
+             seal events. Its operator needs to set RELAY_SIGNING_KEY."
+        ))
+    })?;
+    hooks_client::seal::parse_relay_key(&key)
+        .map_err(|e| Failure::new(sentence(&e.to_string())))?;
+    Ok(key)
+}
+
+/// `00hooks devices seal-key`: a new sealing key for this device (a login from before protocol 2
+/// has none), registered with the relay. Older keys stay, so events sealed to them still open.
+pub async fn devices_seal_key() -> CliResult {
+    let mut ctx = Ctx::load()?;
+    if ctx.config.relay_key.is_none() {
+        let info = ctx.client.info().await.map_err(|e| ctx.explain(e))?;
+        let key = pinnable_relay_key(&info, &ctx.config.relay)?;
+        eprintln!(
+            "This login predates sealing, so the relay's key is pinned now, as the relay \
+             reports it: {key}. Compare it with what your relay's operator publishes."
+        );
+        ctx.config.relay_key = Some(key);
+    }
+    let store = key_store(&ctx.config.key_store, &ctx.state);
+    let seal = SealKey::generate().map_err(|e| Failure::new(e.to_string()))?;
+    seal.save(store.as_ref())
+        .map_err(|e| Failure::new(format!("Couldn't save the sealing key: {e}.")))?;
+    let kid = match ctx.client.set_seal_key(&seal.public_key()).await {
+        Ok(kid) => kid,
+        Err(e) => {
+            let _ = store.delete(&SealKey::store_name(&seal.kid()));
+            return Err(ctx.explain(e));
+        }
+    };
+    if kid != seal.kid() {
+        return Err(Failure::new(
+            "The relay named the new sealing key differently than this computer does; not using it.",
+        ));
+    }
+    ctx.config.seal_kids.push(kid.clone());
+    ctx.state
+        .save_config(&ctx.config)
+        .map_err(|e| Failure::new(e.to_string()))?;
+    println!("New events are sealed to this computer's key {kid}.");
     Ok(())
 }
 
@@ -254,6 +342,7 @@ pub async fn devices_list() -> CliResult {
         "ID".into(),
         "ADDED".into(),
         "LAST SEEN".into(),
+        "SEALING KEY".into(),
     ]];
     for d in devices {
         let mut name = sanitize(&d.name, false);
@@ -267,6 +356,14 @@ pub async fn devices_list() -> CliResult {
             d.last_seen_at
                 .map(date_time)
                 .unwrap_or_else(|| "never".into()),
+            match &d.seal_kid {
+                None if d.current => "none: run `00hooks devices seal-key`".into(),
+                None => "none (gets gaps)".into(),
+                Some(k) if d.current && !ctx.config.seal_kids.contains(k) => {
+                    format!("{} (not on this computer)", sanitize(k, false))
+                }
+                Some(k) => sanitize(k, false),
+            },
         ]);
     }
     print!("{}", table(&rows));

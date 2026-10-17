@@ -467,6 +467,11 @@ every device is deleted; unacknowledged events are kept 7 days (`RETENTION_DAYS`
 which shows up as a `gap`.
 
 Clients dedupe by `id` before acting, so at-least-once delivery never runs an automation twice.
+The reference client records an event (opened) before acknowledging it, and then hands it to its
+consumer. By default it marks the event handed-over as it does (at most once to the consumer); a
+consumer that records durably itself can ask to **confirm** instead (`SubscribeOptions::confirm`,
+then `Subscription::confirm(id)` after its own record): an unconfirmed event is handed over again
+after a restart, with the same `id`, so nothing is lost between the two records.
 
 Because acks are cumulative, a client keeps an ack that failed and retries it with backoff (any later
 ack covers it too) while it goes on recording and handing over newer events in order; otherwise the
