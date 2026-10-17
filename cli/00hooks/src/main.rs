@@ -89,7 +89,7 @@ enum Cmd {
         #[arg(long, env = "HOOKS_AUTOMATIONS", value_name = "FILE")]
         automations: Option<PathBuf>,
     },
-    /// Check automations.yaml.
+    /// Check automations.yaml, or resume an automation the circuit breaker paused.
     Automations {
         #[command(subcommand)]
         cmd: AutomationsCmd,
