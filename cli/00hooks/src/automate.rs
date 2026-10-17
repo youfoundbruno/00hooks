@@ -300,7 +300,7 @@ pub fn check(file: Option<PathBuf>, strict: bool) -> CliResult {
     let path = automations_path(file)?;
     if !path.exists() {
         return Err(Failure::new(format!(
-            "{} doesn't exist. Create it (see `00hooks automations check --help`), or pass --automations.",
+            "{} doesn't exist. Create it (the README's Automations section has an example), or pass --automations.",
             path.display()
         )));
     }

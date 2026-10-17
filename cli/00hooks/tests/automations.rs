@@ -95,7 +95,11 @@ automations:
 
     let out = run(&dir, &["automations", "check"]).await;
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(text(&out.stdout).contains("1 automation, valid."), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stdout).contains("1 automation, valid."),
+        "{}",
+        text(&out.stdout)
+    );
     assert!(
         text(&out.stdout).contains("the kind \"push\" hasn't been seen yet"),
         "{}",
@@ -109,13 +113,23 @@ automations:
     // A second runner for the same state folder is refused.
     let out = run(&dir, &["run"]).await;
     assert_eq!(out.status.code(), Some(1));
-    assert!(text(&out.stderr).contains("already running"), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("already running"),
+        "{}",
+        text(&out.stderr)
+    );
     let stderr = stop(child);
     assert_eq!(ns(&log), vec![2, 3], "{stderr}");
-    assert!(stderr.contains("Connected. 3 events are waiting"), "{stderr}");
+    assert!(
+        stderr.contains("Connected. 3 events are waiting"),
+        "{stderr}"
+    );
     assert!(stderr.contains("New kind: hk_1/push"), "{stderr}");
     assert!(stderr.contains("hk_1/push  evt_0002  1 ran"), "{stderr}");
-    assert!(stderr.contains("Big pushes\" skipped: only_if is false"), "{stderr}");
+    assert!(
+        stderr.contains("Big pushes\" skipped: only_if is false"),
+        "{stderr}"
+    );
     relay.with(|s| {
         assert!(s.violations.is_empty(), "{:?}", s.violations);
         assert_eq!(s.acked, 3);
@@ -132,10 +146,16 @@ automations:
     // The catalogue.
     let out = run(&dir, &["kinds"]).await;
     let t = text(&out.stdout);
-    assert!(t.contains("KIND") && t.contains("hk_1/push") && t.contains("  4  "), "{t}");
+    assert!(
+        t.contains("KIND") && t.contains("hk_1/push") && t.contains("  4  "),
+        "{t}"
+    );
     let out = run(&dir, &["kinds", "show", "push"]).await;
     let t = text(&out.stdout);
-    assert!(t.contains("payload.n") && t.contains("number") && t.contains("4/4"), "{t}");
+    assert!(
+        t.contains("payload.n") && t.contains("number") && t.contains("4/4"),
+        "{t}"
+    );
     assert!(t.contains("headers.x-github-event"), "{t}");
     assert!(t.contains("1, 2, 3, 4"), "values seen: {t}");
     let out = run(&dir, &["kinds", "show", "nope"]).await;
@@ -151,17 +171,27 @@ automations:
     let out = run(&dir, &["automations", "check", "--strict"]).await;
     assert_eq!(out.status.code(), Some(1));
     let t = text(&out.stdout);
-    assert!(t.contains("line 6:") && t.contains("`payload.size` isn't a field of hk_1/push"), "{t}");
+    assert!(
+        t.contains("line 6:") && t.contains("`payload.size` isn't a field of hk_1/push"),
+        "{t}"
+    );
     assert!(!t.contains("hasn't been seen yet"), "{t}");
     std::fs::write(dir.join("automations.yaml"), &yaml).unwrap();
 
     // Runs, and a replay in this process (no runner is running).
     let out = run(&dir, &["runs", "--event", "evt_0003"]).await;
     let t = text(&out.stdout);
-    assert!(t.contains("evt_0003  1 ran") && t.contains("write ok"), "{t}");
+    assert!(
+        t.contains("evt_0003  1 ran") && t.contains("write ok"),
+        "{t}"
+    );
     let out = run(&dir, &["replay", "evt_0003"]).await;
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(text(&out.stdout).contains("evt_0003 (replay)  1 ran"), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stdout).contains("evt_0003 (replay)  1 ran"),
+        "{}",
+        text(&out.stdout)
+    );
     assert_eq!(ns(&log), vec![2, 3, 4, 3]);
 
     // A replay asked of a running runner goes through it.
@@ -169,18 +199,29 @@ automations:
     tokio::time::sleep(Duration::from_millis(500)).await;
     let out = run(&dir, &["replay", "2"]).await;
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(text(&out.stderr).contains("Asked the running runner"), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("Asked the running runner"),
+        "{}",
+        text(&out.stderr)
+    );
     let stderr = stop(child);
     assert_eq!(ns(&log), vec![2, 3, 4, 3, 2], "{stderr}");
     let out = run(&dir, &["replay", "evt_nope"]).await;
-    assert!(text(&out.stderr).contains("No recorded event"), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("No recorded event"),
+        "{}",
+        text(&out.stderr)
+    );
 
     // Clearing a kind's sample keeps its structure.
     let out = run(&dir, &["kinds", "clear", "hk_1/push"]).await;
     assert!(out.status.success(), "{}", text(&out.stderr));
     let out = run(&dir, &["kinds", "show", "push", "--json"]).await;
     let k: serde_json::Value = serde_json::from_str(text(&out.stdout).trim()).unwrap();
-    assert!(k.get("sample").is_none() && k["fields"]["payload.n"].get("values").is_none(), "{k}");
+    assert!(
+        k.get("sample").is_none() && k["fields"]["payload.n"].get("values").is_none(),
+        "{k}"
+    );
     let out = run(&dir, &["kinds", "clear", "--all"]).await;
     assert!(text(&out.stdout).contains("Forgot 1 kind"));
 }
@@ -200,7 +241,12 @@ async fn a_broken_file_stops_the_runner_with_its_lines() {
         let out = run(&dir, args).await;
         assert_eq!(out.status.code(), Some(1));
         let e = text(&out.stderr);
-        assert!(e.contains("has 1 problem") && e.contains("line 5:") && e.contains("did you mean `notify`"), "{e}");
+        assert!(
+            e.contains("has 1 problem")
+                && e.contains("line 5:")
+                && e.contains("did you mean `notify`"),
+            "{e}"
+        );
     }
 }
 
@@ -213,11 +259,23 @@ async fn service_files_and_secrets() {
     let t = text(&out.stdout);
     let home_s = dir.display().to_string();
     if cfg!(target_os = "macos") {
-        assert!(t.contains("<string>run</string>") && t.contains("<key>RunAtLoad</key>"), "{t}");
-        assert!(t.contains(&format!("<string>{home_s}/logs/runner.log</string>")), "{t}");
+        assert!(
+            t.contains("<string>run</string>") && t.contains("<key>RunAtLoad</key>"),
+            "{t}"
+        );
+        assert!(
+            t.contains(&format!("<string>{home_s}/logs/runner.log</string>")),
+            "{t}"
+        );
     } else {
-        assert!(t.contains(" run\n") && t.contains("WantedBy=default.target"), "{t}");
-        assert!(t.contains(&format!("append:{home_s}/logs/runner.log")), "{t}");
+        assert!(
+            t.contains(" run\n") && t.contains("WantedBy=default.target"),
+            "{t}"
+        );
+        assert!(
+            t.contains(&format!("append:{home_s}/logs/runner.log")),
+            "{t}"
+        );
     }
     assert!(t.contains(&home_s), "HOOKS_HOME is passed on: {t}");
 
@@ -233,7 +291,10 @@ async fn service_files_and_secrets() {
     child.stdin.take().unwrap().write_all(b"tok-123\n").unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(!text(&out.stdout).contains("tok-123"), "the value is never echoed");
+    assert!(
+        !text(&out.stdout).contains("tok-123"),
+        "the value is never echoed"
+    );
     let file = dir.join("runner/secrets/API_TOKEN");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "tok-123");
     let out = run(&dir, &["secrets", "delete", "API_TOKEN"]).await;

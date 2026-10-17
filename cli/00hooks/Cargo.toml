@@ -23,6 +23,8 @@ tokio = { version = "1", features = ["rt", "macros", "signal", "sync", "time"] }
 
 [dev-dependencies]
 hmac = "0.13"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.11"
 base64 = "0.22"
 bytes = "1"
