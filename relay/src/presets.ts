@@ -250,7 +250,10 @@ async function verifyToken(config: VerifyConfig, secrets: string[], d: Delivery)
   return { ok: true, verified: true, dedupeKeys: [], eventType: null };
 }
 
-const COMMON_HEADERS = ["content-type", "user-agent"];
+// `00hooks-origin` and `00hooks-hop` are what a 00hooks runner puts on its own outbound calls, so
+// it can recognise its own call coming back and stop loops (PLAN §5.3). Like every kept header, they
+// are the sender's claim; the runner only ever *drops* on them.
+const COMMON_HEADERS = ["content-type", "user-agent", "00hooks-origin", "00hooks-hop"];
 // Signature headers are never kept: once verified they are no use to a reader, and a stored
 // signature next to its body is a ready-made replay.
 const PRESET_HEADERS: Record<Preset, string[]> = {
