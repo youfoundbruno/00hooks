@@ -1,12 +1,13 @@
-// Receiving a webhook (PROTOCOL §4): cheap checks, rate limit, verify over the raw bytes, then dedupe
-// and append in one Durable Object transaction.
+// Receiving a webhook (PROTOCOL §4): cheap checks, rate limit, verify over the raw bytes, then seal,
+// dedupe and append in the account's Durable Object.
 
 import { accountStub } from "./auth.ts";
 import { isId } from "./encoding.ts";
 import { error, json, notFound, readLimited, tooLarge, unavailable } from "./http.ts";
 import { currentSecrets, type HookRow } from "./hooks.ts";
 import { clientKey } from "./ip.ts";
-import { keptHeaders, verifyDelivery, type VerifyConfig } from "./presets.ts";
+import { pepperedHash } from "./seal.ts";
+import { handshakeAnswer, keptHeaders, strictHeaders, verifyDelivery, type VerifyConfig } from "./presets.ts";
 
 /** The Rate Limiting bindings' period (wrangler.jsonc): what `Retry-After` says. */
 export const RATE_LIMIT_PERIOD_S = 10;
@@ -18,7 +19,8 @@ const slowDown = (message: string) =>
 
 export async function receive(request: Request, env: Env, ctx: ExecutionContext, hookId: string): Promise<Response> {
   // Fail closed: without its rate limits the relay would take any flood at full cost.
-  if (!env.HOOK_LIMIT || !env.RECEIVE_IP_LIMIT) return unavailable();
+  // …and without its signing key it couldn't seal what it takes.
+  if (!env.HOOK_LIMIT || !env.RECEIVE_IP_LIMIT || !env.RELAY_SIGNING_KEY) return unavailable();
   if (!isId("hk", hookId)) return notFound();
   // Per client address (IPv6 by /64), before the D1 lookup, so guessing hook ids costs the guesser
   // their budget and not the relay a database read each.
@@ -41,21 +43,35 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
 
   const now = Date.now();
   const config = JSON.parse(hook.verify) as VerifyConfig;
-  const verdict = await verifyDelivery(config, await currentSecrets(env, hook, now), { body, headers: request.headers, now });
+  // The URL as the sender reached it: Workers don't rewrite it, and Twilio signs it.
+  const url = request.url;
+  const verdict = await verifyDelivery(config, await currentSecrets(env, hook, now), { body, headers: request.headers, now, url });
   const stub = accountStub(env, hook.account_id);
   if (!verdict.ok) {
     ctx.waitUntil(stub.recordFailure(hookId).catch(() => {}));
     return error(401, "signature", "The delivery's signature doesn't verify.");
   }
+  // An endpoint check (Slack's url_verification) is answered, not stored: it carries no event.
+  const handshake = handshakeAnswer(config, body);
+  if (handshake) return handshake;
 
+  const strict = config.strict === true;
+  // Marks are stored as keyed hashes: a delivery id or an event id read from the body is content
+  // too, and storage keeps none in the clear.
+  const dedupeKeys = await Promise.all(verdict.dedupeKeys.map((k) => pepperedHash(env.HASH_PEPPER, `dedupe:${hookId}:${k}`)));
   const result = await stub.append({
     hookId,
-    dedupeKeys: verdict.dedupeKeys,
+    dedupeKeys,
     verified: verdict.verified,
+    strict,
     preset: config.preset,
     eventType: verdict.eventType,
-    contentType: request.headers.get("content-type")?.slice(0, 200) ?? null,
-    headers: keptHeaders(config, request.headers),
+    content: {
+      contentType: request.headers.get("content-type")?.slice(0, 200) ?? null,
+      // A strict hook seals the signature headers and the URL too: its devices verify.
+      headers: strict ? strictHeaders(config, request.headers) : keptHeaders(config, request.headers),
+      ...(strict ? { url } : {}),
+    },
     body,
     receivedAt: now,
   });

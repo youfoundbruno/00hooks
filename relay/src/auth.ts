@@ -19,9 +19,26 @@ export const CLOCK_WINDOW_MS = 300_000;
 /** `lastSeenAt` is refreshed at most this often, so reads don't each cost a write. */
 const LAST_SEEN_EVERY_MS = 60_000;
 
+/** A signed request from a device: it may do everything its account may. */
 export interface Caller {
   accountId: string;
   deviceId: string;
+}
+
+/**
+ * Who made a management request: a device (signed), or an API key (PROTOCOL §9) limited to its
+ * scopes. `actor` is the device or key id the audit log names.
+ */
+export interface Principal {
+  accountId: string;
+  /** Null for an API key. */
+  deviceId: string | null;
+  keyId: string | null;
+  actor: string;
+}
+
+export function deviceAsPrincipal(c: Caller): Principal {
+  return { accountId: c.accountId, deviceId: c.deviceId, keyId: null, actor: c.deviceId };
 }
 
 export function accountStub(env: Env, accountId: string): DurableObjectStub<AccountObject> {

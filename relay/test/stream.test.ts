@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { MAX_FRAME_BYTES, type AccountObject } from "../src/account-object.ts";
 import { MAX_BODY_BYTES_LIMIT } from "../src/hooks.ts";
 import { signRequest } from "../src/canonical.ts";
-import { fromBase64, utf8 } from "../src/encoding.ts";
+import { utf8 } from "../src/encoding.ts";
 import {
   BASE,
   accountObject,
@@ -15,9 +15,11 @@ import {
   enrolDevice,
   fetchRelay,
   newAccount,
+  openEvent,
   openStream,
   signed,
   type SseReader,
+  type StreamedEvent,
 } from "./helpers.ts";
 
 async function ready(sse: SseReader) {
@@ -51,7 +53,7 @@ describe("stream", () => {
     expect(res.headers.get("Content-Type")).toBe("text/event-stream");
     expect(res.headers.get("Cache-Control")).toBe("no-cache, no-transform");
     expect(res.headers.get("X-Accel-Buffering")).toBe("no");
-    expect(await ready(sse)).toEqual({ accountId: dev.accountId, deviceId: dev.deviceId, after: 0, head: 0 });
+    expect(await ready(sse)).toEqual({ protocol: 2, sealKid: dev.seal!.kid, accountId: dev.accountId, deviceId: dev.deviceId, after: 0, head: 0 });
     await sse.cancel();
   });
 
@@ -109,10 +111,10 @@ describe("stream", () => {
         hookId: hook.id,
         dedupeKeys: [],
         verified: false,
+        strict: false,
         preset: "unverified",
         eventType: null,
-        contentType: null,
-        headers: {},
+        content: { contentType: null, headers: {} },
         body: big,
         receivedAt: Date.now(),
       });
@@ -129,7 +131,7 @@ describe("stream", () => {
 
   it("refuses a replayed stream request (GET spends the nonce)", async () => {
     const dev = await newAccount();
-    const headers = await signRequest(dev, "GET", `${BASE}/v1/stream`);
+    const headers = { ...(await signRequest(dev, "GET", `${BASE}/v1/stream`)), "X-00h-Protocol": "2" };
     const first = await fetchRelay("/v1/stream", { headers });
     expect(first.status).toBe(200);
     await first.body!.cancel();
@@ -199,8 +201,8 @@ describe("large events", () => {
     // The whole frame is far under Cloudflare's 32 MiB WebSocket message limit.
     expect(f!.data!.length).toBeGreaterThan(2_446_000);
     expect(f!.data!.length).toBeLessThan(MAX_FRAME_BYTES / 10);
-    const ev = data<{ seq: number; body: string }>(f);
-    const got = fromBase64(ev.body)!;
+    const ev = data<StreamedEvent>(f);
+    const got = (await openEvent(dev, ev)).body;
     expect(got.byteLength).toBe(MAX_BODY_BYTES_LIMIT);
     expect(got.slice(0, 64)).toEqual(body.slice(0, 64));
     expect(got.slice(-64)).toEqual(body.slice(-64));
@@ -224,8 +226,8 @@ describe("large events", () => {
         verified: false,
         preset: "unverified",
         eventType: null,
-        contentType: null,
-        headers: {},
+        strict: false,
+        content: { contentType: null, headers: {} },
         body: utf8("z".repeat(bytes)),
         receivedAt: Date.now(),
       });

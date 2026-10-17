@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { AccountObject } from "../src/account-object.ts";
 import { receive } from "../src/receive.ts";
 import { hmac, toBase64, toHex, utf8, fromBase64 } from "../src/encoding.ts";
-import { BASE, accountObject, createHook, deliver, fetchRelay, newAccount, openStream, data, signed } from "./helpers.ts";
+import { BASE, accountObject, createHook, deliver, fetchRelay, newAccount, openEvent, openStream, data, signed, type StreamedEvent } from "./helpers.ts";
 
 async function githubSign(secret: string, body: string): Promise<string> {
   return `sha256=${toHex(await hmac("SHA-256", utf8(secret), utf8(body)))}`;
@@ -157,11 +157,17 @@ describe("receiving", () => {
 
     const { sse } = await openStream(dev);
     await sse.nextEvent(); // ready
-    const ev = data(await sse.nextEvent());
-    expect(ev).toMatchObject({ seq: 1, id: received, hookId: hook.id, verified: true, preset: "github", eventType: "ping", contentType: "application/json" });
-    expect(new TextDecoder().decode(fromBase64(ev.body as string)!)).toBe(body);
+    const ev = data<StreamedEvent>(await sse.nextEvent());
+    expect(ev).toMatchObject({ seq: 1, id: received, hookId: hook.id, verified: true, strict: false, preset: "github", eventType: "ping" });
+    // Content is sealed: no body, headers or content type in the clear.
+    expect(ev).not.toHaveProperty("body");
+    expect(ev).not.toHaveProperty("headers");
+    expect(ev).not.toHaveProperty("contentType");
+    const opened = await openEvent(dev, ev);
+    expect(opened.text).toBe(body);
+    expect(opened.contentType).toBe("application/json");
     // The signature is never kept: next to its body it would be a ready-made replay.
-    expect(ev.headers).toEqual({
+    expect(opened.headers).toEqual({
       "content-type": "application/json",
       "x-github-event": "ping",
       "x-github-delivery": "11111111-2222-3333-4444-555555555555",
@@ -313,11 +319,12 @@ describe("receiving", () => {
     expect((await stub.stats()).usage).toEqual({ events: 0, bytes: 0 });
     expect((await post(hook.id, '{"n":3}')).status).toBe(200);
 
-    // Bytes count too (body plus headers).
+    // Bytes count too.
     await runInDurableObject(stub, (o: AccountObject) => {
-      o.quotaOverride = { events: 100, bytes: 300 };
+      o.quotaOverride = { events: 100, bytes: 1000 };
     });
-    expect((await post(hook.id, "x".repeat(400))).status).toBe(429);
+    // Bytes are what is stored: the sealed envelope (content plus headers, sealed) and its overhead.
+    expect((await post(hook.id, "x".repeat(1000))).status).toBe(429);
     expect((await post(hook.id, "x".repeat(50))).status).toBe(200);
   });
 });

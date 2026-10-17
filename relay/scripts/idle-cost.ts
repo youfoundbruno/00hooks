@@ -67,6 +67,8 @@ async function hold(relay: string, i: number, key: DeviceKey, signal: AbortSigna
     const url = `${relay}/v1/stream`;
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
+      // Idle streams carry no events, so no sealing key is needed; the protocol still has to match.
+      "X-00h-Protocol": "2",
       ...(await signRequest(key, "GET", url, undefined, { time: Date.now() + skewMs })),
     };
     if (lastEventId) headers["Last-Event-ID"] = lastEventId;

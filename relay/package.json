@@ -1,6 +1,6 @@
 {
   "name": "@00hooks/relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p scripts/tsconfig.json",
     "types": "wrangler types --env-interface Env src/worker-configuration.d.ts",
     "idle-cost": "node scripts/idle-cost.ts",
-    "migrate:local": "wrangler d1 migrations apply DB --local"
+    "migrate:local": "wrangler d1 migrations apply DB --local",
+    "seal-interop": "node scripts/seal-interop.ts --fixture"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.3.6",
@@ -19,5 +20,10 @@
     "typescript": "5.9.3",
     "vitest": "4.1.11",
     "wrangler": "4.147.0"
+  },
+  "dependencies": {
+    "@hpke/chacha20poly1305": "1.8.0",
+    "@hpke/core": "1.9.0",
+    "@hpke/dhkem-x25519": "1.8.0"
   }
 }

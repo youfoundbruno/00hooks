@@ -10,8 +10,9 @@ instructions and a tightly limited set of permissions.
 It's a standalone open-source project (Apache-2.0). 00next bundles it as its **Automations** feature,
 and anyone can use the CLI on its own or run their own relay.
 
-Status: **planned**. Sections marked *(suggestion)* go beyond the original brief and are open for a
-decision.
+Status: phases 0 and 1 are built (the relay, the CLI's `login`/`devices`/`hooks`/`keys`/`audit`/
+`listen`, presets, sealing, API keys and the audit); the rest is planned. Sections marked
+*(suggestion)* go beyond the original brief and are open for a decision.
 
 ---
 
@@ -41,7 +42,7 @@ Three rules hold it together:
    service (or that you explicitly marked as unverified), and it never acts on them. Everything that
    *does* something happens on your machine, under rules you set there.
 2. **The relay can't read your events.** Each event is sealed to your devices' public keys right after
-   it's verified. The relay stores and forwards ciphertext. *(suggestion: on by default)*
+   it's verified. The relay stores and forwards ciphertext. Always on since protocol 2.
 3. **Webhook content is data, never instructions.** No field of a payload is ever interpolated into a
    shell, a file path or an agent's instructions. Agents see payloads as quoted, untrusted data, and act
    only within their access profile.
@@ -171,16 +172,17 @@ with an overlap window so the old and new secrets both work for a set time.
   needs either an existing approved device to approve it (a short code, like a TV sign-in) or a
   one-time enrolment token from the dashboard. Requests are signed (a short-lived token minted from a
   signed challenge), so no long-lived secret crosses the network.
-- **API keys** (`hk_…`) are for management and CI only: shown once, stored as a salted SHA-256 hash,
-  scoped (`hooks:read`, `hooks:write`, `events:read`, `devices:write`), with an expiry. An API key can
-  never open the stream.
+- **API keys** (`hk_…`) are for management and CI only: shown once, stored as a salted hash keyed
+  with `HASH_PEPPER`, scoped (`hooks:read`, `hooks:write`, `events:read`, `devices:write`, and
+  `audit:read`), with an expiry. An API key can never open the stream, enrol a device, set a
+  sealing key or make more keys (PROTOCOL §9).
 - **Audit**: hook created or deleted, secret rotated, device added or revoked, key created or used,
   verification failures (counted per hour). Names and ids only.
 
-### 4.4 Sealing *(suggestion: on by default)*
+### 4.4 Sealing (always on; PROTOCOL §5)
 
-Each device publishes its X25519 public key when it pairs. After verification the Worker seals the
-body and kept headers with HPKE (RFC 9180, DHKEM-X25519, HKDF-SHA256, ChaCha20-Poly1305) once per
+Each device publishes its X25519 public key when it pairs. After verification the relay (the
+account's Durable Object, so the sequence number is known) seals the body and kept headers with HPKE (RFC 9180, DHKEM-X25519, HKDF-SHA256, ChaCha20-Poly1305) once per
 allowed device, with the hook id, sequence number and event id as associated data (so stored
 ciphertexts can't be spliced or reordered) and the device key's id in the envelope (so keys can
 rotate), then forgets the plaintext. The relay also signs each envelope with its own Ed25519 key, so
@@ -197,8 +199,8 @@ id, provider, event type), and that metadata is visible to the operator.
 ### 4.5 Self-hosting
 
 `pnpm deploy` in `relay/` with your own Cloudflare account: a Worker, one Durable Object class, Rate
-Limiting bindings, two secrets (`SECRETS_KEY` for encrypting hook secrets, `HASH_PEPPER` for key
-hashes). No other services. The CLI and 00next take the relay URL as a setting, so a hosted relay and
+Limiting bindings, three secrets (`SECRETS_KEY` for encrypting hook secrets, `HASH_PEPPER` for key
+hashes, `RELAY_SIGNING_KEY` for signing sealed envelopes). No other services. The CLI and 00next take the relay URL as a setting, so a hosted relay and
 a self-hosted one are interchangeable.
 
 ## 5. Running automations on your machine

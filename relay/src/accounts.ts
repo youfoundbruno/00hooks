@@ -1,8 +1,9 @@
 // Accounts, devices and enrolments (PROTOCOL §2).
 
-import { accountStub, type Caller } from "./auth.ts";
+import { accountStub, type Caller, type Principal } from "./auth.ts";
 import { importPublicKey } from "./canonical.ts";
 import { constantTimeEqualStrings, newId, randomBytes } from "./encoding.ts";
+import { parseSealKey, sealKid, sealTo } from "./envelope.ts";
 import { HttpError, error, invalid, json, notFound, parseJsonObject, unavailable } from "./http.ts";
 import { clientKey } from "./ip.ts";
 import { pepperedHash } from "./seal.ts";
@@ -28,13 +29,41 @@ async function publicKey(env: Env, v: unknown): Promise<string> {
   return v;
 }
 
-/** Inserts the device in D1, then registers it with the account's object. */
-async function addDevice(env: Env, accountId: string, name: string, key: string, now: number): Promise<string> {
+/** A device's sealing key (PROTOCOL §2): optional, so a client that has none can still join. */
+async function sealKeyField(v: unknown): Promise<{ text: string; raw: Uint8Array; kid: string } | null> {
+  if (v === undefined || v === null) return null;
+  const raw = parseSealKey(v);
+  const bad = () => new HttpError(invalid("sealKey", "sealKey must be a raw X25519 public key in base64url."));
+  if (!raw) throw bad();
+  // A trial seal: a low-order point (whose shared secret is all zeros) is refused here, not at the
+  // first delivery.
+  try {
+    await sealTo(raw, new Uint8Array(0), new Uint8Array(0));
+  } catch {
+    throw bad();
+  }
+  return { text: v as string, raw, kid: await sealKid(raw) };
+}
+
+/** Inserts the device in D1, then registers it (and its sealing key) with the account's object. */
+async function addDevice(
+  env: Env,
+  accountId: string,
+  name: string,
+  key: string,
+  seal: { text: string; raw: Uint8Array; kid: string } | null,
+  now: number,
+  actor: string | null,
+): Promise<string> {
   const deviceId = newId("dev");
-  await env.DB.prepare("INSERT INTO devices (id, account_id, name, public_key, created_at) VALUES (?, ?, ?, ?, ?)")
-    .bind(deviceId, accountId, name, key, now)
+  await env.DB.prepare(
+    "INSERT INTO devices (id, account_id, name, public_key, created_at, seal_key, seal_kid) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  )
+    .bind(deviceId, accountId, name, key, now, seal?.text ?? null, seal?.kid ?? null)
     .run();
-  await accountStub(env, accountId).addDevice(deviceId);
+  const stub = accountStub(env, accountId);
+  await stub.addDevice(deviceId, seal ? { key: seal.raw, kid: seal.kid } : undefined);
+  await stub.audit({ kind: "device.added", actor: actor ?? deviceId, subject: deviceId, name });
   return deviceId;
 }
 
@@ -48,10 +77,11 @@ export async function createAccount(request: Request, env: Env, body: Uint8Array
   const input = parseJsonObject(body);
   const name = deviceName(input.deviceName);
   const key = await publicKey(env, input.publicKey);
+  const seal = await sealKeyField(input.sealKey);
   const now = Date.now();
   const accountId = newId("acc");
   await env.DB.prepare("INSERT INTO accounts (id, created_at) VALUES (?, ?)").bind(accountId, now).run();
-  const deviceId = await addDevice(env, accountId, name, key, now);
+  const deviceId = await addDevice(env, accountId, name, key, seal, now, null);
   return json({ accountId, deviceId }, 201);
 }
 
@@ -122,6 +152,7 @@ export async function redeemEnrolment(request: Request, env: Env, body: Uint8Arr
   const input = parseJsonObject(body);
   const name = deviceName(input.deviceName);
   const key = await publicKey(env, input.publicKey);
+  const seal = await sealKeyField(input.sealKey);
   const code = typeof input.code === "string" ? normalizeCode(input.code) : null;
 
   const now = Date.now();
@@ -131,25 +162,26 @@ export async function redeemEnrolment(request: Request, env: Env, body: Uint8Arr
 
   const redeemed = code
     ? await env.DB.prepare(
-        "UPDATE enrolments SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ? RETURNING account_id",
+        "UPDATE enrolments SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ? RETURNING account_id, created_by",
       )
         .bind(now, await pepperedHash(env.HASH_PEPPER, `enrol:${code}`), now)
-        .first<{ account_id: string }>()
+        .first<{ account_id: string; created_by: string }>()
     : null;
   if (!redeemed) return error(401, "unauthorized", "That enrolment code isn't valid, or has expired.");
 
   // A right code doesn't count against the address.
   await env.DB.prepare("UPDATE enrolment_failures SET failures = max(failures - 1, 0) WHERE ip_hash = ?").bind(ipHash).run();
-  const deviceId = await addDevice(env, redeemed.account_id, name, key, now);
+  // The audit names the device that issued the code as the one that added this device.
+  const deviceId = await addDevice(env, redeemed.account_id, name, key, seal, now, redeemed.created_by);
   return json({ accountId: redeemed.account_id, deviceId });
 }
 
-export async function listDevices(env: Env, caller: Caller): Promise<Response> {
+export async function listDevices(env: Env, caller: Principal): Promise<Response> {
   const { results } = await env.DB.prepare(
-    "SELECT id, name, created_at, last_seen_at FROM devices WHERE account_id = ? AND revoked_at IS NULL ORDER BY created_at, id",
+    "SELECT id, name, created_at, last_seen_at, seal_kid FROM devices WHERE account_id = ? AND revoked_at IS NULL ORDER BY created_at, id",
   )
     .bind(caller.accountId)
-    .all<{ id: string; name: string; created_at: number; last_seen_at: number | null }>();
+    .all<{ id: string; name: string; created_at: number; last_seen_at: number | null; seal_kid: string | null }>();
   return json({
     devices: results.map((d) => ({
       id: d.id,
@@ -157,8 +189,27 @@ export async function listDevices(env: Env, caller: Caller): Promise<Response> {
       createdAt: d.created_at,
       lastSeenAt: d.last_seen_at,
       current: d.id === caller.deviceId,
+      sealKid: d.seal_kid,
     })),
   });
+}
+
+/**
+ * `PUT /v1/devices/<id>/seal-key`: a device sets (or replaces) its own sealing key. Only the device
+ * itself may: a key set by anyone else would let them read what is sealed to it.
+ */
+export async function putSealKey(env: Env, caller: Caller, deviceId: string, body: Uint8Array): Promise<Response> {
+  if (deviceId !== caller.deviceId) {
+    return error(403, "forbidden", "A device can set only its own sealing key.");
+  }
+  const input = parseJsonObject(body);
+  const seal = await sealKeyField(input.sealKey);
+  if (!seal) throw new HttpError(invalid("sealKey", "sealKey must be a raw X25519 public key in base64url."));
+  await env.DB.prepare("UPDATE devices SET seal_key = ?, seal_kid = ? WHERE id = ?").bind(seal.text, seal.kid, deviceId).run();
+  const stub = accountStub(env, caller.accountId);
+  await stub.setSealKey(deviceId, seal.raw, seal.kid);
+  await stub.audit({ kind: "device.seal_key", actor: deviceId, subject: deviceId, name: seal.kid });
+  return json({ kid: seal.kid });
 }
 
 /**
@@ -166,13 +217,15 @@ export async function listDevices(env: Env, caller: Caller): Promise<Response> {
  * device's nonces and closes its stream with 4401), so it is told first, every time, even when D1
  * already says revoked: a retry after a failure part-way always finishes the job.
  */
-export async function revokeDevice(env: Env, caller: Caller, deviceId: string): Promise<Response> {
-  const device = await env.DB.prepare("SELECT 1 AS x FROM devices WHERE id = ? AND account_id = ?")
+export async function revokeDevice(env: Env, caller: Principal, deviceId: string): Promise<Response> {
+  const device = await env.DB.prepare("SELECT name, revoked_at FROM devices WHERE id = ? AND account_id = ?")
     .bind(deviceId, caller.accountId)
-    .first();
+    .first<{ name: string; revoked_at: number | null }>();
   if (!device) return notFound();
-  await accountStub(env, caller.accountId).revokeDevice(deviceId);
+  const stub = accountStub(env, caller.accountId);
+  await stub.revokeDevice(deviceId);
   await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").bind(Date.now(), deviceId).run();
+  if (device.revoked_at === null) await stub.audit({ kind: "device.revoked", actor: caller.actor, subject: deviceId, name: device.name });
   return new Response(null, { status: 204 });
 }
 
