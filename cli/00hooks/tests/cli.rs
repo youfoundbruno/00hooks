@@ -418,6 +418,7 @@ fn the_screen_commands_work_on_this_computer() {
         consequential: true,
         purpose: None,
         summary: "order from shop".into(),
+        text: None,
     };
     let d: Decision = serde_json::from_value(
         serde_json::json!({"verdict": "quarantine", "by": "rule", "reason": "doubtful"}),

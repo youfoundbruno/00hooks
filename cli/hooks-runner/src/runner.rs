@@ -417,6 +417,7 @@ impl Runner {
             purpose: (!names.is_empty())
                 .then(|| format!("events for these automations: {}", names.join("; "))),
             summary: crate::text::cut(&crate::text::sanitize(&format!("{kind} from {hook}")), 120),
+            text: None,
         }
     }
 

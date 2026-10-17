@@ -313,7 +313,7 @@ pub fn cache_key(item: &Item) -> String {
     h.update([0]);
     h.update(crate::shape::shape_hash(&item.payload));
     h.update([0]);
-    h.update(crate::text::item_text(&item.payload));
+    h.update(item.similarity_text());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 

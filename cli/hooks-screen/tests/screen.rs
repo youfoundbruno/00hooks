@@ -57,6 +57,7 @@ fn item(payload: Value) -> Item {
         consequential: true,
         purpose: None,
         summary: "orders/create from Shop".into(),
+        text: None,
     }
 }
 

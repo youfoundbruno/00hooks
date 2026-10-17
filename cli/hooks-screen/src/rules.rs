@@ -562,7 +562,7 @@ impl View {
 
     pub fn text(&mut self, item: &Item) -> Option<&Signature> {
         self.text
-            .get_or_insert_with(|| Signature::of_text(&crate::text::item_text(&item.payload)))
+            .get_or_insert_with(|| Signature::of_text(&item.similarity_text()))
             .as_ref()
     }
 
@@ -649,7 +649,7 @@ fn field_holds(t: &FieldTest, v: &str) -> bool {
 
 /// The fingerprint of an item, as a similarity condition: its shape, and its text when it has any.
 pub fn fingerprint(item: &Item) -> Condition {
-    let text = Signature::of_text(&crate::text::item_text(&item.payload)).map(|s| s.encode());
+    let text = Signature::of_text(&item.similarity_text()).map(|s| s.encode());
     Condition::Similar {
         shape: Some(crate::shape::shape_hash(&item.payload)),
         text,

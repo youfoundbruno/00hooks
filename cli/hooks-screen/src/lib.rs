@@ -147,6 +147,20 @@ pub struct Item {
     /// The item in a few words, for the quarantine list ("pull_request from GitHub").
     #[serde(default)]
     pub summary: String,
+    /// What similarity reads, when it isn't every string of the payload: a message's own text,
+    /// so the same template from another sender still counts as the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl Item {
+    /// The text its fingerprint is taken from: `text` when set, else every string of the payload.
+    pub fn similarity_text(&self) -> String {
+        match &self.text {
+            Some(t) => t.clone(),
+            None => text::item_text(&self.payload),
+        }
+    }
 }
 
 fn yes() -> bool {
