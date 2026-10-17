@@ -77,6 +77,9 @@ pub struct State {
     pub revocations: Vec<(String, String)>,
     /// The enrolment code `POST /v1/enrolments/redeem` accepts.
     pub enrolment_code: Option<String>,
+    /// When set, `POST /v1/accounts` needs `Authorization: Bearer <this>` (`/v1/info` still says
+    /// signups are open, as a relay that misreports would).
+    pub signup_token: Option<String>,
     next_device: usize,
 }
 
@@ -252,6 +255,17 @@ async fn handle(st: Arc<Mutex<State>>, req: Request<Incoming>) -> Result<Resp, I
                 json!({ "version": "mock", "protocol": 1, "signupOpen": true,
                         "serverTime": now_ms() + offset }),
             )
+        }
+        ("POST", "/v1/accounts")
+            if st.lock().unwrap().signup_token.as_ref().is_some_and(|t| {
+                parts
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    != Some(format!("Bearer {t}").as_str())
+            }) =>
+        {
+            unauthorized("unauthorized", None)
         }
         ("POST", "/v1/accounts") => {
             let v: Value = serde_json::from_slice(&body).unwrap_or_default();

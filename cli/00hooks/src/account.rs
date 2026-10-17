@@ -98,6 +98,23 @@ fn random_key_name() -> CliResult<String> {
     Ok(format!("device-{safe}"))
 }
 
+/// A refused account creation or redemption. A `401` there is never about this device (it doesn't
+/// exist yet): it is the signup token, or the enrolment code.
+fn explain_join(e: Error, relay: &str, joining: bool) -> Failure {
+    match &e {
+        Error::Api {
+            status: 401, code, ..
+        } if code != "clock_skew" => Failure::new(if joining {
+            "That enrolment code is wrong, used or expired. Run `00hooks devices add` on a \
+             computer that's logged in for a new one."
+        } else {
+            "This relay needs a signup token to create an account. Pass --signup-token or set \
+             HOOKS_SIGNUP_TOKEN."
+        }),
+        _ => explain(e, relay),
+    }
+}
+
 pub async fn login(args: Login) -> CliResult {
     let state = open_state()?;
     let existing = state
@@ -178,7 +195,7 @@ pub async fn login(args: Login) -> CliResult {
         Ok(j) => j,
         Err(e) => {
             let _ = store.delete(&key_name);
-            return Err(explain(e, &relay));
+            return Err(explain_join(e, &relay, joining));
         }
     };
     check_id("dev_", &joined.device_id).map_err(|e| Failure::new(e.to_string()))?;
@@ -313,4 +330,42 @@ pub fn confirm(question: &str) -> CliResult<bool> {
 /// Whether this platform has a usable keychain (for `doctor`).
 pub fn keychain_available() -> bool {
     KeychainStore::available()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(status: u16, code: &str) -> Error {
+        Error::Api {
+            status,
+            code: code.into(),
+            message: "Signing up on this relay needs its signup token.".into(),
+            field: None,
+        }
+    }
+
+    #[test]
+    fn a_refused_signup_asks_for_the_token_not_a_new_login() {
+        let f = explain_join(refused(401, "unauthorized"), "https://r.example", false);
+        assert!(f.message.contains("signup token"), "{f}");
+        assert!(f.message.contains("HOOKS_SIGNUP_TOKEN"), "{f}");
+        assert!(!f.message.contains("--force"), "{f}");
+        assert!(!f.message.contains("revoked"), "{f}");
+    }
+
+    #[test]
+    fn a_refused_redemption_says_the_code_is_wrong() {
+        let f = explain_join(refused(401, "unauthorized"), "https://r.example", true);
+        assert!(f.message.contains("code is wrong, used or expired"), "{f}");
+        assert!(!f.message.contains("--force"), "{f}");
+    }
+
+    #[test]
+    fn other_refusals_keep_their_explanation() {
+        let f = explain_join(refused(429, "rate_limited"), "https://r.example", true);
+        assert!(f.message.contains("refused the request"), "{f}");
+        let f = explain_join(Error::Network("down".into()), "https://r.example", false);
+        assert!(f.message.contains("Couldn't reach"), "{f}");
+    }
 }
