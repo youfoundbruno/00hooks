@@ -1,11 +1,15 @@
 //! `00hooks`: webhooks from anywhere, delivered to this computer.
 
 mod account;
+mod automate;
 mod ctx;
 mod doctor;
 mod hooks;
 mod listen;
 mod output;
+mod service;
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -79,6 +83,113 @@ enum Cmd {
     },
     /// Check the key, the clock, the relay and the stream.
     Doctor,
+    /// Listen and run automations from automations.yaml, until stopped.
+    Run {
+        /// The automations file (default: ~/.config/00hooks/automations.yaml).
+        #[arg(long, env = "HOOKS_AUTOMATIONS", value_name = "FILE")]
+        automations: Option<PathBuf>,
+    },
+    /// Check automations.yaml.
+    Automations {
+        #[command(subcommand)]
+        cmd: AutomationsCmd,
+    },
+    /// The event catalogue: every kind of event seen, with its fields.
+    Kinds {
+        #[command(subcommand)]
+        cmd: Option<KindsCmd>,
+        /// One JSON line per kind.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recent automation runs.
+    Runs {
+        /// How many (the newest).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Only the runs of this event (id or seq), with every action's result.
+        #[arg(long)]
+        event: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a recorded event again (by id or seq), against the current automations.
+    Replay {
+        event: String,
+        #[arg(long, env = "HOOKS_AUTOMATIONS", value_name = "FILE")]
+        automations: Option<PathBuf>,
+    },
+    /// Run `00hooks run` at login (launchd on macOS, systemd --user on Linux).
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+    /// Secrets that a call's headers use as {{secret.NAME}}, kept in the keychain.
+    Secrets {
+        #[command(subcommand)]
+        cmd: SecretsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutomationsCmd {
+    /// Validate the file, and check its kinds and fields against the event catalogue.
+    Check {
+        #[arg(long, env = "HOOKS_AUTOMATIONS", value_name = "FILE")]
+        automations: Option<PathBuf>,
+        /// Fail on warnings too.
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Lift the pause the circuit breaker put on an automation.
+    Resume { name: String },
+}
+
+#[derive(Subcommand)]
+enum KindsCmd {
+    /// List the kinds (the default).
+    List,
+    /// One kind's field tree, with sample values and the values seen.
+    Show {
+        /// hook/kind (hook name or id), or a kind only one hook has.
+        kind: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear one kind's sample and values seen, or forget every kind.
+    Clear {
+        kind: Option<String>,
+        /// Forget every kind: structure, samples and values.
+        #[arg(long, conflicts_with = "kind")]
+        all: bool,
+        /// Forget this kind entirely instead of only its sample and values.
+        #[arg(long, requires = "kind")]
+        forget: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Install and start the service.
+    Install {
+        #[arg(long, env = "HOOKS_AUTOMATIONS", value_name = "FILE")]
+        automations: Option<PathBuf>,
+        /// Print the service file instead of installing it.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Stop and remove the service.
+    Uninstall,
+    /// Whether it's installed and running.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum SecretsCmd {
+    /// Save a secret; the value is read from stdin (pipe it in).
+    Set { name: String },
+    /// Delete a secret.
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -222,6 +333,30 @@ async fn dispatch(cmd: Cmd) -> CliResult {
         },
         Cmd::Listen { json, hooks } => listen::run(json, hooks).await,
         Cmd::Doctor => doctor::run().await,
+        Cmd::Run { automations } => automate::run(automations).await,
+        Cmd::Automations { cmd } => match cmd {
+            AutomationsCmd::Check {
+                automations,
+                strict,
+            } => automate::check(automations, strict),
+            AutomationsCmd::Resume { name } => automate::resume(name),
+        },
+        Cmd::Kinds { cmd, json } => match cmd.unwrap_or(KindsCmd::List) {
+            KindsCmd::List => automate::kinds(json),
+            KindsCmd::Show { kind, json: j } => automate::kinds_show(kind, json || j),
+            KindsCmd::Clear { kind, all, forget } => automate::kinds_clear(kind, all, forget),
+        },
+        Cmd::Runs { limit, event, json } => automate::runs(limit, event, json),
+        Cmd::Replay { event, automations } => automate::replay(event, automations).await,
+        Cmd::Service { cmd } => match cmd {
+            ServiceCmd::Install { automations, print } => service::install(automations, print),
+            ServiceCmd::Uninstall => service::uninstall(),
+            ServiceCmd::Status => service::status(),
+        },
+        Cmd::Secrets { cmd } => match cmd {
+            SecretsCmd::Set { name } => automate::secrets_set(name),
+            SecretsCmd::Delete { name } => automate::secrets_delete(name),
+        },
     }
 }
 
