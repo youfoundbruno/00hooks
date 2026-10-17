@@ -99,6 +99,9 @@ With no body, the last line is the hash of the empty string,
   Five wrong codes from one IP in 10 minutes block that IP for 10 minutes.
 - `GET /v1/devices` (signed) → `{ "devices": [{ "id", "name", "createdAt", "lastSeenAt", "current" }] }`
 - `DELETE /v1/devices/<id>` (signed): revokes it; its open stream closes at once with `4401`.
+- `POST /v1/enrolments` and `/redeem` answer `200`; a wrong, used or expired code answers `401`
+  `unauthorized`. A newly enrolled device **starts at the head** of the log: it doesn't receive the
+  older backlog and doesn't hold it back from deletion.
 - `GET /v1/info` (unsigned) → `{ "version", "protocol": 1, "signupOpen": bool, "serverTime" }`.
 
 ## 3. Hooks
@@ -120,9 +123,13 @@ With no body, the last line is the hash of the empty string,
 |---|---|---|
 | `github` | `secret`? (generated when absent) | `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(body)>`; dedupe on `X-GitHub-Delivery`; answers `ping` events with `200` |
 | `standard-webhooks` | `secret`? (`whsec_` + base64, generated when absent) | Standard Webhooks v1 HMAC over `id.timestamp.body`, timestamp within 300 s, dedupe on `webhook-id` |
-| `hmac` | `header`, `algorithm` (`sha256`/`sha1`), `encoding` (`hex`/`base64`), `prefix`? (e.g. `sha256=`), `secret`? | HMAC of the raw body; dedupe on a body hash |
-| `token` | `header` (default `Authorization`), `secret`? | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength |
-| `unverified` | — | accepts anything; events carry `verified: false` |
+| `hmac` | `header` (required), `algorithm` (`sha256` default, or `sha1`), `encoding` (`hex` default, or `base64`), `prefix`? (e.g. `sha256=`), `secret`? | HMAC of the raw body; dedupe on a body hash |
+| `token` | `header` (default `Authorization`), `secret`? | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength; **no dedupe** (nothing identifies a delivery) |
+| `unverified` | — | accepts anything; events carry `verified: false`; **no dedupe** |
+
+GitHub's `ping` (sent when a webhook is created) is verified, deduped and stored as a normal event
+with `eventType: "ping"`, so a new hook can be tested end to end. `maxBodyBytes` is at most
+1,835,008 in phase 0 (bodies live in 2 MB SQLite rows; larger ones move to R2 in a later phase).
 
 Stripe, Slack, Linear, Shopify, Twilio and Ed25519 Standard Webhooks follow in phase 1. Secrets are
 stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM), never returned after creation.
@@ -131,9 +138,10 @@ stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM), never returned af
 
 `POST /h/<hookId>` (also PUT and PATCH). In order:
 
-1. Unknown or disabled hook → `404`. Body larger than the hook's `maxBodyBytes` (default 1 MiB) →
-   `413` (checked from `Content-Length` first, then while reading).
-2. Rate limit per hook (60 requests per 10 s by default) → `429` with `Retry-After`.
+1. Unknown or disabled hook → `404`. Body declared larger than the hook's `maxBodyBytes` (default
+   1 MiB) in `Content-Length` → `413`.
+2. Rate limit per hook (60 requests per 10 s by default) → `429` with `Retry-After`. Only then is the
+   body read, and a body that turns out larger than the limit while streaming → `413`.
 3. Verify with the preset → `401` `{"error":"signature"}` on failure (counted, not stored).
 4. Dedupe → a duplicate answers `200` `{"duplicate":true}` and is not stored again.
 5. Append to the account log, in one Durable Object transaction with the dedupe mark → `200`
@@ -192,12 +200,14 @@ data: {…event…}
 - **Where it starts**: after `max(Last-Event-ID, this device's acknowledged seq)`. `ready.after` says
   which; `ready.head` is the newest seq in the log.
 - **Gaps**: when events after that point were already dropped by retention, a `gap` event comes before
-  the next `hook`: `event: gap` `data: {"from": 12, "to": 30, "reason": "retention"}` (inclusive range
-  of lost seqs).
+  the next `hook`: `id: 30` `event: gap` `data: {"from": 12, "to": 30, "reason": "retention"}`
+  (inclusive range of lost seqs; the `id` is `to`, so a resume starts after the gap).
+- `Last-Event-ID` beyond the head is clamped to the head; one that isn't a number answers `400`
+  `invalid`.
 - **Heartbeat**: a comment line `: hb` every 15 s.
 - **Backpressure**: when more than 256 KiB is waiting to be written, the relay stops queueing and, once
-  the client drains, sends `event: resync` `data: {"after": <last seq written>}`; the client reconnects
-  with that `Last-Event-ID`. A client that reads nothing for 60 s is closed with `4408`.
+  the client drains, sends `event: resync` `data: {"after": <last seq written>}` and **ends the stream**
+  (no `closed` event); the client reconnects at once with that `Last-Event-ID`. A client that reads nothing for 60 s is closed with `4408`.
 - **Closing**: before closing, the relay sends `event: closed` `data: {"code": <code>, "reason": "…"}`:
 
 | code | meaning | client should |
@@ -218,7 +228,9 @@ data: {…event…}
 
 How the relay serves it (informative): the Worker holds the SSE response and connects to the
 account's Durable Object over a WebSocket that the object accepts with the hibernation API, so the
-object costs nothing while idle. Clients see only SSE.
+object costs nothing while idle. The Worker pings every 30 s (answered by the object's auto-response
+without waking it) and closes the stream with `1012` when no pong arrives for 75 s. Clients see only
+SSE.
 
 ## 7. Acknowledging
 
@@ -233,4 +245,4 @@ Clients dedupe by `id` before acting, so at-least-once delivery never runs an au
 
 Every error body is `{ "error": "<code>", "message": "<one plain sentence>" }`. Codes: `unauthorized`,
 `clock_skew`, `not_found`, `too_large`, `rate_limited`, `signature`, `invalid` (with `field`),
-`conflict`. Messages never contain secrets, signatures or payload content.
+`conflict`, `internal` (a `500`; the relay logs the cause, never the payload). Messages never contain secrets, signatures or payload content.
