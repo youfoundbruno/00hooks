@@ -1,6 +1,8 @@
 //! `00hooks`: webhooks from anywhere, delivered to this computer.
 
 mod account;
+mod apikeys;
+mod audit;
 mod automate;
 mod ctx;
 mod doctor;
@@ -71,6 +73,20 @@ enum Cmd {
     Hooks {
         #[command(subcommand)]
         cmd: HooksCmd,
+    },
+    /// Create, list or revoke API keys (for management and CI; never the stream).
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
+    /// What happened on the account: hooks, devices and keys changed, keys used, signatures
+    /// refused. Names and ids only.
+    Audit {
+        /// At most this many entries (newest first; default 100).
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        json: bool,
     },
     /// Stream events to the terminal.
     Listen {
@@ -205,6 +221,32 @@ enum DevicesCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Give this computer a new sealing key (a login from before sealing has none).
+    SealKey,
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Create a key; prints its token once.
+    Create {
+        #[arg(long)]
+        name: String,
+        /// What the key may do; repeat for several.
+        #[arg(long = "scope", value_enum, required = true)]
+        scopes: Vec<apikeys::Scope>,
+        /// Days until it expires (1 to 365; default 90).
+        #[arg(long)]
+        expires_in_days: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the keys (never their tokens).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a key: it stops working at once.
+    Revoke { id: String },
 }
 
 #[derive(Subcommand)]
@@ -229,10 +271,28 @@ enum HooksCmd {
         #[arg(long)]
         prefix: Option<String>,
         /// Read the sender's existing secret from stdin instead of letting the relay generate one.
+        /// Required for stripe, slack, linear, shopify and twilio, which issue their own.
         #[arg(long)]
         secret_stdin: bool,
+        /// standard-webhooks-ed25519: the sender's public key (whpk_…). Not a secret.
+        #[arg(long)]
+        public_key: Option<String>,
+        /// Verify on this computer: the secret never goes to the relay, which checks only the
+        /// signature header's shape and timestamp. Other computers need the secret too
+        /// (`00hooks hooks secret`).
+        #[arg(long)]
+        strict: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Keep a strict hook's secret on this computer (from stdin), so it can verify its events.
+    Secret {
+        hook: String,
+        #[arg(long, conflicts_with = "public_key")]
+        secret_stdin: bool,
+        /// standard-webhooks-ed25519: the sender's public key.
+        #[arg(long)]
+        public_key: Option<String>,
     },
     /// List hooks.
     List {
@@ -298,7 +358,19 @@ async fn dispatch(cmd: Cmd) -> CliResult {
             DevicesCmd::List => account::devices_list().await,
             DevicesCmd::Add => account::devices_add().await,
             DevicesCmd::Revoke { id, yes } => account::devices_revoke(id, yes).await,
+            DevicesCmd::SealKey => account::devices_seal_key().await,
         },
+        Cmd::Keys { cmd } => match cmd {
+            KeysCmd::Create {
+                name,
+                scopes,
+                expires_in_days,
+                json,
+            } => apikeys::create(name, scopes, expires_in_days, json).await,
+            KeysCmd::List { json } => apikeys::list(json).await,
+            KeysCmd::Revoke { id } => apikeys::revoke(id).await,
+        },
+        Cmd::Audit { limit, json } => audit::run(limit, json).await,
         Cmd::Hooks { cmd } => match cmd {
             HooksCmd::Create {
                 name,
@@ -308,6 +380,8 @@ async fn dispatch(cmd: Cmd) -> CliResult {
                 encoding,
                 prefix,
                 secret_stdin,
+                public_key,
+                strict,
                 json,
             } => {
                 let secret = if secret_stdin {
@@ -321,8 +395,22 @@ async fn dispatch(cmd: Cmd) -> CliResult {
                     encoding,
                     prefix,
                     secret,
+                    public_key,
+                    strict,
                 };
                 hooks::create(name, preset, args, json).await
+            }
+            HooksCmd::Secret {
+                hook,
+                secret_stdin,
+                public_key,
+            } => {
+                let secret = if secret_stdin {
+                    Some(hooks::read_secret_stdin()?)
+                } else {
+                    None
+                };
+                hooks::secret(hook, secret, public_key).await
             }
             HooksCmd::List { json } => hooks::list(json).await,
             HooksCmd::Show { hook, json } => hooks::show(hook, json).await,

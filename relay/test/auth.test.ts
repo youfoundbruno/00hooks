@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import worker from "../src/index.ts";
 import { bodyHash, canonicalString, generateDeviceKey, importPublicKey, newNonce, signRequest } from "../src/canonical.ts";
 import { fromBase64, fromHex, toBase64, utf8 } from "../src/encoding.ts";
-import { BASE, enrolDevice, fetchRelay, newAccount, signed } from "./helpers.ts";
+import { BASE, RELAY_PUBLIC_KEY, enrolDevice, fetchRelay, newAccount, signed } from "./helpers.ts";
 
 describe("canonical string", () => {
   // PROTOCOL §1's example: both the relay and the CLI test against it.
@@ -191,7 +191,7 @@ describe("/v1/info and signups", () => {
   it("reports the version, protocol and whether signups are open", async () => {
     const res = await fetchRelay("/v1/info");
     const info = (await res.json()) as Record<string, unknown>;
-    expect(info).toMatchObject({ protocol: 1, signupOpen: true });
+    expect(info).toMatchObject({ protocol: 2, protocols: [2], signupOpen: true, relayKey: RELAY_PUBLIC_KEY });
     expect(info.version).toBeTypeOf("string");
     expect(info.serverTime).toBeTypeOf("number");
   });

@@ -1,8 +1,9 @@
 # 00hooks relay
 
 The relay half of 00hooks: a Cloudflare Worker and one Durable Object class. Webhooks arrive at
-`/h/<hook id>`; the relay verifies them over the raw bytes, dedupes them, appends them to the
-account's ordered log, and streams them to the account's devices over SSE, resumably. The contract
+`/h/<hook id>`; the relay verifies them over the raw bytes, dedupes them, seals them to each of the
+account's devices (HPKE, signed by the relay), appends them to the account's ordered log, and streams
+them to the devices over SSE, resumably. The contract
 with clients is [`docs/PROTOCOL.md`](../docs/PROTOCOL.md); the design and the security model are in
 [`docs/PLAN.md`](../docs/PLAN.md).
 
@@ -13,19 +14,21 @@ CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hiber
                                                        WebSocket
 ```
 
-- `src/index.ts`: routes. `src/auth.ts`: signed requests. `src/accounts.ts`: accounts, devices,
-  enrolments. `src/hooks.ts`: the hook API. `src/presets.ts`: verification presets.
-  `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE bridge.
-  `src/account-object.ts`: the Durable Object. `migrations/`: the D1 schema.
-- Phase 0 stores payloads in plain text in the object's SQLite; sealing them to device keys is
-  phase 1 (PLAN §4.4).
+- `src/index.ts`: routes. `src/auth.ts`: signed requests. `src/keys.ts`: API keys.
+  `src/accounts.ts`: accounts, devices, enrolments, sealing keys. `src/hooks.ts`: the hook API.
+  `src/presets.ts`: the preset table and its interpreter. `src/envelope.ts`: sealing and the relay's
+  envelope signature. `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE
+  bridge. `src/audit.ts`: the audit log and events list. `src/account-object.ts`: the Durable
+  Object. `migrations/`: the D1 schema.
+- `scripts/seal-interop.ts` seals events with `src/envelope.ts` under Node, for the CLI's interop
+  tests (`fixtures/seal-interop.v1.json`).
 
 ## Develop
 
 From the repository root (a pnpm workspace; `pnpm install` once):
 
 ```sh
-cp relay/.dev.vars.example relay/.dev.vars    # then fill in the two secrets
+cp relay/.dev.vars.example relay/.dev.vars    # then fill in the three secrets
 pnpm --filter ./relay exec wrangler d1 migrations apply 00hooks --local
 pnpm --filter ./relay dev                     # http://localhost:8787, all local
 pnpm --filter ./relay test                    # vitest inside workerd (Miniflare)
@@ -49,7 +52,8 @@ Rate Limiting binding). In `relay/`:
    | Name | What | Example |
    |---|---|---|
    | `SECRETS_KEY` | AES-256-GCM key sealing hook signing secrets at rest: 32 random bytes, base64 | `openssl rand -base64 32` |
-   | `HASH_PEPPER` | HMAC key for enrolment-code and client-IP hashes | `openssl rand -base64 32` |
+   | `HASH_PEPPER` | HMAC key for enrolment-code, client-IP, dedupe-mark and API-key hashes | `openssl rand -base64 32` |
+   | `RELAY_SIGNING_KEY` | Ed25519 seed (32 bytes, base64) signing every sealed envelope. Its public half is `/v1/info`'s `relayKey`, which clients pin at login: changing it makes every device log in again. Without it the relay takes no deliveries | `openssl rand -base64 32` |
    | `SIGNUP_TOKEN` | Optional. When set, creating an account needs `Authorization: Bearer <token>`. Without it, anyone can sign up: development only (`/v1/info` reports `signupOpen`) | `openssl rand -base64 24` |
 
 4. `wrangler deploy`.
@@ -96,6 +100,17 @@ Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](do
   account's log has a quota.
 - **What's kept**: only an allowlist of headers per preset (event and delivery headers,
   `content-type`, `user-agent`), never `cookie`, `authorization` or a signature or token header.
-  Enrolment codes and client IPs are stored only as HMACs under `HASH_PEPPER`.
+  Enrolment codes, client IPs, dedupe marks and API keys are stored only as HMACs under
+  `HASH_PEPPER`.
+- **Sealing**: the body and kept headers are sealed with HPKE (X25519, HKDF-SHA256,
+  ChaCha20-Poly1305) to each device's key, with the hook, seq and event id as associated data, and
+  each envelope is signed with `RELAY_SIGNING_KEY`. The object's SQLite holds routing metadata and
+  ciphertext only (a test reads every table to check); the plaintext exists only in memory while it
+  is verified and sealed. A device's envelopes are deleted once it acknowledges them.
+- **Strict hooks** keep the provider's secret on the devices: the relay checks only the header's
+  shape and timestamp, and the devices verify the signature (PROTOCOL §3).
+- **API keys** (`hk_…`) are scoped, expire, are shown once, and can never stream, acknowledge,
+  enrol a device, set a sealing key or create keys. The audit log records hooks, devices and keys,
+  and counts key uses and verification failures per hour.
 - **Errors** are fixed sentences: they never quote a secret, a signature or payload content.
 - **Webhook content is data**: the relay never acts on it.

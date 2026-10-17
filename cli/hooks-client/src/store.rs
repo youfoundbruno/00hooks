@@ -42,6 +42,15 @@ pub struct Config {
     pub key_store: String,
     /// The key's name in that store.
     pub key_name: String,
+    /// The relay's envelope-signing key (`relayKey`), pinned at login (PROTOCOL §2). `None` for a
+    /// login from before protocol 2, until `00hooks devices seal-key` pins it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_key: Option<String>,
+    /// The kids of this device's sealing keys, oldest first; each private key is in the key store
+    /// as `seal-<kid>`. The last is the one the relay seals new events to; older ones open events
+    /// sealed before a replacement.
+    #[serde(default)]
+    pub seal_kids: Vec<String>,
 }
 
 /// The state directory.
@@ -395,9 +404,17 @@ mod tests {
             device_name: "laptop".into(),
             key_store: "file".into(),
             key_name: "key_1".into(),
+            relay_key: Some("A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg".into()),
+            seal_kids: vec!["QjSYPjQbvjPuXDfQbGtuAQ".into()],
         };
         s.save_config(&c).unwrap();
         assert_eq!(s.load_config().unwrap(), Some(c));
+        // A login from before protocol 2 still loads, with nothing pinned and no sealing key.
+        let old = r#"{"relay":"https://r.example","accountId":"acc_1","deviceId":"dev_1",
+            "deviceName":"x","keyStore":"file","keyName":"k"}"#;
+        std::fs::write(s.path().join(CONFIG), old).unwrap();
+        let back = s.load_config().unwrap().unwrap();
+        assert!(back.relay_key.is_none() && back.seal_kids.is_empty());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

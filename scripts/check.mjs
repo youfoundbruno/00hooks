@@ -19,7 +19,8 @@ if (existsSync(join(root, "cli/00hooks/Cargo.toml"))) {
 }
 for (const [label, cmd, args] of steps) {
   console.log(`\n▸ ${label}`);
-  const r = spawnSync(cmd, args, { cwd: root, stdio: "inherit" });
+  // The CLI's interop test runs the relay's sealing code under Node; here it must not skip.
+  const r = spawnSync(cmd, args, { cwd: root, stdio: "inherit", env: { ...process.env, HOOKS_REQUIRE_NODE: "1" } });
   if (r.status !== 0) {
     console.error(`\n✗ ${label} failed.`);
     process.exit(r.status ?? 1);

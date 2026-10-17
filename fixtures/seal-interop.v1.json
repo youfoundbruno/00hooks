@@ -1,0 +1,115 @@
+{
+  "about": "Events sealed by the relay's own code (relay/src/envelope.ts) under Node, for the CLI to open: PROTOCOL §5. The device key is a fixture, not a secret. Regenerate with: node relay/scripts/seal-interop.ts --fixture",
+  "devicePrivateKey": "DKibwHI9IHMU6FD41VtgdA9yG53MU-TjWpQlJykvfac",
+  "devicePublicKey": "9cP1MRq146CKPmC0HoYQS0Mp4PsqcxsM3P03yHA2qUQ",
+  "relayKey": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "deviceId": "dev_0123456789abcdefghjkmnpq",
+  "kid": "QjSYPjQbvjPuXDfQbGtuAQ",
+  "events": [
+    {
+      "message": {
+        "seq": 1,
+        "id": "evt_000000000000000000000000a1",
+        "hookId": "hk_000000000000000000000000h1",
+        "receivedAt": 1792233600000,
+        "verified": true,
+        "strict": false,
+        "preset": "github",
+        "eventType": "push",
+        "sealed": {
+          "kid": "QjSYPjQbvjPuXDfQbGtuAQ",
+          "enc": "lMp9fMlMU6B05WALwMwboAF9y_M6uHc7YosdTB5Fq1o",
+          "ct": "cMfUdNPU9xK2WJQEzHzlRgyeTisWm2tvQoDnTLcBBt5wa9exojarUuLRPRkoBcy8zIoKgA4wrAI0qmX8zN2LEdnfPq4DPQWgO9I6tbfJxZYLwJ/VfdmH2vfsfXOKRlyvfCur7cBuATsm0jnqyPqHpWKRMq86SHBdIz0Jyo5BzDohO1GdTpxJBKynUDQuOVc2j2z1mjYgljRg9M+kjQ8jGTDw/6Cf/3tlNN6f9tyeh4qSvA=="
+        },
+        "sig": "TwvPyRaIVqpmVQQ0wppFnZRftKNmYcD7MSdySCVIcIkqiEKh1jCaxULTNbgJX81bB3Tcy7-Xq2KNQQl_qznqCw"
+      },
+      "expect": {
+        "headers": {
+          "content-type": "application/json",
+          "x-github-event": "push",
+          "x-github-delivery": "d-1"
+        },
+        "contentType": "application/json",
+        "url": null,
+        "body": "eyJyZWYiOiJyZWZzL2hlYWRzL21haW4iLCJuIjoxfQ=="
+      }
+    },
+    {
+      "message": {
+        "seq": 2,
+        "id": "evt_000000000000000000000000a2",
+        "hookId": "hk_000000000000000000000000h2",
+        "receivedAt": 1792233601000,
+        "verified": false,
+        "strict": false,
+        "preset": "unverified",
+        "eventType": null,
+        "sealed": {
+          "kid": "QjSYPjQbvjPuXDfQbGtuAQ",
+          "enc": "FzEHUWTBgRGJEMgGfWmQw93aqwmcwiquppG89Y_cOTk",
+          "ct": "LHBQTDEVL0Fo8mV2FJD1g/TqDoEaEqR47w3GkcjpeUA010BwMsO+5pttGK7XjdPCa6E="
+        },
+        "sig": "Mp23OL3Dv-XracsRn_nko7NYtxWhZ4SyGWYN2YgHX37yMnMJUEA2N4Wzxr4EAQnQASxJjubO150d-f7x22NTDQ"
+      },
+      "expect": {
+        "headers": {},
+        "contentType": null,
+        "url": null,
+        "body": ""
+      }
+    },
+    {
+      "message": {
+        "seq": 3,
+        "id": "evt_000000000000000000000000a3",
+        "hookId": "hk_000000000000000000000000h1",
+        "receivedAt": 1792233602000,
+        "verified": true,
+        "strict": false,
+        "preset": "hmac",
+        "eventType": "ünïcode\nlabel ✓",
+        "sealed": {
+          "kid": "QjSYPjQbvjPuXDfQbGtuAQ",
+          "enc": "F6fiC16ts4C4Y_eKp1jKnwiDB2UOftF0Hrr7YbXGsnY",
+          "ct": "Warfhi0z6v6AmeRsdH0PVOa11pp7CPG3r3EjI2+8sds0IKWD+rpvWFzsZd65ZYS2+b98B4u6uGc3JTDHmD9pSORokYH9J5ErFjzSqRIJ/TS6rZIj+OlVaet4K5yZD2cb+JBf18M72/pRNoQcMoYrACVYE9rXA7kGCoPjEyRazp7a74q1e+u2vHaxYvK19tKlz75SfzIenEX+aaczGxqQr6EWIjNblcfDI+XAGcL8jOdFvg+4BSN1VuS/QgCL1wmhpzVa56EMIwT3BZQRfpwfW5J+aRS1eWKa1KKYI4pks99SBJXP8R8qqN8/Rg3QZ0+7XSC3suKvnGwCex4Ay3TbVMNPIEpBIpJq84txcBKDXxtLguNzjtUtaX+mn8tMPTOxjfl+JsG1nUsBpYScWI7Bdn/tZFGlwq+ZFs7eNTiwyMegcnilwO7PseA7/hfDb3irhJD34L0DjyBETNe6yaGbbvWT6YEGSGirIvrXYx2h2hWF"
+        },
+        "sig": "YC09O5WIbKzG_F0htS4sATdkPzX6t89gVJpZj16Kb4ePvC7XtF78bwh5VWih-pJ4YJJIp709hhmqYfCkMiWlBA"
+      },
+      "expect": {
+        "headers": {
+          "content-type": "application/octet-stream"
+        },
+        "contentType": "application/octet-stream",
+        "url": null,
+        "body": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+      }
+    },
+    {
+      "message": {
+        "seq": 4,
+        "id": "evt_000000000000000000000000a4",
+        "hookId": "hk_000000000000000000000000h3",
+        "receivedAt": 1792233603000,
+        "verified": false,
+        "strict": true,
+        "preset": "stripe",
+        "eventType": null,
+        "sealed": {
+          "kid": "QjSYPjQbvjPuXDfQbGtuAQ",
+          "enc": "HTKlrhJDTBRlZ7jad2sCeTFA7VO0KviUKr3GQ1W69Ac",
+          "ct": "umS7O+0iGyr3HWw6LxWSm9kvt8HFSGjRiC99HeGFXyQ0tOuzREoEhnBBHzlKOz3M+NvsHsF+IomfFU63xFFuyOyMErB0LZxhVpeA8Tnq26yQi10yZI8Zi/PnMbM7309MuNg44SJ+mEmbf2n5QEdo654WsMq4ZD85rmGWZT6JDIiwbQyw3LDEwLhg3DFmeDtLwIejUxOUajo0qdkOj00En3evb4XexKTxWQhIoYlpVeEEt6sjxnpOqeUEffKMXaFTCwtbzGudeddBUFZ+PQ9DLDIKeeXiWK6NU5waDMTQL3N9f3qI0cwst+TD+7TQzlY="
+        },
+        "sig": "kTU96su7_vj0Sf2tDE1SgCSr6I23BIsqOHrCaD5M5Fv-4o5cdzdrbac-xk0u6vhj6He4Xgm0GRGxcx2QdoC7Ag"
+      },
+      "expect": {
+        "headers": {
+          "content-type": "application/json",
+          "stripe-signature": "t=1792233603,v1=00"
+        },
+        "contentType": "application/json",
+        "url": "https://relay.example.com/h/hk_000000000000000000000000h3",
+        "body": "eyJpZCI6ImV2dF8xIiwidHlwZSI6Imludm9pY2UucGFpZCJ9"
+      }
+    }
+  ]
+}

@@ -2,7 +2,11 @@
 
 import { accountStub, type Caller } from "./auth.ts";
 import { SseBridge, type BridgeOptions } from "./bridge.ts";
-import { HttpError, invalid, json, parseJsonObject, unauthorized } from "./http.ts";
+import { HttpError, error, invalid, json, parseJsonObject, unauthorized } from "./http.ts";
+import { PROTOCOLS, STREAM_PROTOCOL } from "./version.ts";
+
+/** The header a client names the stream protocol it speaks with (PROTOCOL §0). */
+export const HEADER_PROTOCOL = "X-00h-Protocol";
 
 export const STREAM_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -16,6 +20,17 @@ export async function openStream(
   caller: Caller,
   bridgeOptions?: BridgeOptions,
 ): Promise<Response> {
+  // Every event is sealed in protocol 2: a client that can't open envelopes would get only gaps, so
+  // it is told to update instead.
+  const asked = request.headers.get(HEADER_PROTOCOL)?.trim();
+  if (asked !== String(STREAM_PROTOCOL)) {
+    throw new HttpError(
+      error(400, "invalid", `This relay streams protocol ${STREAM_PROTOCOL}; send ${HEADER_PROTOCOL}: ${STREAM_PROTOCOL}, or update the client.`, {
+        field: HEADER_PROTOCOL,
+        protocols: PROTOCOLS,
+      }),
+    );
+  }
   const lastEventIdHeader = request.headers.get("Last-Event-ID");
   let lastEventId = 0;
   if (lastEventIdHeader !== null && lastEventIdHeader.trim() !== "") {
@@ -24,8 +39,17 @@ export async function openStream(
     }
     lastEventId = Number(lastEventIdHeader.trim());
   }
+  const stub = accountStub(env, caller.accountId);
+  if (new URL(request.url).searchParams.get("probe") === "1") {
+    // A probe answers `ready` and ends, without replacing the device's live stream (for doctor).
+    const r = await stub.probe(caller.deviceId, lastEventId);
+    if (!r) throw new HttpError(unauthorized());
+    const ready = { accountId: caller.accountId, deviceId: caller.deviceId, ...r, protocol: STREAM_PROTOCOL };
+    const text = `retry: 5000\n\nevent: ready\ndata: ${JSON.stringify(ready)}\n\nevent: closed\ndata: ${JSON.stringify({ code: 1000, reason: "probe" })}\n\n`;
+    return new Response(text, { status: 200, headers: STREAM_HEADERS });
+  }
   const params = new URLSearchParams({ account: caller.accountId, device: caller.deviceId, lastEventId: String(lastEventId) });
-  const upstream = await accountStub(env, caller.accountId).fetch(`https://account/stream?${params}`, {
+  const upstream = await stub.fetch(`https://account/stream?${params}`, {
     headers: { Upgrade: "websocket" },
   });
   const ws = upstream.webSocket;

@@ -12,7 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 use common::{Conn, MockRelay, TempHome};
 use hooks_client::backoff::{Clock, Jitter};
 use hooks_client::{
-    Client, DeviceKey, Error, StateDir, StreamEvent, SubscribeOptions, Subscription, subscribe,
+    Client, DeviceKey, Error, Opener, SealKey, StateDir, StreamEvent, SubscribeOptions,
+    Subscription, subscribe,
 };
 
 /// A device on the mock relay, with a state directory the relay can inspect on ack.
@@ -20,7 +21,7 @@ async fn device(relay: &MockRelay, tag: &str) -> (Client, StateDir, TempHome) {
     let key = DeviceKey::generate().unwrap();
     let joined = Client::new(&relay.url)
         .unwrap()
-        .create_account("test", &key.public_key(), None)
+        .create_account("test", &key.public_key(), None, None)
         .await
         .unwrap();
     assert_eq!(joined.account_id, "acc_1");
@@ -29,6 +30,29 @@ async fn device(relay: &MockRelay, tag: &str) -> (Client, StateDir, TempHome) {
     let state = StateDir::open(&home.0).unwrap();
     relay.with(|s| s.client_home = Some(home.0.clone()));
     (client, state, home)
+}
+
+/// A protocol 2 device: it registered a sealing key, and its client opens what is sealed to it
+/// (checking the mock relay's signature with the key pinned from `/v1/info`).
+async fn sealed_device(relay: &MockRelay, tag: &str) -> (Client, StateDir, TempHome, String) {
+    let key = DeviceKey::generate().unwrap();
+    let seal = SealKey::generate().unwrap();
+    let anon = Client::new(&relay.url).unwrap();
+    let info = anon.info().await.unwrap();
+    assert!(info.serves(2));
+    let joined = anon
+        .create_account("test", &key.public_key(), Some(&seal.public_key()), None)
+        .await
+        .unwrap();
+    let client = Client::with_device(&relay.url, &joined.device_id, key).unwrap();
+    let kid = seal.kid();
+    let mut opener = Opener::new(&joined.device_id, info.relay_key.as_deref()).unwrap();
+    opener.add_key(seal);
+    client.set_opener(opener);
+    let home = TempHome::new(tag);
+    let state = StateDir::open(&home.0).unwrap();
+    relay.with(|s| s.client_home = Some(home.0.clone()));
+    (client, state, home, kid)
 }
 
 fn fast() -> SubscribeOptions {
@@ -514,4 +538,163 @@ async fn an_unreadable_last_frame_is_recorded_before_it_is_acknowledged() {
     }
     relay.with(|s| assert!(s.violations.is_empty(), "{:?}", s.violations));
     assert_eq!(sub.store().quarantined().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn sealed_events_are_opened_before_they_are_recorded_or_handed_over() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=5);
+    relay.with(|s| s.script.push_back(Conn::CutAfter(2)));
+    let (client, state, home, _) = sealed_device(&relay, "sealed").await;
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let evs = read_hooks(&mut sub, 5).await;
+    assert_eq!(hook_seqs(&evs), (1..=5).collect::<Vec<_>>());
+    for ev in &evs {
+        if let StreamEvent::Hook(h) = ev {
+            // Opened: the content is back, the envelope gone, as in protocol 1.
+            assert!(h.sealed.is_none() && h.sig.is_none());
+            assert_eq!(
+                h.body_bytes().unwrap(),
+                format!("{{\"n\":{}}}", h.seq).as_bytes()
+            );
+            assert_eq!(h.headers["x-github-event"], "push");
+            assert_eq!(h.content_type.as_deref(), Some("application/json"));
+        }
+    }
+    // Every stream request asked for protocol 2.
+    relay.with(|s| {
+        assert!(!s.stream_protocols.is_empty());
+        assert!(s.stream_protocols.iter().all(|p| p.as_deref() == Some("2")));
+        assert!(s.violations.is_empty(), "{:?}", s.violations);
+    });
+    // What the store kept is the opened event, never an envelope.
+    let inbox = std::fs::read_to_string(home.0.join("inbox.jsonl")).unwrap_or_default();
+    assert!(!inbox.contains("\"sealed\""), "{inbox}");
+}
+
+#[tokio::test]
+async fn a_forged_or_unsealed_event_is_quarantined_and_never_handed_over() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=4);
+    relay.with(|s| {
+        s.forged.insert(2);
+        s.unsealed.insert(3);
+    });
+    let (client, state, _home, _) = sealed_device(&relay, "forged").await;
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let evs = read_hooks(&mut sub, 2).await;
+    let kinds: Vec<String> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Hook(h) => Some(format!("hook {}", h.seq)),
+            StreamEvent::Quarantined { seq, error, .. } => {
+                Some(format!("quarantined {} {}", seq.unwrap(), error))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds.len(), 4, "{kinds:?}");
+    assert_eq!(kinds[0], "hook 1");
+    assert!(
+        kinds[1].starts_with("quarantined 2") && kinds[1].contains("signature"),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds[2].starts_with("quarantined 3") && kinds[2].contains("unsealed"),
+        "{kinds:?}"
+    );
+    assert_eq!(kinds[3], "hook 4");
+    // Kept raw and acknowledged past: nothing silently skipped.
+    assert_eq!(sub.store().quarantined().unwrap().len(), 2);
+    relay.with(|s| {
+        assert!(s.violations.is_empty(), "{:?}", s.violations);
+        assert_eq!(s.acked, 4);
+    });
+}
+
+#[tokio::test]
+async fn ready_says_so_when_the_relay_seals_to_a_key_this_computer_lacks() {
+    let relay = MockRelay::start().await;
+    let (client, state, _home, _) = sealed_device(&relay, "otherkey").await;
+    // Another sealing key set for this device (by a newer login elsewhere, say).
+    let other = SealKey::generate().unwrap();
+    let kid = client.set_seal_key(&other.public_key()).await.unwrap();
+    assert_eq!(kid, other.kid());
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let first = tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match first {
+        StreamEvent::Warning(w) => assert!(w.contains(&kid) && w.contains("seal-key"), "{w}"),
+        other => panic!("expected a warning first, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn confirm_mode_hands_over_again_after_a_restart_until_confirmed() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=3);
+    let (client, state, _home, _) = sealed_device(&relay, "confirm").await;
+    let opts = SubscribeOptions {
+        confirm: true,
+        ..fast()
+    };
+    {
+        let mut sub = subscribe(client.clone(), state.open_events().unwrap(), opts.clone());
+        let evs = read_hooks(&mut sub, 3).await;
+        assert_eq!(hook_seqs(&evs), vec![1, 2, 3]);
+        // The consumer recorded 1 and 2, then died before recording 3.
+        sub.confirm("evt_0001").unwrap();
+        sub.confirm("evt_0002").unwrap();
+    }
+    relay.with(|s| assert_eq!(s.acked, 3, "acknowledged once recorded here"));
+    let mut sub = subscribe(client, state.open_events().unwrap(), opts);
+    let evs = read_hooks(&mut sub, 1).await;
+    let again: Vec<String> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Hook(h) => Some(h.id.clone()),
+            _ => None,
+        })
+        .collect();
+    // Same id, opened content, handed over again; the confirmed ones never come back.
+    assert_eq!(again, vec!["evt_0003"]);
+    sub.confirm("evt_0003").unwrap();
+    relay.push_events(4..=4);
+    let evs = read_hooks(&mut sub, 1).await;
+    assert_eq!(hook_seqs(&evs), vec![4]);
+    assert!(sub.store().pending().iter().all(|e| e.id == "evt_0004"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_next_cancelled_during_an_ack_loses_neither_the_ack_nor_the_events() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=2);
+    relay.with(|s| s.ack_delay = Duration::from_millis(300));
+    let (client, state, _home) = device(&relay, "cancel").await;
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    // Read until a batch is recorded and its ack is in flight, then give up on it (as a select!
+    // does), a few times over.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut cancelled = 0;
+    while sub.store().cursor() < 1 || cancelled < 3 {
+        if sub.store().cursor() >= 1 {
+            cancelled += 1;
+        }
+        assert!(std::time::Instant::now() < deadline, "never recorded");
+        let r = tokio::time::timeout(Duration::from_millis(50), sub.next()).await;
+        assert!(
+            !matches!(r, Ok(Some(Ok(StreamEvent::Hook(_))))),
+            "handed over before the ack"
+        );
+    }
+    relay.with(|s| s.ack_delay = Duration::ZERO);
+    let evs = read_hooks(&mut sub, 2).await;
+    assert_eq!(hook_seqs(&evs), vec![1, 2]);
+    relay.with(|s| {
+        assert_eq!(s.acked, 2);
+        assert!(s.violations.is_empty(), "{:?}", s.violations);
+    });
 }

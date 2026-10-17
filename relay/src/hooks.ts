@@ -1,10 +1,10 @@
 // Hooks (PROTOCOL §3). A hook's signing secret is shown once, in the create or rotate response, and
 // is otherwise only ever held sealed.
 
-import type { Caller } from "./auth.ts";
+import { accountStub, type Principal } from "./auth.ts";
 import { newId } from "./encoding.ts";
 import { HttpError, error, invalid, json, notFound, parseJsonObject } from "./http.ts";
-import { generateSecret, parseVerify, presetTakesSecret, type VerifyConfig } from "./presets.ts";
+import { generateSecret, parseVerify, presetTakesSecret, relayGeneratesSecret, type VerifyConfig } from "./presets.ts";
 import { openSecret, sealSecret } from "./seal.ts";
 
 export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
@@ -61,18 +61,22 @@ function hookName(v: unknown): string {
   return v.trim();
 }
 
-async function load(env: Env, caller: Caller, id: string): Promise<HookRow> {
+async function load(env: Env, caller: Principal, id: string): Promise<HookRow> {
   const row = await env.DB.prepare("SELECT * FROM hooks WHERE id = ? AND account_id = ?").bind(id, caller.accountId).first<HookRow>();
   if (!row) throw new HttpError(notFound());
   return row;
 }
 
-export async function createHook(env: Env, caller: Caller, origin: string, body: Uint8Array): Promise<Response> {
+export async function createHook(env: Env, caller: Principal, origin: string, body: Uint8Array): Promise<Response> {
   const input = parseJsonObject(body);
   const name = hookName(input.name);
   const { config, secret: supplied } = parseVerify(input.verify);
   const id = newId("hk");
-  const generated = supplied === null && presetTakesSecret(config.preset) ? generateSecret(config.preset) : null;
+  // A strict hook's secret stays on the devices; a provider-issued one was checked to be supplied.
+  const generated =
+    supplied === null && presetTakesSecret(config.preset, config.strict) && relayGeneratesSecret(config.preset)
+      ? generateSecret(config.preset)
+      : null;
   const secret = supplied ?? generated;
   const now = Date.now();
   await env.DB.prepare(
@@ -81,23 +85,24 @@ export async function createHook(env: Env, caller: Caller, origin: string, body:
   )
     .bind(id, caller.accountId, name, JSON.stringify(config), secret ? await sealSecret(env.SECRETS_KEY, id, secret) : null, DEFAULT_MAX_BODY_BYTES, now)
     .run();
+  await accountStub(env, caller.accountId).audit({ kind: "hook.created", actor: caller.actor, subject: id, name });
   const row = await load(env, caller, id);
   // The secret appears here only when the relay generated it: a caller-supplied one is never echoed.
   return json({ hook: hookJson(row, origin), url: hookUrl(origin, id), ...(generated ? { secret: generated } : {}) }, 201);
 }
 
-export async function listHooks(env: Env, caller: Caller, origin: string): Promise<Response> {
+export async function listHooks(env: Env, caller: Principal, origin: string): Promise<Response> {
   const { results } = await env.DB.prepare("SELECT * FROM hooks WHERE account_id = ? ORDER BY created_at, id")
     .bind(caller.accountId)
     .all<HookRow>();
   return json({ hooks: results.map((r) => hookJson(r, origin)) });
 }
 
-export async function getHook(env: Env, caller: Caller, origin: string, id: string): Promise<Response> {
+export async function getHook(env: Env, caller: Principal, origin: string, id: string): Promise<Response> {
   return json(hookJson(await load(env, caller, id), origin));
 }
 
-export async function patchHook(env: Env, caller: Caller, origin: string, id: string, body: Uint8Array): Promise<Response> {
+export async function patchHook(env: Env, caller: Principal, origin: string, id: string, body: Uint8Array): Promise<Response> {
   const row = await load(env, caller, id);
   const input = parseJsonObject(body);
   const name = input.name === undefined ? row.name : hookName(input.name);
@@ -120,11 +125,17 @@ export async function patchHook(env: Env, caller: Caller, origin: string, id: st
   return json(hookJson(await load(env, caller, id), origin));
 }
 
-export async function rotateHook(env: Env, caller: Caller, id: string): Promise<Response> {
+export async function rotateHook(env: Env, caller: Principal, id: string): Promise<Response> {
   const row = await load(env, caller, id);
   const config = JSON.parse(row.verify) as VerifyConfig;
+  if (config.strict) {
+    return error(409, "conflict", "A strict hook's secret is kept on your devices; change it there.");
+  }
   if (!presetTakesSecret(config.preset) || !row.secret_sealed) {
     return error(409, "conflict", "This hook has no secret to rotate.");
+  }
+  if (!relayGeneratesSecret(config.preset)) {
+    return error(409, "conflict", "This provider issues the secret; rotate it there, then create the hook again with the new one.");
   }
   const secret = generateSecret(config.preset);
   const now = Date.now();
@@ -133,12 +144,14 @@ export async function rotateHook(env: Env, caller: Caller, id: string): Promise<
   )
     .bind(await sealSecret(env.SECRETS_KEY, id, secret), row.secret_sealed, now + ROTATION_OVERLAP_MS, id)
     .run();
+  await accountStub(env, caller.accountId).audit({ kind: "hook.rotated", actor: caller.actor, subject: id, name: row.name });
   return json({ secret });
 }
 
-export async function deleteHook(env: Env, caller: Caller, id: string): Promise<Response> {
-  await load(env, caller, id);
+export async function deleteHook(env: Env, caller: Principal, id: string): Promise<Response> {
+  const row = await load(env, caller, id);
   // Events already in the log stay until they're acknowledged (or retention drops them).
   await env.DB.prepare("DELETE FROM hooks WHERE id = ? AND account_id = ?").bind(id, caller.accountId).run();
+  await accountStub(env, caller.accountId).audit({ kind: "hook.deleted", actor: caller.actor, subject: id, name: row.name });
   return new Response(null, { status: 204 });
 }

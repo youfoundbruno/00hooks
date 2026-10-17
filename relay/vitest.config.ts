@@ -13,6 +13,8 @@ export default defineConfig({
           // Test-only values; real ones come from `wrangler secret put` (see .dev.vars.example).
           SECRETS_KEY: "dGVzdC1vbmx5LWtleS10ZXN0LW9ubHkta2V5LTAwMDA=",
           HASH_PEPPER: "test-only-pepper",
+          // The seed 00 01 … 1f: its public key is PROTOCOL §1's example key, so tests can pin it.
+          RELAY_SIGNING_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
           // Signups open, whatever a local .dev.vars says (the gated case is tested explicitly).
           SIGNUP_TOKEN: "",
           TEST_MIGRATIONS: await readD1Migrations("./migrations"),

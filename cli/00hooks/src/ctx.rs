@@ -2,9 +2,12 @@
 //! that say what to do next.
 
 use std::fmt;
+use std::sync::Arc;
 
+use hooks_client::seal::StoreStrictSecrets;
 use hooks_client::{
-    Client, Config, DeviceKey, Error, KeyStore, KeychainStore, StateDir, describe_skew,
+    Client, Config, DeviceKey, Error, KeyStore, KeychainStore, Opener, SealKey, StateDir,
+    describe_skew,
 };
 
 use crate::output::sanitize;
@@ -140,6 +143,7 @@ impl Ctx {
             })?;
         let client = Client::with_device(&config.relay, &config.device_id, key)
             .map_err(|e| Failure::new(sentence(&e.to_string())))?;
+        client.set_opener(opener(&config, store)?);
         Ok(Ctx {
             state,
             config,
@@ -150,6 +154,23 @@ impl Ctx {
     pub fn explain(&self, e: Error) -> Failure {
         explain(e, &self.config.relay)
     }
+}
+
+/// What opens this device's sealed events (PROTOCOL §5): its sealing keys, the relay key pinned at
+/// login, and the strict hooks' secrets, all from the login's key store. A missing sealing key
+/// isn't fatal here: events sealed to it are quarantined with the reason, and `listen` says so.
+pub fn opener(config: &Config, store: Box<dyn KeyStore>) -> CliResult<Opener> {
+    let store: Arc<dyn KeyStore> = Arc::from(store);
+    let mut opener = Opener::new(&config.device_id, config.relay_key.as_deref())
+        .map_err(|e| Failure::new(sentence(&e.to_string())))?;
+    for kid in &config.seal_kids {
+        match SealKey::load(store.as_ref(), kid) {
+            Ok(Some(k)) => opener.add_key(k),
+            Ok(None) => {}
+            Err(e) => return Err(Failure::new(sentence(&e.to_string()))),
+        }
+    }
+    Ok(opener.with_strict(Box::new(StoreStrictSecrets(store))))
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 //! A tiny in-process relay implementing just enough of PROTOCOL.md for the client's tests: signed
 //! request checks (time window, nonces, signatures), accounts, `/v1/stream` with a backlog and
 //! scripted misbehaviour, and `/v1/ack`, which checks that everything acknowledged was recorded in
-//! the client's state directory first.
+//! the client's state directory first. Events are kept in the clear in `log` and sealed (and signed
+//! with the mock's relay key) at send time for any device that registered a sealing key.
 
 #![allow(dead_code)]
 
@@ -16,7 +17,9 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use hooks_client::Event;
+use hooks_client::seal::{SealedContent, seal_event, seal_kid};
 use hooks_client::signing::canonical_string;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -71,13 +74,74 @@ pub struct State {
     pub fail_acks: usize,
     /// Acks answered with `503`.
     pub failed_acks: usize,
+    /// Each ack is answered after this long.
+    pub ack_delay: Duration,
     /// Seqs whose `hook` frame is sent garbled (data that isn't an event).
     pub garbled: HashSet<u64>,
     /// `DELETE /v1/devices/<id>`: (the signing device, the revoked id), in order.
     pub revocations: Vec<(String, String)>,
     /// The enrolment code `POST /v1/enrolments/redeem` accepts.
     pub enrolment_code: Option<String>,
+    /// Sealing keys by device (raw X25519 public keys).
+    pub seal_keys: HashMap<String, [u8; 32]>,
+    /// The `X-00h-Protocol` header of each stream request, in order.
+    pub stream_protocols: Vec<Option<String>>,
+    /// Seqs whose envelope is sent with a broken relay signature (a forgery).
+    pub forged: HashSet<u64>,
+    /// Seqs sent unsealed even to a device with a sealing key.
+    pub unsealed: HashSet<u64>,
+    /// Every `POST /v1/hooks` body, in order.
+    pub hook_requests: Vec<Value>,
+    /// API keys created: (id, name, scopes), and revoked ids.
+    pub api_keys: Vec<(String, String, Vec<String>)>,
+    pub revoked_keys: Vec<String>,
+    /// When set, `POST /v1/accounts` needs `Authorization: Bearer <this>` (`/v1/info` still says
+    /// signups are open, as a relay that misreports would).
+    pub signup_token: Option<String>,
     next_device: usize,
+}
+
+/// The mock relay's envelope-signing key (its public half is `/v1/info`'s `relayKey`).
+pub fn relay_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[7u8; 32])
+}
+
+pub fn relay_key_b64() -> String {
+    URL_SAFE_NO_PAD.encode(relay_signing_key().verifying_key().as_bytes())
+}
+
+/// `e` as `device` receives it: sealed to its key when it has one.
+pub fn sealed_for(s: &State, device: &str, e: &Value) -> Value {
+    let seq = e["seq"].as_u64().unwrap();
+    let Some(pk) = s.seal_keys.get(device) else {
+        return e.clone();
+    };
+    if s.unsealed.contains(&seq) {
+        return e.clone();
+    }
+    let meta: Event = serde_json::from_value(e.clone()).unwrap();
+    let content = SealedContent {
+        headers: meta.headers.clone(),
+        content_type: meta.content_type.clone(),
+        url: None,
+        body: meta.body_bytes().unwrap(),
+    };
+    let sealed = seal_event(&relay_signing_key(), device, pk, &meta, &content).unwrap();
+    let mut v = serde_json::to_value(&sealed).unwrap();
+    if s.forged.contains(&seq) {
+        // Signed by someone else's key.
+        let other = SigningKey::from_bytes(&[8u8; 32]);
+        let forged = seal_event(&other, device, pk, &meta, &content).unwrap();
+        v = serde_json::to_value(&forged).unwrap();
+    }
+    v
+}
+
+fn seal_key_of(v: &Value) -> Option<[u8; 32]> {
+    URL_SAFE_NO_PAD
+        .decode(v["sealKey"].as_str()?)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
 }
 
 pub fn now_ms() -> i64 {
@@ -244,14 +308,31 @@ async fn handle(st: Arc<Mutex<State>>, req: Request<Incoming>) -> Result<Resp, I
         .map(|b| b.to_bytes())
         .unwrap_or_default();
     let route = (parts.method.as_str(), parts.uri.path());
+    if route == ("POST", "/v1/ack") {
+        let delay = st.lock().unwrap().ack_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
     let resp = match route {
         ("GET", "/v1/info") => {
             let offset = st.lock().unwrap().clock_offset_ms;
             json_resp(
                 StatusCode::OK,
-                json!({ "version": "mock", "protocol": 1, "signupOpen": true,
-                        "serverTime": now_ms() + offset }),
+                json!({ "version": "mock", "protocol": 2, "protocols": [2], "signupOpen": true,
+                        "relayKey": relay_key_b64(), "serverTime": now_ms() + offset }),
             )
+        }
+        ("POST", "/v1/accounts")
+            if st.lock().unwrap().signup_token.as_ref().is_some_and(|t| {
+                parts
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    != Some(format!("Bearer {t}").as_str())
+            }) =>
+        {
+            unauthorized("unauthorized", None)
         }
         ("POST", "/v1/accounts") => {
             let v: Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -270,6 +351,9 @@ async fn handle(st: Arc<Mutex<State>>, req: Request<Incoming>) -> Result<Resp, I
                     s.next_device += 1;
                     let id = format!("dev_{}", s.next_device);
                     s.devices.insert(id.clone(), key);
+                    if let Some(k) = seal_key_of(&v) {
+                        s.seal_keys.insert(id.clone(), k);
+                    }
                     json_resp(
                         StatusCode::CREATED,
                         json!({ "accountId": "acc_1", "deviceId": id }),
@@ -293,6 +377,9 @@ async fn handle(st: Arc<Mutex<State>>, req: Request<Incoming>) -> Result<Resp, I
                     s.next_device += 1;
                     let id = format!("dev_{}", s.next_device);
                     s.devices.insert(id.clone(), key);
+                    if let Some(k) = seal_key_of(&v) {
+                        s.seal_keys.insert(id.clone(), k);
+                    }
                     json_resp(
                         StatusCode::OK,
                         json!({ "accountId": "acc_1", "deviceId": id }),
@@ -316,22 +403,133 @@ fn signed_route(
     device: &str,
 ) -> Resp {
     match (parts.method.as_str(), parts.uri.path()) {
-        ("GET", "/v1/devices") => json_resp(
+        ("GET", "/v1/devices") => {
+            let kid = st
+                .lock()
+                .unwrap()
+                .seal_keys
+                .get(device)
+                .map(|k| seal_kid(k));
+            json_resp(
+                StatusCode::OK,
+                json!({ "devices": [{ "id": device, "name": "test", "createdAt": 1,
+                                      "lastSeenAt": null, "current": true, "sealKid": kid }] }),
+            )
+        }
+        ("PUT", path) if path.starts_with("/v1/devices/") && path.ends_with("/seal-key") => {
+            let v: Value = serde_json::from_slice(body).unwrap_or_default();
+            let target = &path["/v1/devices/".len()..path.len() - "/seal-key".len()];
+            if target != device {
+                return json_resp(
+                    StatusCode::FORBIDDEN,
+                    json!({"error":"forbidden","message":"Only its own."}),
+                );
+            }
+            match seal_key_of(&v) {
+                None => json_resp(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"invalid","message":"Bad key.","field":"sealKey"}),
+                ),
+                Some(k) => {
+                    st.lock().unwrap().seal_keys.insert(device.to_string(), k);
+                    json_resp(StatusCode::OK, json!({ "kid": seal_kid(&k) }))
+                }
+            }
+        }
+        ("POST", "/v1/keys") => {
+            let v: Value = serde_json::from_slice(body).unwrap_or_default();
+            let mut s = st.lock().unwrap();
+            let id = format!("key_{:026}", s.api_keys.len() + 1);
+            let scopes: Vec<String> = v["scopes"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let name = v["name"].as_str().unwrap_or("").to_string();
+            s.api_keys.push((id.clone(), name.clone(), scopes.clone()));
+            let token = format!("hk_{}_{}", &id[4..], "A".repeat(43));
+            json_resp(
+                StatusCode::CREATED,
+                json!({ "key": { "id": id, "name": name, "scopes": scopes, "createdAt": 1,
+                                  "createdBy": device, "expiresAt": now_ms() + 86_400_000,
+                                  "lastUsedAt": null },
+                        "token": token }),
+            )
+        }
+        ("GET", "/v1/keys") => {
+            let s = st.lock().unwrap();
+            let keys: Vec<Value> = s
+                .api_keys
+                .iter()
+                .filter(|(id, _, _)| !s.revoked_keys.contains(id))
+                .map(|(id, name, scopes)| {
+                    json!({ "id": id, "name": name, "scopes": scopes, "createdAt": 1,
+                            "createdBy": device, "expiresAt": now_ms() + 86_400_000,
+                            "lastUsedAt": null })
+                })
+                .collect();
+            json_resp(StatusCode::OK, json!({ "keys": keys }))
+        }
+        ("DELETE", path) if path.starts_with("/v1/keys/") => {
+            st.lock()
+                .unwrap()
+                .revoked_keys
+                .push(path["/v1/keys/".len()..].to_string());
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Full::new(Bytes::new()).boxed())
+                .unwrap()
+        }
+        ("GET", "/v1/audit") => json_resp(
             StatusCode::OK,
-            json!({ "devices": [{ "id": device, "name": "test", "createdAt": 1,
-                                  "lastSeenAt": null, "current": true }] }),
+            json!({ "entries": [
+                { "at": 1792233600000u64, "kind": "hook.created", "actor": device,
+                  "subject": "hk_1", "name": "ci\u{1b}[2J" },
+                { "at": 1792231200000u64, "kind": "verify.failed", "actor": null,
+                  "subject": "hk_1", "name": "ci", "count": 3 }
+            ] }),
         ),
         ("POST", "/v1/hooks") => {
             let v: Value = serde_json::from_slice(body).unwrap_or_default();
-            let hook = json!({ "id": "hk_1", "name": v["name"], "url": "https://relay.example/h/hk_1",
-                               "enabled": true, "verify": { "preset": v["verify"]["preset"] },
+            let mut verify = v["verify"].clone();
+            let supplied = verify.get("secret").is_some();
+            if let Some(o) = verify.as_object_mut() {
+                o.remove("secret");
+            }
+            let strict = verify["strict"] == json!(true);
+            let mut s = st.lock().unwrap();
+            s.hook_requests.push(v.clone());
+            let id = format!("hk_{}", s.hooks.len() + 1);
+            let hook = json!({ "id": id, "name": v["name"], "url": format!("https://relay.example/h/{id}"),
+                               "enabled": true, "verify": verify,
                                "maxBodyBytes": 1048576, "createdAt": 1, "lastEventAt": null });
-            st.lock().unwrap().hooks.push(hook.clone());
-            json_resp(
-                StatusCode::CREATED,
-                json!({ "hook": hook, "url": "https://relay.example/h/hk_1",
-                        "secret": "s3cret" }),
-            )
+            s.hooks.push(hook.clone());
+            let mut out = json!({ "hook": hook, "url": format!("https://relay.example/h/{id}") });
+            // Like the relay: a secret only when it generated one.
+            if !supplied && !strict {
+                out["secret"] = json!("s3cret");
+            }
+            json_resp(StatusCode::CREATED, out)
+        }
+        ("GET", path) if path.starts_with("/v1/hooks/") => {
+            let id = &path["/v1/hooks/".len()..];
+            let hook = st
+                .lock()
+                .unwrap()
+                .hooks
+                .iter()
+                .find(|h| h["id"] == id)
+                .cloned();
+            match hook {
+                Some(h) => json_resp(StatusCode::OK, h),
+                None => json_resp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error":"not_found","message":"Nothing is here."}),
+                ),
+            }
         }
         ("GET", "/v1/hooks") => {
             let hooks = st.lock().unwrap().hooks.clone();
@@ -377,12 +575,18 @@ fn signed_route(
                 .get("last-event-id")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse().ok());
+            let protocol = parts
+                .headers
+                .get("x-00h-protocol")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let conn = {
                 let mut s = st.lock().unwrap();
                 s.stream_requests.push(last);
+                s.stream_protocols.push(protocol);
                 s.script.pop_front().unwrap_or(Conn::Normal)
             };
-            stream_response(st.clone(), last, conn)
+            stream_response(st.clone(), last, conn, device.to_string())
         }
         _ => json_resp(
             StatusCode::NOT_FOUND,
@@ -445,34 +649,36 @@ fn frame(e: &Value) -> String {
     format!("id: {}\nevent: hook\ndata: {}\n\n", e["seq"], e)
 }
 
-/// The frame for `e`, garbled when the test asked for its seq to be.
-fn frame_for(st: &Arc<Mutex<State>>, e: &Value) -> String {
+/// The frame for `e` as `device` receives it (sealed when it has a key), garbled when the test
+/// asked for its seq to be.
+fn frame_for(st: &Arc<Mutex<State>>, device: &str, e: &Value) -> String {
     let seq = e["seq"].as_u64().unwrap();
-    if st.lock().unwrap().garbled.contains(&seq) {
+    let s = st.lock().unwrap();
+    if s.garbled.contains(&seq) {
         format!("id: {seq}\nevent: hook\ndata: {{\"seq\":{seq},\"id\":\"evt_garbled\n\n")
     } else {
-        frame(e)
+        frame(&sealed_for(&s, device, e))
     }
 }
 
-fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn) -> Resp {
+fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn, device: String) -> Resp {
     let (tx, rx) = mpsc::channel::<Bytes>(64);
     tokio::spawn(async move {
         let send = |s: String| {
             let tx = tx.clone();
             async move { tx.send(Bytes::from(s)).await.is_ok() }
         };
-        let (acked, head) = {
+        let (acked, head, kid) = {
             let s = st.lock().unwrap();
             let head = s.log.last().and_then(|e| e["seq"].as_u64()).unwrap_or(0);
-            (s.acked, head)
+            (s.acked, head, s.seal_keys.get(&device).map(|k| seal_kid(k)))
         };
         let mut after = last.unwrap_or(0).max(acked);
         if let Conn::Rewind(n) = conn {
             after = after.saturating_sub(n);
         }
-        let ready =
-            json!({ "accountId": "acc_1", "deviceId": "dev_1", "after": after, "head": head });
+        let ready = json!({ "accountId": "acc_1", "deviceId": device, "after": after,
+                            "head": head, "protocol": 2, "sealKid": kid });
         if !send(format!("retry: 5000\n\nevent: ready\ndata: {ready}\n\n")).await {
             return;
         }
@@ -501,7 +707,7 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn) -> Resp
         let mut sent = after;
         for e in backlog.iter().take(limit) {
             // Several frames per write, split mid-frame, so the client sees odd chunk boundaries.
-            let f = frame_for(&st, e);
+            let f = frame_for(&st, &device, e);
             let (a, b) = f.split_at(f.len() / 3);
             if !send(a.to_string()).await || !send(b.to_string()).await {
                 return;
@@ -511,7 +717,7 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn) -> Resp
         match conn {
             Conn::CutAfter(_) => {
                 if let Some(next) = backlog.get(limit) {
-                    let f = frame(next);
+                    let f = frame_for(&st, &device, next);
                     let _ = send(f[..f.len() / 2].to_string()).await;
                 }
                 return;
@@ -540,7 +746,7 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn) -> Resp
                     .collect()
             };
             for e in fresh {
-                if !send(frame_for(&st, &e)).await {
+                if !send(frame_for(&st, &device, &e)).await {
                     return;
                 }
                 sent = e["seq"].as_u64().unwrap();

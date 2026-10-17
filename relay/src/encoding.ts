@@ -116,7 +116,7 @@ export function toCrockford(bytes: Uint8Array): string {
   return out;
 }
 
-export type IdPrefix = "acc" | "dev" | "hk" | "evt" | "enr";
+export type IdPrefix = "acc" | "dev" | "hk" | "evt" | "enr" | "key";
 
 /** A new random id: the prefix, `_`, and 128 random bits in Crockford base32 (26 chars). */
 export function newId(prefix: IdPrefix): string {

@@ -93,10 +93,28 @@ async fn login_create_a_hook_listen_and_doctor() {
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();
-        assert_eq!(keys.len(), 1);
-        let mode = std::fs::metadata(&keys[0]).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        // The signing key and the sealing key, both private.
+        assert_eq!(keys.len(), 2);
+        assert!(
+            keys.iter().any(|k| k
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("seal-")),
+            "{keys:?}"
+        );
+        for k in &keys {
+            let mode = std::fs::metadata(k).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
+    // The relay key is pinned, and the relay holds the sealing key.
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["relayKey"], common::relay_key_b64());
+    assert_eq!(config["sealKids"].as_array().unwrap().len(), 1);
+    relay.with(|s| assert!(s.seal_keys.contains_key("dev_1")));
 
     // A second login without --force is refused.
     let out = blocking(argv(&["login", "--relay", "http://127.0.0.1:1"]))
@@ -286,8 +304,8 @@ async fn login_reads_the_code_from_stdin_and_force_revokes_the_previous_device()
             vec![("dev_1".to_string(), "dev_1".to_string())]
         );
     });
-    // Only the new device's key is left.
-    assert_eq!(std::fs::read_dir(dir.join("keys")).unwrap().count(), 1);
+    // Only the new device's keys are left (signing and sealing).
+    assert_eq!(std::fs::read_dir(dir.join("keys")).unwrap().count(), 2);
 
     // --code reads stdin too when it isn't a terminal. When the previous device can't be revoked,
     // the login still goes through and says so plainly.
@@ -320,4 +338,43 @@ async fn login_reads_the_code_from_stdin_and_force_revokes_the_previous_device()
     .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("No enrolment code"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_signup_or_code_is_explained_as_such() {
+    let relay = MockRelay::start().await;
+    relay.with(|s| s.signup_token = Some("right".into()));
+    let home = TempHome::new("cli-refused");
+    let dir = home.0.clone();
+    let url = relay.url.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        run(&dir, &["login", "--relay", &url, "--signup-token", "wrong"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("needs a signup token"), "{err}");
+    assert!(
+        !err.contains("--force") && !err.contains("revoked"),
+        "{err}"
+    );
+    // Nothing was kept: no login, no key.
+    assert!(!home.0.join("config.json").exists());
+
+    let dir = home.0.clone();
+    let url = relay.url.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        run_with_stdin(
+            &dir,
+            &["login", "--relay", &url, "--code-stdin"],
+            "ZZZZ-ZZZZ-ZZZZ\n",
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("code is wrong, used or expired"), "{err}");
+    assert!(!err.contains("--force"), "{err}");
 }

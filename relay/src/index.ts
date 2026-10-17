@@ -1,21 +1,23 @@
 // The 00hooks relay Worker: routes, signed-request checks, and the SSE bridge's front half.
 // The contract is docs/PROTOCOL.md at the repository root.
 
-import { createAccount, createEnrolment, listDevices, redeemEnrolment, revokeDevice } from "./accounts.ts";
-import { authenticate, type Caller } from "./auth.ts";
+import { createAccount, createEnrolment, listDevices, putSealKey, redeemEnrolment, revokeDevice } from "./accounts.ts";
+import { listEvents, readAudit } from "./audit.ts";
+import { authenticate, deviceAsPrincipal, type Caller, type Principal } from "./auth.ts";
+import { importRelayKey } from "./envelope.ts";
 import { describeError } from "./describe-error.ts";
 import { isId } from "./encoding.ts";
 import { HttpError, json, notFound, readLimited, tooLarge } from "./http.ts";
 import { createHook, deleteHook, getHook, listHooks, patchHook, rotateHook } from "./hooks.ts";
+import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
 import { receive } from "./receive.ts";
 import { ack, openStream } from "./stream.ts";
-import { VERSION } from "./version.ts";
+import { PROTOCOLS, STREAM_PROTOCOL, VERSION } from "./version.ts";
 
 // The main module may export only handlers and Durable Object classes: workerd refuses anything
 // else (a plain constant here stops the Worker from starting).
 export { AccountObject } from "./account-object.ts";
 
-const PROTOCOL_VERSION = 1;
 /** Management requests are small JSON; anything bigger is refused before it's hashed. */
 const API_BODY_LIMIT = 64 * 1024;
 
@@ -48,7 +50,16 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (!path.startsWith("/v1/")) return notFound();
 
   if (path === "/v1/info" && method === "GET") {
-    return json({ version: VERSION, protocol: PROTOCOL_VERSION, signupOpen: !env.SIGNUP_TOKEN, serverTime: Date.now() });
+    // The relay's envelope-signing key: clients pin it at login and check every envelope with it.
+    const relayKey = (await importRelayKey(env.RELAY_SIGNING_KEY))?.publicKey ?? null;
+    return json({
+      version: VERSION,
+      protocol: STREAM_PROTOCOL,
+      protocols: PROTOCOLS,
+      signupOpen: !env.SIGNUP_TOKEN,
+      relayKey,
+      serverTime: Date.now(),
+    });
   }
 
   const body = await readLimited(request, API_BODY_LIMIT);
@@ -58,20 +69,39 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (path === "/v1/accounts" && method === "POST") return createAccount(request, env, body);
   if (path === "/v1/enrolments/redeem" && method === "POST") return redeemEnrolment(request, env, body);
 
-  const signed = (): Promise<Caller> => authenticate(request, env, ctx, body);
+  // A device's signature may do anything its account may; an API key only what its scopes allow,
+  // and never what only a device may (the stream, acks, enrolments, sealing keys, keys themselves).
+  const signed = (): Promise<Caller> => (presentsKey(request) ? deviceOnly() : authenticate(request, env, ctx, body));
+  const scoped = async (scope: Scope): Promise<Principal> =>
+    presentsKey(request) ? authenticateKey(request, env, ctx, scope) : deviceAsPrincipal(await authenticate(request, env, ctx, body));
   const origin = url.origin;
 
   if (path === "/v1/enrolments" && method === "POST") return createEnrolment(env, await signed());
-  if (path === "/v1/devices" && method === "GET") return listDevices(env, await signed());
-  const dev = /^\/v1\/devices\/([^/]+)$/.exec(path);
-  if (dev && method === "DELETE") {
+  if (path === "/v1/devices" && method === "GET") return listDevices(env, await scoped("devices:write"));
+  const dev = /^\/v1\/devices\/([^/]+)(\/seal-key)?$/.exec(path);
+  if (dev && dev[2] && method === "PUT") {
     const caller = await signed();
+    return isId("dev", dev[1]) ? putSealKey(env, caller, dev[1]!, body) : notFound();
+  }
+  if (dev && !dev[2] && method === "DELETE") {
+    const caller = await scoped("devices:write");
     return isId("dev", dev[1]) ? revokeDevice(env, caller, dev[1]) : notFound();
   }
 
+  if (path === "/v1/keys") {
+    if (method === "POST") return createKey(env, await signed(), body);
+    if (method === "GET") return listKeys(env, await signed());
+    return notFound();
+  }
+  const key = /^\/v1\/keys\/([^/]+)$/.exec(path);
+  if (key && method === "DELETE") return revokeKey(env, await signed(), key[1]!);
+
+  if (path === "/v1/audit" && method === "GET") return readAudit(env, await scoped("audit:read"), url);
+  if (path === "/v1/events" && method === "GET") return listEvents(env, await scoped("events:read"), url);
+
   if (path === "/v1/hooks") {
-    if (method === "POST") return createHook(env, await signed(), origin, body);
-    if (method === "GET") return listHooks(env, await signed(), origin);
+    if (method === "POST") return createHook(env, await scoped("hooks:write"), origin, body);
+    if (method === "GET") return listHooks(env, await scoped("hooks:read"), origin);
     return notFound();
   }
   const hk = /^\/v1\/hooks\/([^/]+)(\/rotate)?$/.exec(path);
@@ -80,7 +110,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const rotate = hk[2] !== undefined;
     if (rotate && method !== "POST") return notFound();
     if (!rotate && method !== "GET" && method !== "PATCH" && method !== "DELETE") return notFound();
-    const caller = await signed();
+    const caller = await scoped(method === "GET" ? "hooks:read" : "hooks:write");
     if (!isId("hk", id)) return notFound();
     if (rotate) return rotateHook(env, caller, id);
     if (method === "GET") return getHook(env, caller, origin, id);

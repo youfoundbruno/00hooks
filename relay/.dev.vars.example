@@ -8,6 +8,11 @@ SECRETS_KEY=REPLACE_WITH_32_RANDOM_BYTES_BASE64
 #   openssl rand -base64 32
 HASH_PEPPER=REPLACE_WITH_A_LONG_RANDOM_STRING
 
+# Ed25519 seed (32 random bytes, base64) the relay signs every sealed envelope with. Its public half
+# is published at /v1/info, and clients pin it at login: changing it makes every device log in again.
+#   openssl rand -base64 32
+RELAY_SIGNING_KEY=REPLACE_WITH_32_RANDOM_BYTES_BASE64
+
 # Optional. When set, creating an account needs `Authorization: Bearer <SIGNUP_TOKEN>`.
 # Leave it unset only for local development: signups are then open to anyone.
 # SIGNUP_TOKEN=REPLACE_WITH_A_LONG_RANDOM_STRING

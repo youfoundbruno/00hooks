@@ -273,6 +273,12 @@ describe("what each preset signs", () => {
     expect(EVENT_TYPE_SOURCE).toEqual({
       github: "claimed",
       "standard-webhooks": "signed",
+      "standard-webhooks-ed25519": "signed",
+      stripe: "signed",
+      slack: "signed",
+      linear: "signed",
+      shopify: "claimed",
+      twilio: "none",
       hmac: "none",
       token: "none",
       unverified: "none",

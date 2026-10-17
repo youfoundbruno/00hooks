@@ -16,5 +16,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "files": ["idle-cost.ts"]
+  "files": ["idle-cost.ts", "seal-interop.ts"]
 }

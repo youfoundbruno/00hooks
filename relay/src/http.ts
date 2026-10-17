@@ -11,6 +11,7 @@ export type ErrorCode =
   | "invalid"
   | "conflict"
   | "quota"
+  | "forbidden"
   | "unavailable";
 
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -31,6 +32,8 @@ export function error(
 }
 
 export const notFound = () => error(404, "not_found", "Nothing is here.");
+/** Authenticated, but not allowed this: an API key without the scope, or a route only a device may use. */
+export const forbidden = (message: string) => error(403, "forbidden", message);
 export const unauthorized = () => error(401, "unauthorized", "The request isn't signed by a known device.");
 export const invalid = (field: string, message: string) => error(400, "invalid", message, { field });
 /** A safety binding (a rate limit) is missing: refuse rather than run unprotected. */

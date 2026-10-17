@@ -15,8 +15,25 @@ use crate::Secret;
 pub struct Info {
     pub version: String,
     pub protocol: u32,
+    /// Every stream protocol the relay serves (PROTOCOL §0); `[protocol]` when absent.
+    #[serde(default)]
+    pub protocols: Vec<u32>,
     pub signup_open: bool,
+    /// The relay's Ed25519 envelope-signing key (unpadded base64url), pinned at login.
+    #[serde(default)]
+    pub relay_key: Option<String>,
     pub server_time: i64,
+}
+
+impl Info {
+    /// Whether the relay serves stream protocol `v`.
+    pub fn serves(&self, v: u32) -> bool {
+        if self.protocols.is_empty() {
+            self.protocol == v
+        } else {
+            self.protocols.contains(&v)
+        }
+    }
 }
 
 /// `POST /v1/accounts` and `POST /v1/enrolments/redeem`.
@@ -46,6 +63,9 @@ pub struct DeviceInfo {
     pub last_seen_at: Option<i64>,
     #[serde(default)]
     pub current: bool,
+    /// The kid of the sealing key the relay holds for it; `None` when it has none.
+    #[serde(default)]
+    pub seal_kid: Option<String>,
 }
 
 /// A hook's verification settings: the preset and its non-secret fields.
@@ -101,15 +121,29 @@ pub struct HookPatch {
     pub max_body_bytes: Option<u64>,
 }
 
-/// An event (PROTOCOL §5), as delivered in `event: hook`.
+/// `sealed` in an event (PROTOCOL §5): an HPKE envelope for this device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Sealed {
+    pub kid: String,
+    pub enc: String,
+    pub ct: String,
+}
+
+/// An event (PROTOCOL §5). As delivered in `event: hook` it is sealed (`sealed` and `sig` set,
+/// `headers` and `body` empty); a subscription opens it ([`crate::seal::Opener`]) before recording
+/// and handing it over, so consumers see `headers`, `content_type` and `body`, as in protocol 1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Event {
     pub seq: u64,
     pub id: String,
     pub hook_id: String,
     pub received_at: i64,
+    /// Verified by the relay or, for a strict hook, by this device after opening.
     pub verified: bool,
+    /// A strict hook: the provider's signature is checked on the device (PROTOCOL §3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
     pub preset: String,
     #[serde(default)]
     pub event_type: Option<String>,
@@ -119,6 +153,12 @@ pub struct Event {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub body: String,
+    /// The envelope, until it is opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<Sealed>,
+    /// The relay's signature over the envelope, until it is opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -138,7 +178,7 @@ impl Event {
 }
 
 /// Padded standard base64 first (what the protocol sends), then any other common spelling.
-pub(crate) fn decode_base64_lenient(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+pub fn decode_base64_lenient(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     use base64::engine::general_purpose::STANDARD;
     use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
     if let Ok(bytes) = STANDARD.decode(s) {
@@ -161,6 +201,11 @@ pub struct Ready {
     pub device_id: String,
     pub after: u64,
     pub head: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
+    /// The sealing key the relay holds for this device (PROTOCOL §6); `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_kid: Option<String>,
 }
 
 /// `event: gap`: an inclusive range of seqs that retention dropped.
@@ -186,6 +231,41 @@ pub struct Closed {
     pub reason: String,
 }
 
+/// An API key (PROTOCOL §9). Its token is shown only in [`CreatedKey`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKey {
+    pub id: String,
+    pub name: String,
+    pub scopes: Vec<String>,
+    pub created_at: i64,
+    pub created_by: String,
+    pub expires_at: i64,
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+}
+
+/// `POST /v1/keys` → `{ key, token }`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatedKey {
+    pub key: ApiKey,
+    pub token: Secret,
+}
+
+/// One entry of `GET /v1/audit`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditEntry {
+    pub at: i64,
+    pub kind: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+    pub subject: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+}
+
 /// An error body (PROTOCOL §8).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -208,13 +288,13 @@ mod tests {
     fn event_round_trips_unknown_fields() {
         let raw = r#"{"seq":42,"id":"evt_1","hookId":"hk_1","receivedAt":1,"verified":true,
             "preset":"github","eventType":"push","contentType":"application/json",
-            "headers":{"x-github-event":"push"},"body":"e30=","sealed":{"v":1}}"#;
+            "headers":{"x-github-event":"push"},"body":"e30=","future":{"v":1}}"#;
         let e: Event = serde_json::from_str(raw).unwrap();
         assert_eq!(e.seq, 42);
         assert_eq!(e.body_bytes().unwrap(), b"{}");
         assert_eq!(e.body_len(), 2);
         let back = serde_json::to_value(&e).unwrap();
-        assert_eq!(back["sealed"]["v"], 1);
+        assert_eq!(back["future"]["v"], 1);
         assert_eq!(back["hookId"], "hk_1");
     }
 

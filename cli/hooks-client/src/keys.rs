@@ -75,13 +75,31 @@ impl std::fmt::Debug for DeviceKey {
     }
 }
 
-/// Where device key seeds are kept.
+/// Where device keys (the signing seed, the sealing keys) and strict hooks' secrets are kept.
 pub trait KeyStore: Send + Sync {
     /// A short name for messages: "the keychain", "a file".
     fn describe(&self) -> String;
-    fn load(&self, name: &str) -> Result<Option<[u8; 32]>>;
-    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()>;
+    fn load_bytes(&self, name: &str) -> Result<Option<Vec<u8>>>;
+    fn save_bytes(&self, name: &str, bytes: &[u8]) -> Result<()>;
     fn delete(&self, name: &str) -> Result<()>;
+
+    /// A 32-byte key.
+    fn load(&self, name: &str) -> Result<Option<[u8; 32]>> {
+        match self.load_bytes(name)? {
+            None => Ok(None),
+            Some(mut b) => {
+                let key = <[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
+                    Error::KeyStore(format!("the key {name} in {} is damaged", self.describe()))
+                });
+                b.fill(0);
+                key.map(Some)
+            }
+        }
+    }
+
+    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()> {
+        self.save_bytes(name, seed)
+    }
 }
 
 /// Key names become keychain accounts and file names, so they are kept to a safe alphabet.
@@ -98,17 +116,16 @@ pub fn check_key_name(name: &str) -> Result<()> {
     }
 }
 
-fn encode_seed(seed: &[u8; 32]) -> String {
-    URL_SAFE_NO_PAD.encode(seed)
+// Every entry is base64url text, so a device seed reads the same as before (32 bytes) and other
+// entries (strict hooks' secrets) fit the keychain's text values.
+fn encode_bytes(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn decode_seed(text: &str, where_: &str) -> Result<[u8; 32]> {
-    let bytes = URL_SAFE_NO_PAD
+fn decode_bytes(text: &str, where_: &str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
         .decode(text.trim())
-        .map_err(|_| Error::KeyStore(format!("the device key in {where_} is damaged")))?;
-    bytes
-        .try_into()
-        .map_err(|_| Error::KeyStore(format!("the device key in {where_} is damaged")))
+        .map_err(|_| Error::KeyStore(format!("a key in {where_} is damaged")))
 }
 
 /// The OS keychain: macOS Keychain, the Secret Service on Linux, Credential Manager on Windows.
@@ -136,17 +153,17 @@ impl KeyStore for KeychainStore {
         "the keychain".into()
     }
 
-    fn load(&self, name: &str) -> Result<Option<[u8; 32]>> {
+    fn load_bytes(&self, name: &str) -> Result<Option<Vec<u8>>> {
         match Self::entry(name)?.get_password() {
-            Ok(text) => decode_seed(&text, "the keychain").map(Some),
+            Ok(text) => decode_bytes(&text, "the keychain").map(Some),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(keychain_error(e)),
         }
     }
 
-    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()> {
+    fn save_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
         Self::entry(name)?
-            .set_password(&encode_seed(seed))
+            .set_password(&encode_bytes(bytes))
             .map_err(keychain_error)
     }
 
@@ -231,7 +248,7 @@ impl KeyStore for FileKeyStore {
         format!("a private file in {}", self.dir.display())
     }
 
-    fn load(&self, name: &str) -> Result<Option<[u8; 32]>> {
+    fn load_bytes(&self, name: &str) -> Result<Option<Vec<u8>>> {
         let path = self.path(name)?;
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -240,13 +257,13 @@ impl KeyStore for FileKeyStore {
         }
         check_private(&path)?;
         let text = std::fs::read_to_string(&path)?;
-        decode_seed(&text, &path.display().to_string()).map(Some)
+        decode_bytes(&text, &path.display().to_string()).map(Some)
     }
 
-    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()> {
+    fn save_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
         let path = self.path(name)?;
         fsutil::create_private_dir(&self.dir)?;
-        fsutil::write_atomic(&path, encode_seed(seed).as_bytes(), true)
+        fsutil::write_atomic(&path, encode_bytes(bytes).as_bytes(), true)
     }
 
     fn delete(&self, name: &str) -> Result<()> {
@@ -260,7 +277,7 @@ impl KeyStore for FileKeyStore {
 /// Keys in memory only, for tests.
 #[derive(Debug, Default)]
 pub struct MemoryKeyStore {
-    keys: Mutex<HashMap<String, [u8; 32]>>,
+    keys: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MemoryKeyStore {
@@ -274,17 +291,17 @@ impl KeyStore for MemoryKeyStore {
         "memory".into()
     }
 
-    fn load(&self, name: &str) -> Result<Option<[u8; 32]>> {
+    fn load_bytes(&self, name: &str) -> Result<Option<Vec<u8>>> {
         check_key_name(name)?;
-        Ok(self.keys.lock().expect("key map").get(name).copied())
+        Ok(self.keys.lock().expect("key map").get(name).cloned())
     }
 
-    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()> {
+    fn save_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
         check_key_name(name)?;
         self.keys
             .lock()
             .expect("key map")
-            .insert(name.to_string(), *seed);
+            .insert(name.to_string(), bytes.to_vec());
         Ok(())
     }
 
