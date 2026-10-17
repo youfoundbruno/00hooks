@@ -53,8 +53,11 @@ impl Jitter {
     }
 }
 
-/// Exponential backoff with jitter: attempt `n` waits a random time in `[max(min, d/2), d]` where
-/// `d = min(max, base · 2ⁿ)`. `base` starts at `min` and follows the stream's `retry:` field.
+/// Exponential backoff with jitter, as PROTOCOL §6 states it: wait a random time between half and
+/// all of `min(30 s, retry × 2^attempt)`, never under 1 s; `attempt` resets after `ready`.
+///
+/// Here `max` is the 30 s cap, `min` the 1 s floor, and `base` the stream's `retry:` value (kept
+/// within `min..=max`; `min` until the stream sends one). The caller resets after `ready`.
 #[derive(Debug, Clone)]
 pub struct Backoff {
     min: Duration,
@@ -185,6 +188,30 @@ mod tests {
             "only {} distinct second delays",
             firsts.len()
         );
+    }
+
+    #[test]
+    fn delays_follow_the_protocol_formula_for_retry_5000() {
+        // PROTOCOL §6: between half and all of min(30 s, retry × 2^attempt), never under 1 s.
+        for seed in 0..200 {
+            let mut b = backoff(seed);
+            b.set_base(Duration::from_millis(5000));
+            for attempt in 0..10u32 {
+                let all = Duration::from_millis(5000 * (1u64 << attempt)).min(30 * S);
+                let half = (all / 2).max(S);
+                let d = b.next_delay();
+                assert!(
+                    d >= half && d <= all,
+                    "seed {seed} attempt {attempt}: {d:?}"
+                );
+            }
+            b.reset();
+            let d = b.next_delay();
+            assert!(
+                d >= Duration::from_millis(2500) && d <= 5 * S,
+                "after reset: {d:?}"
+            );
+        }
     }
 
     #[test]

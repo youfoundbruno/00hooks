@@ -26,8 +26,10 @@ pub fn body_hash(body: &[u8]) -> String {
     out
 }
 
-/// The canonical string of PROTOCOL §1: seven lines joined with `\n`, no trailing newline.
+/// The canonical string of PROTOCOL §1: eight lines joined with `\n`, no trailing newline. The
+/// device id is signed so a signature can't be presented as another device's.
 pub fn canonical_string(
+    device_id: &str,
     host: &str,
     method: &str,
     path_and_query: &str,
@@ -37,6 +39,7 @@ pub fn canonical_string(
 ) -> String {
     [
         CANONICAL_VERSION,
+        device_id,
         &host.to_ascii_lowercase(),
         &method.to_ascii_uppercase(),
         path_and_query,
@@ -47,8 +50,8 @@ pub fn canonical_string(
     .join("\n")
 }
 
-/// The host line: lowercase, with `:port` only when the URL names a port that isn't its scheme's
-/// default (exactly what an HTTP client puts in the `Host` header).
+/// The host line: exactly the `Host` header an HTTP client sends for `url`: lowercase, IPv6 in
+/// brackets, `:port` only when it isn't the scheme's default.
 pub fn signing_host(url: &Url) -> Result<String> {
     let host = url
         .host_str()
@@ -106,6 +109,7 @@ pub fn sign_with(
     nonce: &str,
 ) -> Result<SignedHeaders> {
     let canonical = canonical_string(
+        device_id,
         &signing_host(url)?,
         method,
         &path_and_query(url),
@@ -135,15 +139,17 @@ mod tests {
     const TIME: i64 = 1792233600000;
     const NONCE: &str = "AAECAwQFBgcICQoLDA0ODw";
     const BODY: &str = r#"{"name":"ci","verify":{"preset":"github"}}"#;
+    const DEVICE: &str = "dev_0123456789abcdefghjkmnpq";
     const PUBLIC_KEY: &str = "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg";
     const BODY_HASH: &str = "871ec9aaacf62bacee0fb97ada9c29fed342cd0d7a3a07731570385a03c17a4c";
     const SIGNATURE: &str =
-        "OlQhu7X6asl-UprVxIhRjftd-Hl-KN6hOcQdDgiJlLacZL6pbTwK3-E-TOtNaqW7wOTr2QkRirJfp0O8hDOaAQ";
+        "_nBVrNWhRGN_JWnxbDBmQjNFDXz5APg0zqD6eCXe7EeJptiP0-Xb1czIn-r0p9faavla1rF7dhbtotQ3OTR1DA";
 
     #[test]
     fn canonical_string_matches_the_protocol_vector() {
         let url = Url::parse(URL).unwrap();
         let s = canonical_string(
+            DEVICE,
             &signing_host(&url).unwrap(),
             "post",
             &path_and_query(&url),
@@ -152,7 +158,7 @@ mod tests {
             BODY.as_bytes(),
         );
         let expected = format!(
-            "00hooks-v1\nrelay.example.com\nPOST\n/v1/hooks?limit=10\n1792233600000\nAAECAwQFBgcICQoLDA0ODw\n{BODY_HASH}"
+            "00hooks-v1\n{DEVICE}\nrelay.example.com\nPOST\n/v1/hooks?limit=10\n1792233600000\nAAECAwQFBgcICQoLDA0ODw\n{BODY_HASH}"
         );
         assert_eq!(s, expected);
         assert_eq!(body_hash(BODY.as_bytes()), BODY_HASH);
@@ -163,15 +169,26 @@ mod tests {
         let key = DeviceKey::from_seed(&SEED);
         assert_eq!(key.public_key(), PUBLIC_KEY);
         let url = Url::parse(URL).unwrap();
-        let h = sign_with(&key, "dev_0", "POST", &url, BODY.as_bytes(), TIME, NONCE).unwrap();
+        let h = sign_with(&key, DEVICE, "POST", &url, BODY.as_bytes(), TIME, NONCE).unwrap();
         assert_eq!(h.signature, SIGNATURE);
         assert_eq!(h.signature.len(), 86);
+        assert_eq!(h.device, DEVICE);
+    }
+
+    #[test]
+    fn the_signature_is_bound_to_the_device_id() {
+        let key = DeviceKey::from_seed(&SEED);
+        let url = Url::parse(URL).unwrap();
+        let other = "dev_0123456789abcdefghjkmnpr";
+        let h = sign_with(&key, other, "POST", &url, BODY.as_bytes(), TIME, NONCE).unwrap();
+        assert_ne!(h.signature, SIGNATURE);
     }
 
     #[test]
     fn the_protocol_document_carries_the_same_vector() {
         let doc = include_str!("../../../docs/PROTOCOL.md");
         for value in [
+            DEVICE,
             PUBLIC_KEY,
             BODY_HASH,
             SIGNATURE,
@@ -200,6 +217,8 @@ mod tests {
         assert_eq!(h("https://relay.example.com:443/"), "relay.example.com");
         assert_eq!(h("http://relay.example.com:80/"), "relay.example.com");
         assert_eq!(h("http://127.0.0.1:8787/"), "127.0.0.1:8787");
+        assert_eq!(h("http://[::1]:8787/"), "[::1]:8787");
+        assert_eq!(h("https://[::1]/"), "[::1]");
         assert_eq!(
             h("https://relay.example.com:8443/"),
             "relay.example.com:8443"

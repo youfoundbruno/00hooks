@@ -205,7 +205,15 @@ fn check_signed(
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
-    let canonical = canonical_string(&host, req.method.as_str(), &path, time, &nonce, body);
+    let canonical = canonical_string(
+        &device,
+        &host,
+        req.method.as_str(),
+        &path,
+        time,
+        &nonce,
+        body,
+    );
     let ok = URL_SAFE_NO_PAD
         .decode(&sig)
         .ok()

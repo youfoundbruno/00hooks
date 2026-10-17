@@ -124,7 +124,8 @@ pub struct Event {
 }
 
 impl Event {
-    /// The raw body bytes. Accepts standard or URL-safe base64, padded or not.
+    /// The raw body bytes. The protocol sends padded standard base64 (RFC 4648 §4); URL-safe or
+    /// unpadded bodies are accepted too.
     pub fn body_bytes(&self) -> Result<Vec<u8>, base64::DecodeError> {
         decode_base64_lenient(&self.body)
     }
@@ -136,15 +137,20 @@ impl Event {
     }
 }
 
+/// Padded standard base64 first (what the protocol sends), then any other common spelling.
 pub(crate) fn decode_base64_lenient(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::engine::general_purpose::STANDARD;
     use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-    let cfg = GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
-    let standard = GeneralPurpose::new(&base64::alphabet::STANDARD, cfg);
-    if s.contains(['-', '_']) {
-        GeneralPurpose::new(&base64::alphabet::URL_SAFE, cfg).decode(s)
-    } else {
-        standard.decode(s)
+    if let Ok(bytes) = STANDARD.decode(s) {
+        return Ok(bytes);
     }
+    let cfg = GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
+    let alphabet = if s.contains(['-', '_']) {
+        &base64::alphabet::URL_SAFE
+    } else {
+        &base64::alphabet::STANDARD
+    };
+    GeneralPurpose::new(alphabet, cfg).decode(s)
 }
 
 /// `event: ready`.
@@ -210,6 +216,15 @@ mod tests {
         let back = serde_json::to_value(&e).unwrap();
         assert_eq!(back["sealed"]["v"], 1);
         assert_eq!(back["hookId"], "hk_1");
+    }
+
+    #[test]
+    fn body_decodes_padded_standard_base64() {
+        // Bytes that need `+`, `/` and padding in the standard alphabet.
+        assert_eq!(decode_base64_lenient("+/8=").unwrap(), vec![0xfb, 0xff]);
+        assert_eq!(decode_base64_lenient("e30=").unwrap(), b"{}");
+        assert_eq!(decode_base64_lenient("").unwrap(), b"");
+        assert!(decode_base64_lenient("not base64!").is_err());
     }
 
     #[test]
