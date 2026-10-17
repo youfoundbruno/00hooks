@@ -279,6 +279,13 @@ AI actions:
   **access profile** (§6). The event arrives as a quoted block marked as untrusted data, with the hook
   and the verified/unverified flag. The agent's reply can feed a following action (for example *notify
   me with the agent's summary*).
+  - *Built in the runner for hosts*: a host that runs agents (00next) gives the runner its
+    automations as data (`Runner::open_with`, `set_automations`) and runs `ActionKind::Ask` through
+    the `ask::Asker` trait. The event reaches the agent through `ask::quote_event`: a header saying
+    it is untrusted outside content, the hook, the kind and the verified flag, then the payload in a
+    fence its content can't close. The reply is `{{agent.reply}}` (with `agent.name`, `agent.id`)
+    for the actions after it, and the run record keeps it (`output`). The CLI has no agents, so
+    there the action fails and says why; `automations.yaml` doesn't write it.
 
 ### 5.3 Reliability
 

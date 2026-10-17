@@ -134,6 +134,17 @@ pub enum ActionKind {
         name: Template,
         content: JsonTemplate,
     },
+    /// Ask an agent about the event (`crate::ask`). Only a host that runs agents (00next) makes
+    /// these; they aren't written in `automations.yaml`.
+    Ask {
+        /// The host's spelling: an agent's id, or "new" for a new agent per event.
+        agent: String,
+        /// The person's instructions, as written (never templated).
+        instructions: String,
+        /// The access profile, as the host spells it.
+        profile: String,
+        timeout: Duration,
+    },
 }
 
 impl ActionKind {
@@ -143,6 +154,7 @@ impl ActionKind {
             ActionKind::Call { .. } => "call",
             ActionKind::Run { .. } => "run",
             ActionKind::Append { .. } | ActionKind::WriteFile { .. } => "write",
+            ActionKind::Ask { .. } => "ask",
         }
     }
 }
@@ -1339,6 +1351,7 @@ pub fn field_refs(a: &Automation) -> Vec<(usize, fpath::Path)> {
                 add(name.paths().collect());
                 add(content.paths());
             }
+            ActionKind::Ask { .. } => {}
         }
     }
     out

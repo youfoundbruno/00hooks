@@ -50,7 +50,13 @@ pub struct ActionResult {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// What an "ask an agent" action got back: the agent's reply (cut to `MAX_OUTPUT` characters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
+
+/// The most of an agent's reply a run record keeps.
+pub const MAX_OUTPUT: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -307,6 +313,12 @@ impl RunLog {
             .iter()
             .filter(|r| r.event_id == event_id)
             .collect()
+    }
+
+    /// The newest `n` archived events, newest first (for previews against real events).
+    pub fn recent_events(&self, n: usize) -> Result<Vec<Event>> {
+        let (events, _) = jsonl::read_all::<Event>(&self.events_path)?;
+        Ok(events.into_iter().rev().take(n).collect())
     }
 
     /// An archived event, by id (or by seq, written as a number).

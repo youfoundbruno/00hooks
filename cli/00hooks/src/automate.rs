@@ -792,6 +792,7 @@ mod tests {
                         ms: 10,
                         error: Some("HTTP 503 from x\u{1b}[2J".into()),
                         detail: None,
+                        output: None,
                     }],
                 },
                 AutomationRun {

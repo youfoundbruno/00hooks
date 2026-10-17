@@ -9,6 +9,7 @@ use hooks_client::Event;
 use serde_json::{Value, json};
 
 use crate::actions::{self, Failure, Notifier, NullNotifier, SystemNotifier};
+use crate::ask::{AskRequest, Asker};
 use crate::catalogue::{Catalogue, Observation};
 use crate::config::{
     Action, ActionKind, Automation, Automations, NotifyMode, Trigger, describe_rate, hook_matches,
@@ -34,6 +35,8 @@ pub struct RunnerOptions {
     pub secrets: Arc<dyn SecretStore>,
     /// The first retry's wait; doubles each time, at most 30 s.
     pub retry_base: Duration,
+    /// Runs "ask an agent" actions; `None` (the CLI) makes them fail, saying why.
+    pub asker: Option<Arc<dyn Asker>>,
 }
 
 impl RunnerOptions {
@@ -47,6 +50,7 @@ impl RunnerOptions {
             notifier: None,
             secrets,
             retry_base: Duration::from_secs(1),
+            asker: None,
         }
     }
 }
@@ -62,6 +66,8 @@ pub struct Runner {
     opts: RunnerOptions,
     config: Automations,
     config_stamp: Option<SystemTime>,
+    /// The host gave the automations (`open_with`): the file is never read.
+    given: bool,
     catalogue: Catalogue,
     runs: RunLog,
     states: States,
@@ -94,8 +100,24 @@ impl Runner {
     pub fn open(opts: RunnerOptions) -> Result<Runner> {
         hooks_client::fsutil::create_private_dir(&opts.dir).map_err(Error::from_client)?;
         let config = Automations::load(&opts.automations).map_err(Error::Config)?;
+        Self::start(opts, config, false)
+    }
+
+    /// Open the runner's store with automations the host keeps as data (00next), instead of
+    /// `automations.yaml`. `set_automations` replaces them; the file is never read.
+    pub fn open_with(opts: RunnerOptions, automations: Automations) -> Result<Runner> {
+        hooks_client::fsutil::create_private_dir(&opts.dir).map_err(Error::from_client)?;
+        Self::start(opts, automations, true)
+    }
+
+    fn start(opts: RunnerOptions, config: Automations, given: bool) -> Result<Runner> {
         let mut r = Runner {
-            config_stamp: stamp(&opts.automations),
+            given,
+            config_stamp: if given {
+                None
+            } else {
+                stamp(&opts.automations)
+            },
             catalogue: Catalogue::open(opts.dir.join("catalogue"))?,
             runs: RunLog::open(&opts.dir)?,
             states: States::open(&opts.dir)?,
@@ -121,8 +143,26 @@ impl Runner {
         &self.config
     }
 
+    /// Replace the automations (a host that keeps them as data).
+    pub fn set_automations(&mut self, automations: Automations) {
+        self.config = automations;
+        if let Err(e) = self.apply_structure_only() {
+            self.say(format!("Couldn't apply structure_only: {e}"));
+        }
+    }
+
     pub fn catalogue(&self) -> &Catalogue {
         &self.catalogue
+    }
+
+    /// To clear a kind's sample, forget a kind, or clear the whole catalogue.
+    pub fn catalogue_mut(&mut self) -> &mut Catalogue {
+        &mut self.catalogue
+    }
+
+    /// Each automation's rate-limit and circuit-breaker state, by name.
+    pub fn states(&self) -> &States {
+        &self.states
     }
 
     pub fn runs(&self) -> &RunLog {
@@ -190,6 +230,9 @@ impl Runner {
     /// Re-read `automations.yaml` when it changed. A file with problems is reported and the
     /// previous automations stay in force.
     pub fn reload_if_changed(&mut self) {
+        if self.given {
+            return;
+        }
         let now = stamp(&self.opts.automations);
         if now == self.config_stamp {
             return;
@@ -549,12 +592,17 @@ impl Runner {
                 return run;
             }
         }
+        // Each automation reads the event, plus what its own "ask an agent" actions answered.
+        let mut ctx = ctx.clone();
         for action in &a.actions {
-            let result = self.run_action(a, action, ctx, hop).await;
+            let (result, answer) = self.run_action(a, action, &ctx, e, hop).await;
             let ok = result.ok;
             run.actions.push(result);
             if !ok {
                 break;
+            }
+            if let (Some(answer), Value::Object(m)) = (answer, &mut ctx) {
+                m.insert("agent".into(), answer);
             }
         }
         let ok = !run.failed();
@@ -583,28 +631,89 @@ impl Runner {
         run
     }
 
+    /// Run one action (with its retries). An "ask an agent" action also returns its answer, as
+    /// `agent` reads it in the templates after it.
     async fn run_action(
         &mut self,
         a: &Automation,
         action: &Action,
         ctx: &Value,
+        e: &Event,
         hop: u32,
-    ) -> ActionResult {
+    ) -> (ActionResult, Option<Value>) {
         let started = Instant::now();
+        if let ActionKind::Ask {
+            agent,
+            instructions,
+            profile,
+            timeout,
+        } = &action.kind
+        {
+            let req = AskRequest {
+                automation: a.name.clone(),
+                agent: agent.clone(),
+                instructions: instructions.clone(),
+                profile: profile.clone(),
+                timeout: *timeout,
+                event: e.clone(),
+                hook: self.names.get(&e.hook_id).cloned(),
+                kind: ctx["event"]["kind"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                payload: ctx["payload"].clone(),
+            };
+            let outcome = self.ask(req).await;
+            let ms = started.elapsed().as_millis() as u64;
+            return match outcome {
+                Ok(r) => {
+                    let output: String = r.reply.chars().take(crate::runs::MAX_OUTPUT).collect();
+                    let answer = json!({"reply": r.reply, "id": r.agent_id, "name": r.agent_name});
+                    (
+                        ActionResult {
+                            action: action.kind.label().into(),
+                            ok: true,
+                            attempts: 1,
+                            ms,
+                            error: None,
+                            detail: Some(format!("answered by {}", r.agent_name)),
+                            output: Some(output),
+                        },
+                        Some(answer),
+                    )
+                }
+                Err(f) => (
+                    ActionResult {
+                        action: action.kind.label().into(),
+                        ok: false,
+                        attempts: 1,
+                        ms,
+                        error: Some(f.message),
+                        detail: None,
+                        output: None,
+                    },
+                    None,
+                ),
+            };
+        }
         let mut attempts = 0;
         loop {
             attempts += 1;
             let outcome = self.exec(a, action, ctx, hop).await;
             match outcome {
                 Ok(detail) => {
-                    return ActionResult {
-                        action: action.kind.label().into(),
-                        ok: true,
-                        attempts,
-                        ms: started.elapsed().as_millis() as u64,
-                        error: None,
-                        detail: Some(detail),
-                    };
+                    return (
+                        ActionResult {
+                            action: action.kind.label().into(),
+                            ok: true,
+                            attempts,
+                            ms: started.elapsed().as_millis() as u64,
+                            error: None,
+                            detail: Some(detail),
+                            output: None,
+                        },
+                        None,
+                    );
                 }
                 Err(Failure { message, retryable }) => {
                     if retryable && attempts <= action.retries {
@@ -617,16 +726,39 @@ impl Runner {
                         tokio::time::sleep(wait).await;
                         continue;
                     }
-                    return ActionResult {
-                        action: action.kind.label().into(),
-                        ok: false,
-                        attempts,
-                        ms: started.elapsed().as_millis() as u64,
-                        error: Some(message),
-                        detail: None,
-                    };
+                    return (
+                        ActionResult {
+                            action: action.kind.label().into(),
+                            ok: false,
+                            attempts,
+                            ms: started.elapsed().as_millis() as u64,
+                            error: Some(message),
+                            detail: None,
+                            output: None,
+                        },
+                        None,
+                    );
                 }
             }
+        }
+    }
+
+    /// Ask the host's agent, within the action's time limit. Never retried: an agent's turn isn't
+    /// safe to repeat.
+    async fn ask(&self, req: AskRequest) -> Result<crate::ask::AskReply, Failure> {
+        let Some(asker) = self.opts.asker.clone() else {
+            return Err(Failure::fatal(
+                "asking an agent needs a host that runs agents, such as 00next; the 00hooks CLI \
+                 runs plain actions only",
+            ));
+        };
+        let limit = req.timeout;
+        match tokio::time::timeout(limit, asker.ask(req)).await {
+            Ok(r) => r,
+            Err(_) => Err(Failure::fatal(format!(
+                "the agent didn't answer within {} minutes",
+                limit.as_secs().div_ceil(60)
+            ))),
         }
     }
 
@@ -704,6 +836,8 @@ impl Runner {
                 name,
                 content,
             } => actions::write::write_file(folder, &name.render(ctx), &content.render(ctx)),
+            // Handled before the retry loop (`run_action`).
+            ActionKind::Ask { .. } => Err(Failure::fatal("an ask action can't run here")),
         }
     }
 

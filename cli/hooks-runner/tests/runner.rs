@@ -925,3 +925,157 @@ automations:
     assert!(rec.replay);
     assert_eq!(read_lines(&log).len(), 2);
 }
+
+/// A host's agents, for the tests: answers with what it was asked, or fails, or never answers.
+#[derive(Default)]
+struct FakeAgents {
+    asked: Mutex<Vec<hooks_runner::AskRequest>>,
+    mode: Mutex<&'static str>,
+}
+
+impl hooks_runner::Asker for FakeAgents {
+    fn ask(&self, req: hooks_runner::AskRequest) -> hooks_runner::ask::AskFuture<'_> {
+        Box::pin(async move {
+            let mode = *self.mode.lock().unwrap();
+            let quoted = hooks_runner::ask::quote_event(&req);
+            self.asked.lock().unwrap().push(req);
+            match mode {
+                "refuse" => Err(hooks_runner::actions::Failure::fatal(
+                    "the supervisor never answers outside content",
+                )),
+                "silent" => {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    unreachable!()
+                }
+                _ => Ok(hooks_runner::AskReply {
+                    agent_id: "ag_1".into(),
+                    agent_name: "Reviewer".into(),
+                    reply: format!("Looks fine. ({} chars of event)", quoted.len()),
+                }),
+            }
+        })
+    }
+}
+
+fn ask_action(timeout: Duration) -> hooks_runner::config::Action {
+    hooks_runner::config::Action {
+        kind: hooks_runner::config::ActionKind::Ask {
+            agent: "new".into(),
+            instructions: "Review this pull request.".into(),
+            profile: "read_only".into(),
+            timeout,
+        },
+        retries: 0,
+        line: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_gives_automations_as_data_and_an_agents_reply_feeds_the_next_action() {
+    let dir = Temp::new("ask");
+    // The host's automations: parsed here for brevity, then given as data, with an ask first.
+    let yaml = r#"
+automations:
+  - name: au_review
+    when: { hook: hk_gh, kinds: [pull_request] }
+    then:
+      - notify: { title: "{{agent.name}} on #{{payload.number}}", body: "{{agent.reply}}" }
+"#;
+    let mut given = hooks_runner::config::parse(yaml, &dir.0.join("not-read.yaml")).expect("valid");
+    given.automations[0]
+        .actions
+        .insert(0, ask_action(Duration::from_secs(5)));
+    let notifier = Arc::new(RecordingNotifier::default());
+    let agents = Arc::new(FakeAgents::default());
+    let mut opts = RunnerOptions::new(dir.0.join("runner"), dir.0.join("not-read.yaml"), "dev_me");
+    opts.notifier = Some(notifier.clone());
+    opts.asker = Some(agents.clone());
+    let mut runner = Runner::open_with(opts, given.clone()).unwrap();
+    // A file at the path is never read.
+    std::fs::write(dir.0.join("not-read.yaml"), "automations: [broken").unwrap();
+
+    let e = event(
+        1,
+        "pull_request",
+        &json!({"number": 7, "title": "Add a page"}),
+    );
+    let rec = runner.handle(&e).await;
+    assert_eq!(rec.status, RunStatus::Ok, "{rec:?}");
+    let actions = &rec.automations[0].actions;
+    assert_eq!(actions[0].action, "ask");
+    assert_eq!(actions[0].detail.as_deref(), Some("answered by Reviewer"));
+    assert!(
+        actions[0]
+            .output
+            .as_deref()
+            .unwrap()
+            .starts_with("Looks fine.")
+    );
+    // The reply feeds the notification.
+    let shown = notifier.shown.lock().unwrap().clone();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].0, "Reviewer on #7");
+    assert!(shown[0].1.starts_with("Looks fine."), "{shown:?}");
+    // The agent got the instructions as written and the event as data.
+    let asked = agents.asked.lock().unwrap()[0].clone();
+    assert_eq!(asked.automation, "au_review");
+    assert_eq!(asked.instructions, "Review this pull request.");
+    assert_eq!(asked.profile, "read_only");
+    assert_eq!(asked.kind, "pull_request");
+    assert_eq!(asked.payload["number"], 7);
+    assert!(asked.event.verified);
+
+    // A refusal fails the action and stops the ones after it.
+    *agents.mode.lock().unwrap() = "refuse";
+    let rec = runner
+        .handle(&event(2, "pull_request", &json!({"number": 8})))
+        .await;
+    assert_eq!(rec.status, RunStatus::Failed);
+    let run = &rec.automations[0];
+    assert_eq!(run.actions.len(), 1, "the notify didn't run");
+    assert!(
+        run.actions[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("never answers")
+    );
+    assert_eq!(notifier.shown.lock().unwrap().len(), 1);
+
+    // No answer within the limit is a failure too, never retried.
+    *agents.mode.lock().unwrap() = "silent";
+    let mut quick = given.clone();
+    quick.automations[0].actions[0] = ask_action(Duration::from_millis(200));
+    runner.set_automations(quick);
+    let rec = runner
+        .handle(&event(3, "pull_request", &json!({"number": 9})))
+        .await;
+    let a = &rec.automations[0].actions[0];
+    assert!(!a.ok && a.attempts == 1, "{a:?}");
+    assert!(
+        a.error.as_deref().unwrap().contains("didn't answer within"),
+        "{a:?}"
+    );
+
+    // Without a host that runs agents (the CLI), the action says why it can't run.
+    let mut opts = RunnerOptions::new(dir.0.join("runner2"), dir.0.join("not-read.yaml"), "dev_me");
+    opts.notifier = Some(notifier.clone());
+    let mut cli = Runner::open_with(opts, given).unwrap();
+    let rec = cli.handle(&event(4, "pull_request", &json!({}))).await;
+    assert!(
+        rec.automations[0].actions[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("needs a host that runs agents"),
+        "{rec:?}"
+    );
+}
+
+#[test]
+fn agent_fields_are_the_only_agent_paths() {
+    use hooks_runner::template::{Scope, Template};
+    assert!(Template::parse("{{agent.reply}} by {{agent.name}}", Scope::Event).is_ok());
+    let err = Template::parse("{{agent.secret}}", Scope::Event).unwrap_err();
+    assert!(err.contains("agent.reply"), "{err}");
+}

@@ -11,10 +11,15 @@
 //!    retries for what's safe to repeat, per-automation rate limits and a circuit breaker;
 //! 6. records the result ([`runs`]), so any event can be replayed.
 //!
+//! A host that embeds the runner (00next) gives it automations as data ([`Runner::open_with`],
+//! [`Runner::set_automations`]) instead of the file, and runs "ask an agent" actions for it
+//! ([`ask::Asker`]); the agent's reply is `{{agent.reply}}` for the actions after it.
+//!
 //! Webhook content is data: no payload value is ever interpolated into a shell, a file path (a
 //! file name is sanitised; folders are fixed in the configuration) or a URL's host.
 
 pub mod actions;
+pub mod ask;
 pub mod catalogue;
 pub mod check;
 pub mod config;
@@ -37,6 +42,7 @@ pub(crate) mod testutil;
 
 use std::fmt;
 
+pub use ask::{AskReply, AskRequest, Asker};
 pub use catalogue::{Catalogue, KindRecord};
 pub use config::{Automations, Problem};
 pub use runner::{Runner, RunnerOptions};

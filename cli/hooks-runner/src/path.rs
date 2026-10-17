@@ -6,7 +6,10 @@ use std::fmt;
 use serde_json::Value;
 
 /// Where a path may start.
-pub const ROOTS: &[&str] = &["payload", "headers", "event", "change"];
+pub const ROOTS: &[&str] = &["payload", "headers", "event", "change", "agent"];
+
+/// The fields of `agent.*`: the reply of the last "ask an agent" action before this one.
+pub const AGENT_FIELDS: &[&str] = &["reply", "id", "name"];
 
 /// The fields of `event.*`.
 pub const EVENT_FIELDS: &[&str] = &[
@@ -228,6 +231,21 @@ pub fn check_root(p: &Path, secrets: bool) -> Result<(), String> {
             "`{p}`: events have no field `{f}` (they have {})",
             EVENT_FIELDS.join(", ")
         ));
+    }
+    if root == "agent" {
+        match (p.segs.len(), p.segs.get(1)) {
+            (2, Some(Seg::Key(f))) if AGENT_FIELDS.contains(&f.as_str()) => {}
+            _ => {
+                return Err(format!(
+                    "`{p}`: an agent's answer has {}",
+                    AGENT_FIELDS
+                        .iter()
+                        .map(|f| format!("agent.{f}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
     }
     Ok(())
 }
