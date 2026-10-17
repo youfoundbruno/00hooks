@@ -3,7 +3,15 @@
 
 import { describe, expect, it } from "vitest";
 import { utf8 } from "../src/encoding.ts";
-import { generateSecret, keptHeaders, parseVerify, verifyDelivery, type VerifyConfig } from "../src/presets.ts";
+import {
+  EVENT_TYPE_SOURCE,
+  PRESETS,
+  generateSecret,
+  keptHeaders,
+  parseVerify,
+  verifyDelivery,
+  type VerifyConfig,
+} from "../src/presets.ts";
 import { HttpError } from "../src/http.ts";
 import { fromBase64 } from "../src/encoding.ts";
 
@@ -28,9 +36,27 @@ describe("github", () => {
     expect(v).toEqual({
       ok: true,
       verified: true,
-      dedupeKey: "delivery:72d3162e-cc78-11e3-81ab-4c9367dc0958",
+      // The delivery id isn't signed, so the body's hash is always a mark too (a replay of the same
+      // body under a new delivery id is a duplicate).
+      dedupeKeys: ["delivery:72d3162e-cc78-11e3-81ab-4c9367dc0958", expect.stringMatching(/^body:[0-9a-f]{64}$/)],
       eventType: "push",
     });
+  });
+
+  it("marks the same body under any delivery id with the same body key", async () => {
+    const h = { "X-Hub-Signature-256": signature, "X-GitHub-Event": "push" };
+    const a = await verifyDelivery(config, [secret], delivery("Hello, World!", { ...h, "X-GitHub-Delivery": "one" }));
+    const b = await verifyDelivery(config, [secret], delivery("Hello, World!", { ...h, "X-GitHub-Delivery": "two" }));
+    expect(a.dedupeKeys[1]).toBe(b.dedupeKeys[1]);
+    expect(a.dedupeKeys[0]).not.toBe(b.dedupeKeys[0]);
+  });
+
+  it("caps the (unsigned) event type", async () => {
+    const v = await verifyDelivery(config, [secret], delivery("Hello, World!", {
+      "X-Hub-Signature-256": signature,
+      "X-GitHub-Event": "x".repeat(5000),
+    }));
+    expect(v.eventType).toHaveLength(200);
   });
 
   it("refuses a changed body, a wrong secret, a missing or malformed header", async () => {
@@ -48,7 +74,7 @@ describe("github", () => {
 
   it("dedupes on the body hash when there's no delivery id", async () => {
     const v = await verifyDelivery(config, [secret], delivery("Hello, World!", { "X-Hub-Signature-256": signature }));
-    expect(v.dedupeKey).toMatch(/^body:[0-9a-f]{64}$/);
+    expect(v.dedupeKeys).toEqual([expect.stringMatching(/^body:[0-9a-f]{64}$/)]);
   });
 });
 
@@ -64,7 +90,8 @@ describe("standard-webhooks", () => {
 
   it("accepts the specification's vector", async () => {
     const v = await verifyDelivery(config, [secret], delivery(body, { "webhook-id": id, "webhook-timestamp": ts, "webhook-signature": sig }, at));
-    expect(v).toEqual({ ok: true, verified: true, dedupeKey: `id:${id}`, eventType: null });
+    // The id is signed (id.timestamp.body), so the id alone is the replay key.
+    expect(v).toEqual({ ok: true, verified: true, dedupeKeys: [`id:${id}`], eventType: null });
   });
 
   it("accepts one valid signature among several, and reads the payload's type", async () => {
@@ -103,7 +130,7 @@ describe("hmac", () => {
     const good = "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
     const v = await verifyDelivery(config, [key], delivery(body, { "X-Signature": good }));
     expect(v.ok).toBe(true);
-    expect(v.dedupeKey).toMatch(/^body:[0-9a-f]{64}$/);
+    expect(v.dedupeKeys).toEqual([expect.stringMatching(/^body:[0-9a-f]{64}$/)]);
     expect((await verifyDelivery(config, [key], delivery(body, { "X-Signature": good.slice(7) }))).ok).toBe(false);
     expect((await verifyDelivery(config, [key], delivery(body, { "X-Signature": good.replace("5b", "5c") }))).ok).toBe(false);
   });
@@ -133,7 +160,7 @@ describe("token", () => {
 describe("unverified", () => {
   it("accepts anything, marked unverified", async () => {
     const v = await verifyDelivery({ preset: "unverified" }, [], delivery("anything", {}));
-    expect(v).toEqual({ ok: true, verified: false, dedupeKey: null, eventType: null });
+    expect(v).toEqual({ ok: true, verified: false, dedupeKeys: [], eventType: null });
   });
 });
 
@@ -189,7 +216,6 @@ describe("keptHeaders", () => {
       "user-agent": "GitHub-Hookshot/abc",
       "x-github-event": "push",
       "x-github-delivery": "d1",
-      "x-hub-signature-256": "sha256=00",
     });
     expect(keptHeaders({ preset: "token", header: "authorization" }, h)).toEqual({
       "content-type": "application/json",
@@ -199,5 +225,44 @@ describe("keptHeaders", () => {
     expect(keptHeaders({ preset: "hmac", header: "authorization", algorithm: "sha256", encoding: "hex" }, h)).not.toHaveProperty(
       "authorization",
     );
+  });
+
+  it("never keeps a signature header, whatever the preset calls it", () => {
+    const h = new Headers({
+      "Content-Type": "application/json",
+      "X-Hub-Signature-256": "sha256=00",
+      "X-Hub-Signature": "sha1=00",
+      "webhook-id": "msg_1",
+      "webhook-timestamp": "1",
+      "webhook-signature": "v1,AAAA",
+      "X-Custom-Sig": "abcd",
+      "X-Hook-Token": "secret",
+    });
+    const all = [
+      keptHeaders({ preset: "github" }, h),
+      keptHeaders({ preset: "standard-webhooks" }, h),
+      keptHeaders({ preset: "hmac", header: "x-custom-sig", algorithm: "sha256", encoding: "hex" }, h),
+      keptHeaders({ preset: "token", header: "x-hook-token" }, h),
+      keptHeaders({ preset: "unverified" }, h),
+    ];
+    for (const kept of all) {
+      for (const name of ["x-hub-signature-256", "x-hub-signature", "webhook-signature", "x-custom-sig", "x-hook-token"]) {
+        expect(kept).not.toHaveProperty(name);
+      }
+    }
+    expect(all[1]).toEqual({ "content-type": "application/json", "webhook-id": "msg_1", "webhook-timestamp": "1" });
+  });
+});
+
+describe("what each preset signs", () => {
+  it("says for every preset whether eventType is covered by the signature", () => {
+    expect(Object.keys(EVENT_TYPE_SOURCE).sort()).toEqual([...PRESETS].sort());
+    expect(EVENT_TYPE_SOURCE).toEqual({
+      github: "claimed",
+      "standard-webhooks": "signed",
+      hmac: "none",
+      token: "none",
+      unverified: "none",
+    });
   });
 });

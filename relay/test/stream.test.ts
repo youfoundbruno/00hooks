@@ -2,9 +2,10 @@
 
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { AccountObject } from "../src/account-object.ts";
+import { MAX_FRAME_BYTES, type AccountObject } from "../src/account-object.ts";
+import { MAX_BODY_BYTES_LIMIT } from "../src/hooks.ts";
 import { signRequest } from "../src/canonical.ts";
-import { utf8 } from "../src/encoding.ts";
+import { fromBase64, utf8 } from "../src/encoding.ts";
 import {
   BASE,
   accountObject,
@@ -106,7 +107,7 @@ describe("stream", () => {
     for (let i = 1; i <= 150; i++) {
       const r = await stub.append({
         hookId: hook.id,
-        dedupeKey: null,
+        dedupeKeys: [],
         verified: false,
         preset: "unverified",
         eventType: null,
@@ -173,6 +174,78 @@ describe("stream", () => {
     await evictDurableObject(accountObject(dev.accountId));
     await deliver(hook.id, { n: 2 });
     expect((await hooks(sse, 1))[0]!.seq).toBe(2);
+    await sse.cancel();
+  });
+});
+
+describe("large events", () => {
+  it("streams a maximum-size event (1,835,008 bytes, base64 in JSON) whole", async () => {
+    const dev = await newAccount();
+    const { hook } = await createHook(dev, { preset: "unverified" });
+    expect((await signed(dev, "PATCH", `/v1/hooks/${hook.id}`, { maxBodyBytes: MAX_BODY_BYTES_LIMIT })).status).toBe(200);
+    // Random bytes: base64 expands them fully, and nothing compresses.
+    const body = new Uint8Array(MAX_BODY_BYTES_LIMIT);
+    for (let i = 0; i < body.length; i += 65_536) crypto.getRandomValues(body.subarray(i, i + 65_536));
+    const { sse } = await openStream(dev);
+    await ready(sse);
+    const res = await fetchRelay(`/h/${hook.id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream", "User-Agent": "u".repeat(5000) },
+      body,
+    });
+    expect(res.status).toBe(200);
+    const f = await sse.nextEvent(10_000);
+    expect(f?.event).toBe("hook");
+    // The whole frame is far under Cloudflare's 32 MiB WebSocket message limit.
+    expect(f!.data!.length).toBeGreaterThan(2_446_000);
+    expect(f!.data!.length).toBeLessThan(MAX_FRAME_BYTES / 10);
+    const ev = data<{ seq: number; body: string }>(f);
+    const got = fromBase64(ev.body)!;
+    expect(got.byteLength).toBe(MAX_BODY_BYTES_LIMIT);
+    expect(got.slice(0, 64)).toEqual(body.slice(0, 64));
+    expect(got.slice(-64)).toEqual(body.slice(-64));
+    // The stream keeps going after it.
+    await deliver(hook.id, { after: true });
+    expect((await hooks(sse, 1))[0]!.seq).toBe(ev.seq + 1);
+    await sse.cancel();
+  }, 30_000);
+
+  it("reports an event over the frame limit as a one-event gap instead of wedging the stream", async () => {
+    const dev = await newAccount();
+    const { hook } = await createHook(dev, { preset: "unverified" });
+    const stub = accountObject(dev.accountId);
+    await runInDurableObject(stub, (o: AccountObject) => {
+      o.frameLimit = 4096;
+    });
+    const append = (bytes: number) =>
+      stub.append({
+        hookId: hook.id,
+        dedupeKeys: [],
+        verified: false,
+        preset: "unverified",
+        eventType: null,
+        contentType: null,
+        headers: {},
+        body: utf8("z".repeat(bytes)),
+        receivedAt: Date.now(),
+      });
+    await append(10); // 1
+    await append(10_000); // 2: too large for this stream
+    await append(10); // 3
+    // In the backlog…
+    const { sse } = await openStream(dev);
+    await ready(sse);
+    expect((await hooks(sse, 1))[0]!.seq).toBe(1);
+    const gap = await sse.nextEvent();
+    expect(gap?.event).toBe("gap");
+    expect(gap?.id).toBe("2");
+    expect(data(gap)).toEqual({ from: 2, to: 2, reason: "too_large" });
+    expect((await hooks(sse, 1))[0]!.seq).toBe(3);
+    // …and live.
+    await append(10_000); // 4
+    await append(10); // 5
+    expect(data(await sse.nextEvent())).toEqual({ from: 4, to: 4, reason: "too_large" });
+    expect((await hooks(sse, 1))[0]!.seq).toBe(5);
     await sse.cancel();
   });
 });

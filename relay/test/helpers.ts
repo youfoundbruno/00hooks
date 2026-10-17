@@ -31,13 +31,20 @@ export async function newAccount(name = "laptop"): Promise<TestDevice> {
   return { accountId, deviceId, privateKey, publicKey };
 }
 
+/** A random address in 198.18.0.0/15 (reserved for testing). */
+export function randomTestIp(): string {
+  const b = crypto.getRandomValues(new Uint8Array(3));
+  return `198.${18 + (b[0]! & 1)}.${b[1]}.${b[2]}`;
+}
+
 /** Adds a second device to `dev`'s account through an enrolment code. */
 export async function enrolDevice(dev: TestDevice, name = "desktop"): Promise<TestDevice> {
   const { code } = (await (await signed(dev, "POST", "/v1/enrolments")).json()) as { code: string };
   const { privateKey, publicKey } = await generateDeviceKey();
   const res = await fetchRelay("/v1/enrolments/redeem", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    // A fresh address each time, so the per-address redemption limit never couples tests.
+    headers: { "Content-Type": "application/json", "CF-Connecting-IP": randomTestIp() },
     body: JSON.stringify({ code, deviceName: name, publicKey }),
   });
   expect(res.status).toBe(200);

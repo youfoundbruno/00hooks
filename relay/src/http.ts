@@ -9,7 +9,9 @@ export type ErrorCode =
   | "rate_limited"
   | "signature"
   | "invalid"
-  | "conflict";
+  | "conflict"
+  | "quota"
+  | "unavailable";
 
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -31,6 +33,8 @@ export function error(
 export const notFound = () => error(404, "not_found", "Nothing is here.");
 export const unauthorized = () => error(401, "unauthorized", "The request isn't signed by a known device.");
 export const invalid = (field: string, message: string) => error(400, "invalid", message, { field });
+/** A safety binding (a rate limit) is missing: refuse rather than run unprotected. */
+export const unavailable = () => error(503, "unavailable", "The relay isn't configured to accept this right now.");
 export const tooLarge = () => error(413, "too_large", "The body is larger than this endpoint accepts.");
 
 /** Thrown inside handlers to answer with a prepared response. */

@@ -18,10 +18,29 @@ export const PAGE_BYTES = 128 * 1024;
 
 export const CLOSE_REVOKED = 4401;
 export const CLOSE_REPLACED = 4409;
+/** A send to a stream failed for a reason other than size: the client reconnects and resumes. */
+export const CLOSE_SEND_FAILED = 1011;
+
+/**
+ * The largest WebSocket message Cloudflare carries: 32 MiB since 2025-10 (it was 1 MiB). The largest
+ * event the relay accepts (a 1,835,008-byte body, base64-expanded to 2,446,680 characters, plus at
+ * most a few KiB of headers and metadata) is well under it; this guard is for what can't happen.
+ */
+export const MAX_FRAME_BYTES = 32 * 1024 * 1024;
+
+/** Per-account storage quota defaults (PROTOCOL §4): `ACCOUNT_MAX_EVENTS`, `ACCOUNT_MAX_BYTES`. */
+export const DEFAULT_MAX_EVENTS = 10_000;
+export const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;
+
+export interface Quota {
+  events: number;
+  bytes: number;
+}
 
 export interface AppendInput {
   hookId: string;
-  dedupeKey: string | null;
+  /** Replay marks: a duplicate when any was seen; all are written with the event. */
+  dedupeKeys: string[];
   verified: boolean;
   preset: string;
   eventType: string | null;
@@ -31,7 +50,10 @@ export interface AppendInput {
   receivedAt: number;
 }
 
-export type AppendResult = { duplicate: true } | { duplicate: false; seq: number; id: string };
+export type AppendResult =
+  | { duplicate: true }
+  | { duplicate: false; full: true }
+  | { duplicate: false; full: false; seq: number; id: string };
 
 /** The per-socket state, kept in the WebSocket's attachment so it survives hibernation. */
 interface Attachment {
@@ -65,6 +87,9 @@ export function hookFrame(seq: number, eventJson: string): string {
 
 export class AccountObject extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  /** Tests lower these to exercise the guards; production uses the constants and the env. */
+  frameLimit = MAX_FRAME_BYTES;
+  quotaOverride: Quota | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -79,6 +104,55 @@ export class AccountObject extends DurableObject<Env> {
   private head(): number {
     const row = this.sql.exec<{ value: number }>("SELECT value FROM meta WHERE key = 'head'").toArray()[0];
     return row?.value ?? 0;
+  }
+
+  private quota(): Quota {
+    if (this.quotaOverride) return this.quotaOverride;
+    const n = (v: string | undefined, d: number) => {
+      const x = Number(v);
+      return Number.isFinite(x) && x > 0 ? x : d;
+    };
+    return { events: n(this.env.ACCOUNT_MAX_EVENTS, DEFAULT_MAX_EVENTS), bytes: n(this.env.ACCOUNT_MAX_BYTES, DEFAULT_MAX_BYTES) };
+  }
+
+  /**
+   * What the log holds: events and bytes (body plus headers), kept as counters in `meta` so an
+   * append doesn't scan the log. An object from before the counters existed counts once.
+   */
+  private usage(): Quota {
+    const rows = this.sql
+      .exec<{ key: string; value: number }>("SELECT key, value FROM meta WHERE key IN ('log_events', 'log_bytes')")
+      .toArray();
+    if (rows.length === 2) {
+      const get = (k: string) => rows.find((r) => r.key === k)!.value;
+      return { events: get("log_events"), bytes: get("log_bytes") };
+    }
+    const r = this.sql
+      .exec<{ n: number; b: number | null }>("SELECT count(*) AS n, sum(length(body) + length(headers)) AS b FROM events")
+      .one();
+    const u = { events: r.n, bytes: r.b ?? 0 };
+    this.setUsage(u);
+    return u;
+  }
+
+  private setUsage(u: Quota): void {
+    const up = "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+    this.sql.exec(up, "log_events", Math.max(0, u.events));
+    this.sql.exec(up, "log_bytes", Math.max(0, u.bytes));
+  }
+
+  /** Deletes events up to `seq`, keeping the usage counters right. */
+  private deleteThrough(seq: number): void {
+    const gone = this.sql
+      .exec<{ n: number; b: number | null }>(
+        "SELECT count(*) AS n, sum(length(body) + length(headers)) AS b FROM events WHERE seq <= ?",
+        seq,
+      )
+      .one();
+    if (gone.n === 0) return;
+    const u = this.usage();
+    this.sql.exec("DELETE FROM events WHERE seq <= ?", seq);
+    this.setUsage({ events: u.events - gone.n, bytes: u.bytes - (gone.b ?? 0) });
   }
 
   private retentionMs(): number {
@@ -134,15 +208,25 @@ export class AccountObject extends DurableObject<Env> {
     return ok;
   }
 
-  /** Appends one event, with its dedupe mark, in one transaction; then delivers it live. */
+  /**
+   * Appends one event, with its dedupe marks, in one transaction; then delivers it live. Refuses
+   * (`full`) when the account's log is at its quota, until devices acknowledge what's waiting.
+   */
   async append(input: AppendInput): Promise<AppendResult> {
+    const headers = JSON.stringify(input.headers);
+    const size = input.body.byteLength + headers.length;
     const result = this.ctx.storage.transactionSync((): AppendResult => {
-      if (input.dedupeKey !== null) {
+      for (const key of input.dedupeKeys) {
         const seen = this.sql
-          .exec<{ n: number }>("SELECT count(*) AS n FROM seen WHERE hook_id = ? AND key = ?", input.hookId, input.dedupeKey)
+          .exec<{ n: number }>("SELECT count(*) AS n FROM seen WHERE hook_id = ? AND key = ?", input.hookId, key)
           .one().n;
         if (seen > 0) return { duplicate: true };
-        this.sql.exec("INSERT INTO seen (hook_id, key, at) VALUES (?, ?, ?)", input.hookId, input.dedupeKey, input.receivedAt);
+      }
+      const usage = this.usage();
+      const quota = this.quota();
+      if (usage.events + 1 > quota.events || usage.bytes + size > quota.bytes) return { duplicate: false, full: true };
+      for (const key of new Set(input.dedupeKeys)) {
+        this.sql.exec("INSERT INTO seen (hook_id, key, at) VALUES (?, ?, ?)", input.hookId, key, input.receivedAt);
       }
       const seq = this.head() + 1;
       this.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", seq);
@@ -158,12 +242,13 @@ export class AccountObject extends DurableObject<Env> {
         input.preset,
         input.eventType,
         input.contentType,
-        JSON.stringify(input.headers),
+        headers,
         input.body,
       );
-      return { duplicate: false, seq, id };
+      this.setUsage({ events: usage.events + 1, bytes: usage.bytes + size });
+      return { duplicate: false, full: false, seq, id };
     });
-    if (!result.duplicate) {
+    if (!result.duplicate && !result.full) {
       this.deliverLive(result.seq);
       await this.ensureAlarm();
     }
@@ -240,8 +325,7 @@ export class AccountObject extends DurableObject<Env> {
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [deviceId]);
     const att: Attachment = { deviceId, cursor: after, catchingUp: true };
-    server.send(JSON.stringify({ t: "ready", accountId, deviceId, after, head }));
-    this.sendPage(server, att);
+    if (this.trySend(server, JSON.stringify({ t: "ready", accountId, deviceId, after, head }))) this.sendPage(server, att);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -277,11 +361,10 @@ export class AccountObject extends DurableObject<Env> {
       .toArray();
     let bytes = 0;
     for (const row of rows) {
-      if (row.seq > att.cursor + 1) this.sendGaps(ws, att, row.seq - 1);
-      const frame = hookFrame(row.seq, eventJson(row));
-      ws.send(frame);
-      att.cursor = row.seq;
-      bytes += frame.length;
+      if (row.seq > att.cursor + 1 && !this.sendGaps(ws, att, row.seq - 1)) return;
+      const sent = this.sendHook(ws, att, row);
+      if (sent === null) return;
+      bytes += sent;
       if (bytes >= PAGE_BYTES) break;
     }
     const more =
@@ -289,15 +372,53 @@ export class AccountObject extends DurableObject<Env> {
         .n > 0;
     if (!more) {
       const head = this.head();
-      if (head > att.cursor) this.sendGaps(ws, att, head);
+      if (head > att.cursor && !this.sendGaps(ws, att, head)) return;
     }
     att.catchingUp = more;
     ws.serializeAttachment(att);
-    if (more) ws.send(JSON.stringify({ t: "more" }));
+    if (more) this.trySend(ws, JSON.stringify({ t: "more" }));
   }
 
-  /** Reports recorded pruned ranges within (cursor, through], and moves the cursor to `through`. */
-  private sendGaps(ws: WebSocket, att: Attachment, through: number): void {
+  /**
+   * Sends one message; false when the socket can't take it. Such a socket is closed (the client
+   * reconnects from its cursor) so one failing stream never throws into the others' delivery.
+   */
+  private trySend(ws: WebSocket, message: string): boolean {
+    try {
+      ws.send(message);
+      return true;
+    } catch {
+      try {
+        ws.close(CLOSE_SEND_FAILED, "send failed");
+      } catch {
+        // Already closing.
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Sends one event and moves the cursor past it; returns the bytes sent, or null when the socket
+   * failed. An event whose frame is over the WebSocket message limit can never be delivered, so it
+   * is reported as a one-event `gap` (reason `too_large`) rather than wedging the stream on it.
+   */
+  private sendHook(ws: WebSocket, att: Attachment, row: EventRow): number | null {
+    const frame = hookFrame(row.seq, eventJson(row));
+    if (overLimit(frame, this.frameLimit)) {
+      if (!this.trySend(ws, JSON.stringify({ t: "gap", from: row.seq, to: row.seq, reason: "too_large" }))) return null;
+      att.cursor = row.seq;
+      return 0;
+    }
+    if (!this.trySend(ws, frame)) return null;
+    att.cursor = row.seq;
+    return frame.length;
+  }
+
+  /**
+   * Reports recorded pruned ranges within (cursor, through], and moves the cursor to `through`.
+   * False when the socket failed.
+   */
+  private sendGaps(ws: WebSocket, att: Attachment, through: number): boolean {
     const ranges = this.sql
       .exec<{ from_seq: number; to_seq: number; reason: string }>(
         "SELECT from_seq, to_seq, reason FROM pruned WHERE to_seq > ? AND from_seq <= ? ORDER BY from_seq",
@@ -308,9 +429,10 @@ export class AccountObject extends DurableObject<Env> {
     for (const r of ranges) {
       const from = Math.max(r.from_seq, att.cursor + 1);
       const to = Math.min(r.to_seq, through);
-      ws.send(JSON.stringify({ t: "gap", from, to, reason: r.reason }));
+      if (!this.trySend(ws, JSON.stringify({ t: "gap", from, to, reason: r.reason }))) return false;
     }
     att.cursor = through;
+    return true;
   }
 
   /** Sends a just-appended event to every stream that is live (not still paging its backlog). */
@@ -318,17 +440,11 @@ export class AccountObject extends DurableObject<Env> {
     const sockets = this.ctx.getWebSockets();
     if (sockets.length === 0) return;
     const row = this.sql.exec<EventRow>("SELECT * FROM events WHERE seq = ?", seq).one();
-    const frame = hookFrame(seq, eventJson(row));
     for (const ws of sockets) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (!att || att.catchingUp || att.cursor >= seq) continue;
-      try {
-        ws.send(frame);
-        att.cursor = seq;
-        ws.serializeAttachment(att);
-      } catch {
-        // The socket is closing; it will resume from its cursor.
-      }
+      // A failed socket is closed by sendHook and resumes from its cursor on reconnect.
+      if (this.sendHook(ws, att, row) !== null) ws.serializeAttachment(att);
     }
   }
 
@@ -340,7 +456,7 @@ export class AccountObject extends DurableObject<Env> {
       .exec<{ m: number | null; n: number }>("SELECT min(acked) AS m, count(*) AS n FROM devices WHERE revoked = 0")
       .one();
     if (row.n === 0 || row.m === null) return;
-    this.sql.exec("DELETE FROM events WHERE seq <= ?", row.m);
+    this.deleteThrough(row.m);
     this.sql.exec("DELETE FROM pruned WHERE to_seq <= ?", row.m);
   }
 
@@ -362,7 +478,7 @@ export class AccountObject extends DurableObject<Env> {
       } else {
         this.sql.exec("INSERT INTO pruned (from_seq, to_seq, reason) VALUES (?, ?, 'retention')", r.lo, r.hi);
       }
-      this.sql.exec("DELETE FROM events WHERE seq <= ?", r.hi);
+      this.deleteThrough(r.hi!);
     });
   }
 
@@ -405,16 +521,27 @@ export class AccountObject extends DurableObject<Env> {
 
   // ── test and diagnostics helpers (not routed) ───────────────────────────────
 
-  async stats(): Promise<{ head: number; events: number; devices: { id: string; acked: number; revoked: boolean }[] }> {
+  async stats(): Promise<{
+    head: number;
+    events: number;
+    usage: Quota;
+    devices: { id: string; acked: number; revoked: boolean }[];
+  }> {
     return {
       head: this.head(),
       events: this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM events").one().n,
+      usage: this.usage(),
       devices: this.sql
         .exec<{ id: string; acked: number; revoked: number }>("SELECT id, acked, revoked FROM devices ORDER BY id")
         .toArray()
         .map((d) => ({ id: d.id, acked: d.acked, revoked: d.revoked === 1 })),
     };
   }
+}
+
+/** Whether a message is over `limit` bytes of UTF-8 (encoding it only when it might be). */
+function overLimit(s: string, limit: number): boolean {
+  return s.length * 3 > limit && new TextEncoder().encode(s).byteLength > limit;
 }
 
 function eventJson(row: EventRow): string {

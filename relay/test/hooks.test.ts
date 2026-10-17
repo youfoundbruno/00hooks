@@ -1,7 +1,10 @@
 // Hooks (PROTOCOL §3) and receiving (PROTOCOL §4), end to end through the Worker and the object.
 
+import { createExecutionContext, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import type { AccountObject } from "../src/account-object.ts";
+import { receive } from "../src/receive.ts";
 import { hmac, toBase64, toHex, utf8, fromBase64 } from "../src/encoding.ts";
 import { BASE, accountObject, createHook, deliver, fetchRelay, newAccount, openStream, data, signed } from "./helpers.ts";
 
@@ -157,15 +160,34 @@ describe("receiving", () => {
     const ev = data(await sse.nextEvent());
     expect(ev).toMatchObject({ seq: 1, id: received, hookId: hook.id, verified: true, preset: "github", eventType: "ping", contentType: "application/json" });
     expect(new TextDecoder().decode(fromBase64(ev.body as string)!)).toBe(body);
+    // The signature is never kept: next to its body it would be a ready-made replay.
     expect(ev.headers).toEqual({
       "content-type": "application/json",
       "x-github-event": "ping",
       "x-github-delivery": "11111111-2222-3333-4444-555555555555",
-      "x-hub-signature-256": headers["X-Hub-Signature-256"],
     });
     await sse.cancel();
     const stats = await accountObject(dev.accountId).stats();
     expect(stats.events).toBe(1);
+  });
+
+  it("refuses a captured GitHub delivery replayed under a new X-GitHub-Delivery (the id isn't signed)", async () => {
+    const dev = await newAccount();
+    const { hook, secret } = await createHook(dev, { preset: "github" });
+    const body = '{"action":"opened","number":7}';
+    const sig = await githubSign(secret!, body);
+    const first = await post(hook.id, body, { "X-Hub-Signature-256": sig, "X-GitHub-Event": "pull_request", "X-GitHub-Delivery": "d-1" });
+    expect(await first.json()).toHaveProperty("received");
+    // Same signed body, new delivery id and even a different (unsigned) event type: a replay.
+    const replay = await post(hook.id, body, { "X-Hub-Signature-256": sig, "X-GitHub-Event": "push", "X-GitHub-Delivery": "d-2" });
+    expect(await replay.json()).toEqual({ duplicate: true });
+    const noId = await post(hook.id, body, { "X-Hub-Signature-256": sig });
+    expect(await noId.json()).toEqual({ duplicate: true });
+    // A different body is a different event.
+    const other = '{"action":"closed","number":7}';
+    const next = await post(hook.id, other, { "X-Hub-Signature-256": await githubSign(secret!, other), "X-GitHub-Delivery": "d-3" });
+    expect(await next.json()).toHaveProperty("received");
+    expect((await accountObject(dev.accountId).stats()).events).toBe(2);
   });
 
   it("verifies Standard Webhooks with a fresh timestamp and dedupes on webhook-id", async () => {
@@ -270,5 +292,82 @@ describe("receiving", () => {
       expect(text).not.toContain(sig.slice(7));
       expect(Object.keys(JSON.parse(text) as object)).toContain("message");
     }
+  });
+
+  it("refuses with 429 quota when the account's log is full, and accepts again once acknowledged", async () => {
+    const dev = await newAccount();
+    const { hook } = await createHook(dev, { preset: "unverified" });
+    const stub = accountObject(dev.accountId);
+    await runInDurableObject(stub, (o: AccountObject) => {
+      o.quotaOverride = { events: 2, bytes: 1_000_000 };
+    });
+    expect((await post(hook.id, '{"n":1}')).status).toBe(200);
+    expect((await post(hook.id, '{"n":2}')).status).toBe(200);
+    const full = await post(hook.id, '{"n":3}');
+    expect(full.status).toBe(429);
+    expect(full.headers.get("Retry-After")).toBe("60");
+    expect(await full.json()).toMatchObject({ error: "quota" });
+    expect((await stub.stats()).usage.events).toBe(2);
+    // Acknowledged events are deleted, which frees the quota.
+    expect((await signed(dev, "POST", "/v1/ack", { through: 2 })).status).toBe(200);
+    expect((await stub.stats()).usage).toEqual({ events: 0, bytes: 0 });
+    expect((await post(hook.id, '{"n":3}')).status).toBe(200);
+
+    // Bytes count too (body plus headers).
+    await runInDurableObject(stub, (o: AccountObject) => {
+      o.quotaOverride = { events: 100, bytes: 300 };
+    });
+    expect((await post(hook.id, "x".repeat(400))).status).toBe(429);
+    expect((await post(hook.id, "x".repeat(50))).status).toBe(200);
+  });
+});
+
+/** A Rate Limiting binding that answers `success` and records its keys. */
+function fakeLimit(success: boolean, keys: string[] = []): RateLimit {
+  return {
+    limit: async ({ key }: { key: string }) => {
+      keys.push(key);
+      return { success };
+    },
+  } as RateLimit;
+}
+
+describe("receiving: limits before any lookup", () => {
+  const untouchedDb = new Proxy({} as D1Database, {
+    get() {
+      throw new Error("the database was read");
+    },
+  });
+
+  it("fails closed with 503 when a rate limit binding is missing", async () => {
+    const dev = await newAccount();
+    const { hook } = await createHook(dev, { preset: "unverified" });
+    for (const missing of ["HOOK_LIMIT", "RECEIVE_IP_LIMIT"] as const) {
+      const res = await receive(
+        new Request(`${BASE}/h/${hook.id}`, { method: "POST", body: "{}" }),
+        { ...env, [missing]: undefined } as unknown as Env,
+        createExecutionContext(),
+        hook.id,
+      );
+      expect(res.status).toBe(503);
+      expect(await res.json()).toMatchObject({ error: "unavailable" });
+    }
+  });
+
+  it("limits each client address (IPv6 by /64) before the hook lookup", async () => {
+    const keys: string[] = [];
+    const res = await receive(
+      new Request(`${BASE}/h/hk_00000000000000000000000000`, {
+        method: "POST",
+        body: "{}",
+        headers: { "CF-Connecting-IP": "2001:db8:aa:bb:1:2:3:4" },
+      }),
+      { ...env, DB: untouchedDb, RECEIVE_IP_LIMIT: fakeLimit(false, keys) } as unknown as Env,
+      createExecutionContext(),
+      "hk_00000000000000000000000000",
+    );
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("10");
+    expect(keys).toEqual(["2001:db8:aa:bb::/64"]);
   });
 });

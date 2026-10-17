@@ -56,8 +56,13 @@ Rate Limiting binding). In `relay/`:
 
 Bindings (all in `wrangler.jsonc`): `ACCOUNT` (the `AccountObject` Durable Object, SQLite-backed),
 `DB` (D1: accounts, devices, hooks with their sealed secrets, enrolments, and the routing from a
-hook id to its account), `HOOK_LIMIT` (Rate Limiting: 60 requests per 10 s per hook). Variable:
-`RETENTION_DAYS` (default 7), how long unacknowledged events are kept.
+hook id to its account), and four Rate Limiting bindings: `HOOK_LIMIT` (60 deliveries per 10 s per
+hook), `RECEIVE_IP_LIMIT` (600 deliveries per 10 s per client address, checked before the hook
+lookup), `REDEEM_IP_LIMIT` and `REDEEM_GLOBAL_LIMIT` (enrolment redemptions: 10 a minute per address,
+300 a minute in all). The relay answers `503` rather than run without them. Variables:
+`RETENTION_DAYS` (default 7), how long unacknowledged events are kept; `ACCOUNT_MAX_EVENTS` (10,000)
+and `ACCOUNT_MAX_BYTES` (256 MiB), how much one account's log may hold before deliveries get `429`
+`quota`.
 
 Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
 
@@ -69,19 +74,28 @@ Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](do
   account's Durable Object, strongly consistent, GET requests included, so a captured stream request
   can't be replayed into a live copy of the account's events.
 - **Revoking a device** closes its open stream at once (`4401`) and stops it holding events back.
+  The account's Durable Object is told first, every time, so revoking again finishes a revocation
+  that failed part-way.
+- **Enrolment codes** are 60 random bits. Every redemption attempt is counted atomically before the
+  code is checked (IPv6 clients by /64); five wrong codes block the address for 10 minutes, and the
+  Rate Limiting bindings cap attempts per address and in all.
 - **Hook secrets** are generated from 32 random bytes, shown once (create or rotate), and stored
   sealed with AES-256-GCM under `SECRETS_KEY`, with the hook id as associated data. Rotation keeps
   the previous secret valid for 24 hours. A secret you supply is never echoed back.
 - **Verification** runs over the raw bytes before anything is parsed, with constant-time
   comparisons, and checks every valid secret, not just until one matches. Failures answer `401`
   `signature` and are counted, never stored.
-- **Replays**: GitHub deliveries dedupe on `X-GitHub-Delivery`, Standard Webhooks on `webhook-id`
-  within a 300 s timestamp window, generic HMAC on the body hash. The dedupe mark is written in the
-  same Durable Object transaction as the event, so a crash can't lose an event that was marked.
+- **Replays**: GitHub deliveries dedupe on `X-GitHub-Delivery` and, since that header isn't signed,
+  always on the body hash too (so a captured body can't come back under a new delivery id);
+  Standard Webhooks on `webhook-id` within a 300 s timestamp window, generic HMAC on the body hash.
+  The dedupe marks are written in the same Durable Object transaction as the event, so a crash
+  can't lose an event that was marked. GitHub's `eventType` (`X-GitHub-Event`) is the sender's
+  claim: PROTOCOL §3 lists what each preset signs.
 - **Limits**: bodies are checked against the hook's limit (1 MiB by default) from `Content-Length`
-  and again while streaming; each hook is rate limited at the edge.
-- **What's kept**: only an allowlist of headers per preset (event, delivery and signature headers,
-  `content-type`, `user-agent`), never `cookie` or `authorization`. Enrolment codes and client IPs
-  are stored only as HMACs under `HASH_PEPPER`.
+  and again while streaming; each client address and each hook is rate limited at the edge; each
+  account's log has a quota.
+- **What's kept**: only an allowlist of headers per preset (event and delivery headers,
+  `content-type`, `user-agent`), never `cookie`, `authorization` or a signature or token header.
+  Enrolment codes and client IPs are stored only as HMACs under `HASH_PEPPER`.
 - **Errors** are fixed sentences: they never quote a secret, a signature or payload content.
 - **Webhook content is data**: the relay never acts on it.

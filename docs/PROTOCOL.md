@@ -93,12 +93,23 @@ With no body, the last line is the hash of the empty string,
   `{ "accountId", "deviceId" }`. When the relay has a `SIGNUP_TOKEN` secret, the request must carry
   `Authorization: Bearer <SIGNUP_TOKEN>`; without the secret, signups are open (development only;
   `/v1/info` says so).
-- `POST /v1/enrolments` (signed) → `{ "code": "ABCD-EFGH", "expiresAt" }`: a one-time code, valid
-  10 minutes, for adding another device to the same account.
+- `POST /v1/enrolments` (signed) → `{ "code": "ABCD-EFGH-JKMN", "expiresAt" }`: a one-time code,
+  valid 10 minutes, for adding another device to the same account. A code is 12 Crockford base32
+  characters (60 random bits) in three groups of four; redeeming reads it case-insensitively, ignores
+  dashes and spaces, and takes `I`/`L` as `1` and `O` as `0`.
 - `POST /v1/enrolments/redeem` `{ "code", "deviceName", "publicKey" }` → `{ "accountId", "deviceId" }`.
-  Five wrong codes from one IP in 10 minutes block that IP for 10 minutes.
+  Limits, all answering `429` `rate_limited` with `Retry-After`, keyed on the client address (an IPv4
+  address, or an IPv6 address's /64):
+  - at most 10 redemptions a minute per address and 300 a minute in all (the Rate Limiting binding,
+    checked before anything else);
+  - every attempt is counted, atomically, **before** the code is looked at, and a right code is
+    refunded; the attempt after five wrong codes in 10 minutes blocks the address for 10 minutes,
+    so parallel guesses each count.
 - `GET /v1/devices` (signed) → `{ "devices": [{ "id", "name", "createdAt", "lastSeenAt", "current" }] }`
-- `DELETE /v1/devices/<id>` (signed): revokes it; its open stream closes at once with `4401`.
+- `DELETE /v1/devices/<id>` (signed) → `204`: revokes it; its open stream closes at once with `4401`.
+  Idempotent: revoking a device of this account that is already revoked answers `204` again and
+  closes any stream it still has (so a retry after a failure part-way finishes the job); a device of
+  another account, or none, is `404`.
 - `POST /v1/enrolments` and `/redeem` answer `200`; a wrong, used or expired code answers `401`
   `unauthorized`. A newly enrolled device **starts at the head** of the log: it doesn't receive the
   older backlog and doesn't hold it back from deletion.
@@ -121,11 +132,26 @@ With no body, the last line is the hash of the empty string,
 
 | `preset` | fields | check |
 |---|---|---|
-| `github` | `secret`? (generated when absent) | `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(body)>`; dedupe on `X-GitHub-Delivery`; answers `ping` events with `200` |
-| `standard-webhooks` | `secret`? (`whsec_` + base64, generated when absent) | Standard Webhooks v1 HMAC over `id.timestamp.body`, timestamp within 300 s, dedupe on `webhook-id` |
+| `github` | `secret`? (generated when absent) | `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(body)>`; dedupe on `X-GitHub-Delivery` **and** on the body's SHA-256 (always, since the delivery id isn't signed); answers `ping` events with `200` |
+| `standard-webhooks` | `secret`? (`whsec_` + base64, generated when absent) | Standard Webhooks v1 HMAC over `id.timestamp.body`, timestamp within 300 s, dedupe on `webhook-id` (signed) |
 | `hmac` | `header` (required), `algorithm` (`sha256` default, or `sha1`), `encoding` (`hex` default, or `base64`), `prefix`? (e.g. `sha256=`), `secret`? | HMAC of the raw body; dedupe on a body hash |
 | `token` | `header` (default `Authorization`), `secret`? | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength; **no dedupe** (nothing identifies a delivery) |
 | `unverified` | — | accepts anything; events carry `verified: false`; **no dedupe** |
+
+What each preset's signature covers, and what the relay uses besides:
+
+| `preset` | signed | used but **not** signed (the sender's claim) |
+|---|---|---|
+| `github` | the body | `X-GitHub-Delivery` (dedupe; the body hash backs it), `X-GitHub-Event` (`eventType`) |
+| `standard-webhooks` | `webhook-id`, `webhook-timestamp`, the body (and so `eventType`, read from it) | — |
+| `hmac` | the body | — |
+| `token` | nothing (the token proves the sender knows the secret; the body has no integrity) | — |
+| `unverified` | nothing | — |
+
+Because GitHub's signature covers only the body, someone who captured one delivery could resend it
+under a new `X-GitHub-Delivery`; the body-hash mark, kept as long as the delivery mark (7 days),
+answers that as a duplicate. The cost: two genuinely different GitHub deliveries with byte-identical
+bodies within 7 days are stored once.
 
 GitHub's `ping` (sent when a webhook is created) is verified, deduped and stored as a normal event
 with `eventType: "ping"`, so a new hook can be tested end to end. `maxBodyBytes` is at most
@@ -138,13 +164,22 @@ stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM), never returned af
 
 `POST /h/<hookId>` (also PUT and PATCH). In order:
 
-1. Unknown or disabled hook → `404`. Body declared larger than the hook's `maxBodyBytes` (default
+0. A relay whose rate limit bindings are missing refuses everything here with `503` `unavailable`
+   (it fails closed rather than take a flood at full cost).
+1. Rate limit per client address (an IPv4 address, or an IPv6 /64; 600 requests per 10 s by
+   default), **before** the hook is looked up → `429` `rate_limited` with `Retry-After`. Guessing hook
+   ids costs the guesser this budget, not the relay a database read each.
+2. Unknown or disabled hook → `404`. Body declared larger than the hook's `maxBodyBytes` (default
    1 MiB) in `Content-Length` → `413`.
-2. Rate limit per hook (60 requests per 10 s by default) → `429` with `Retry-After`. Only then is the
+3. Rate limit per hook (60 requests per 10 s by default) → `429` with `Retry-After`. Only then is the
    body read, and a body that turns out larger than the limit while streaming → `413`.
-3. Verify with the preset → `401` `{"error":"signature"}` on failure (counted, not stored).
-4. Dedupe → a duplicate answers `200` `{"duplicate":true}` and is not stored again.
-5. Append to the account log, in one Durable Object transaction with the dedupe mark → `200`
+4. Verify with the preset → `401` `{"error":"signature"}` on failure (counted, not stored).
+5. Dedupe → a duplicate (any of the delivery's marks seen before) answers `200` `{"duplicate":true}`
+   and is not stored again.
+6. Quota: an account's log holds at most `ACCOUNT_MAX_EVENTS` events (default 10,000) and
+   `ACCOUNT_MAX_BYTES` of bodies and headers (default 256 MiB) waiting for acknowledgement; past
+   either → `429` `quota` with `Retry-After: 60`. Acknowledging (or retention) frees it.
+7. Append to the account log, in one Durable Object transaction with all its dedupe marks → `200`
    `{"received": "<evt_…>"}`.
 
 ## 5. Events
@@ -166,9 +201,15 @@ stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM), never returned af
 
 - `seq` is per account, strictly increasing, never reused.
 - `eventType` comes from the preset (`X-GitHub-Event`, the Standard Webhooks payload's `type`) or is
-  `null`.
-- `headers` keeps only an allowlist per preset (the provider's event, delivery and signature headers,
-  `content-type`, `user-agent`), lowercased. Never `cookie` or `authorization`.
+  `null`, at most 200 characters. **For `github` it is the sender's claim, not authenticated**: GitHub
+  signs only the body, so treat it as a label and read the type from the body where it matters (the
+  table in §3 says, per preset, what is signed). `contentType` is likewise the sender's header, at
+  most 200 characters.
+- `headers` keeps only an allowlist per preset (the provider's event and delivery headers,
+  `content-type`, `user-agent`), lowercased, each value at most 1,024 characters. None of them is
+  covered by a signature. Never `cookie`, `authorization`, or any signature or token header
+  (`x-hub-signature-256`, `webhook-signature`, the `hmac` or `token` preset's own header): once
+  verified they're no use to a reader, and a stored signature beside its body is a ready-made replay.
 - *(phase 1)* `sealed`: the body and headers become an HPKE envelope; see PLAN §4.4.
 
 ## 6. Streaming
@@ -201,7 +242,11 @@ data: {…event…}
   which; `ready.head` is the newest seq in the log.
 - **Gaps**: when events after that point were already dropped by retention, a `gap` event comes before
   the next `hook`: `id: 30` `event: gap` `data: {"from": 12, "to": 30, "reason": "retention"}`
-  (inclusive range of lost seqs; the `id` is `to`, so a resume starts after the gap).
+  (inclusive range of lost seqs; the `id` is `to`, so a resume starts after the gap). `reason` is
+  `retention`, or `too_large` for a single event whose message would pass the WebSocket message limit
+  between the relay's Worker and its Durable Object (32 MiB). That can't happen within this
+  version's limits (the largest event, a 1,835,008-byte body base64-encoded with its headers, is
+  under 2.5 MB); the rule exists so one undeliverable event can never wedge a stream.
 - `Last-Event-ID` beyond the head is clamped to the head; one that isn't a number answers `400`
   `invalid`.
 - **Heartbeat**: a comment line `: hb` every 15 s.
@@ -244,5 +289,7 @@ Clients dedupe by `id` before acting, so at-least-once delivery never runs an au
 ## 8. Errors
 
 Every error body is `{ "error": "<code>", "message": "<one plain sentence>" }`. Codes: `unauthorized`,
-`clock_skew`, `not_found`, `too_large`, `rate_limited`, `signature`, `invalid` (with `field`),
-`conflict`, `internal` (a `500`; the relay logs the cause, never the payload). Messages never contain secrets, signatures or payload content.
+`clock_skew`, `not_found`, `too_large`, `rate_limited`, `quota` (a `429`: the account's log is full),
+`signature`, `invalid` (with `field`), `conflict`, `unavailable` (a `503`: the relay is missing a
+safety binding and refuses rather than run without it), `internal` (a `500`; the relay logs the
+cause, never the payload). Messages never contain secrets, signatures or payload content.

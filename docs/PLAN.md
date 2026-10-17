@@ -196,8 +196,8 @@ id, provider, event type), and that metadata is visible to the operator.
 
 ### 4.5 Self-hosting
 
-`pnpm deploy` in `relay/` with your own Cloudflare account: a Worker, one Durable Object class, a Rate
-Limiting binding, two secrets (`SECRETS_KEY` for encrypting hook secrets, `HASH_PEPPER` for key
+`pnpm deploy` in `relay/` with your own Cloudflare account: a Worker, one Durable Object class, Rate
+Limiting bindings, two secrets (`SECRETS_KEY` for encrypting hook secrets, `HASH_PEPPER` for key
 hashes). No other services. The CLI and 00next take the relay URL as a setting, so a hosted relay and
 a self-hosted one are interchangeable.
 

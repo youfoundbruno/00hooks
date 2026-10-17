@@ -110,12 +110,32 @@ export interface Delivery {
 export interface Verdict {
   ok: boolean;
   verified: boolean;
-  /** Per-hook replay key, or null for presets that don't dedupe. */
-  dedupeKey: string | null;
+  /**
+   * Per-hook replay keys, empty for presets that don't dedupe. A delivery is a duplicate when any of
+   * them was seen before; all of them are marked in the same transaction as the append.
+   */
+  dedupeKeys: string[];
+  /** The provider's event type, capped at 200 characters. Signed or not: see `EVENT_TYPE_SOURCE`. */
   eventType: string | null;
 }
 
-const REFUSED: Verdict = { ok: false, verified: false, dedupeKey: null, eventType: null };
+/** Event types are labels: anything longer is cut. */
+export const EVENT_TYPE_MAX = 200;
+
+/**
+ * Where a preset's `eventType` comes from (PROTOCOL §5): `signed` when the provider's signature covers
+ * it, `claimed` when it is an unsigned header (GitHub signs only the body, so `X-GitHub-Event` is the
+ * sender's claim), `none` when the preset never sets one.
+ */
+export const EVENT_TYPE_SOURCE: Record<Preset, "signed" | "claimed" | "none"> = {
+  github: "claimed",
+  "standard-webhooks": "signed",
+  hmac: "none",
+  token: "none",
+  unverified: "none",
+};
+
+const REFUSED: Verdict = { ok: false, verified: false, dedupeKeys: [], eventType: null };
 
 /**
  * Verifies one delivery. `secrets` holds every secret that is currently valid (the current one, and
@@ -132,7 +152,7 @@ export async function verifyDelivery(config: VerifyConfig, secrets: string[], d:
     case "token":
       return verifyToken(config, secrets, d);
     case "unverified":
-      return { ok: true, verified: false, dedupeKey: null, eventType: null };
+      return { ok: true, verified: false, dedupeKeys: [], eventType: null };
   }
 }
 
@@ -150,12 +170,17 @@ async function verifyGithub(secrets: string[], d: Delivery): Promise<Verdict> {
   if (!given || given.byteLength !== 32) return REFUSED;
   const ok = await anySecret(secrets, async (s) => constantTimeEqual(await hmac("SHA-256", utf8(s), d.body), given));
   if (!ok) return REFUSED;
+  // GitHub's HMAC covers the body only: `X-GitHub-Delivery` and `X-GitHub-Event` are unsigned. The
+  // body mark is always written, so a captured delivery can't be replayed under a new delivery id;
+  // the delivery mark keeps GitHub's own retries (same id) answered as duplicates too.
   const delivery = d.headers.get("x-github-delivery");
+  const keys = [`body:${await sha256Hex(d.body)}`];
+  if (delivery) keys.unshift(`delivery:${delivery.slice(0, 200)}`);
   return {
     ok: true,
     verified: true,
-    dedupeKey: delivery ? `delivery:${delivery}` : `body:${await sha256Hex(d.body)}`,
-    eventType: d.headers.get("x-github-event"),
+    dedupeKeys: keys,
+    eventType: d.headers.get("x-github-event")?.slice(0, EVENT_TYPE_MAX) ?? null,
   };
 }
 
@@ -181,14 +206,15 @@ async function verifyStandardWebhooks(secrets: string[], d: Delivery): Promise<V
     return match;
   });
   if (!ok) return REFUSED;
-  return { ok: true, verified: true, dedupeKey: `id:${id}`, eventType: jsonType(d.body) };
+  // The id, the timestamp and the body are all signed: a replay under a new id needs a new signature.
+  return { ok: true, verified: true, dedupeKeys: [`id:${id.slice(0, 200)}`], eventType: jsonType(d.body) };
 }
 
 function jsonType(body: Uint8Array): string | null {
   try {
     const v = JSON.parse(new TextDecoder().decode(body)) as unknown;
     if (typeof v === "object" && v !== null && typeof (v as { type?: unknown }).type === "string") {
-      return ((v as { type: string }).type).slice(0, 200);
+      return ((v as { type: string }).type).slice(0, EVENT_TYPE_MAX);
     }
   } catch {
     // Not JSON: the event simply has no type.
@@ -206,7 +232,7 @@ async function verifyHmac(config: VerifyConfig, secrets: string[], d: Delivery):
   const algorithm = config.algorithm === "sha1" ? "SHA-1" : "SHA-256";
   const ok = await anySecret(secrets, async (s) => constantTimeEqual(await hmac(algorithm, utf8(s), d.body), given));
   if (!ok) return REFUSED;
-  return { ok: true, verified: true, dedupeKey: `body:${await sha256Hex(d.body)}`, eventType: null };
+  return { ok: true, verified: true, dedupeKeys: [`body:${await sha256Hex(d.body)}`], eventType: null };
 }
 
 async function verifyToken(config: VerifyConfig, secrets: string[], d: Delivery): Promise<Verdict> {
@@ -221,10 +247,12 @@ async function verifyToken(config: VerifyConfig, secrets: string[], d: Delivery)
   const given = utf8(presented);
   const ok = await anySecret(secrets, async (s) => constantTimeEqual(utf8(s), given));
   if (!ok) return REFUSED;
-  return { ok: true, verified: true, dedupeKey: null, eventType: null };
+  return { ok: true, verified: true, dedupeKeys: [], eventType: null };
 }
 
 const COMMON_HEADERS = ["content-type", "user-agent"];
+// Signature headers are never kept: once verified they are no use to a reader, and a stored
+// signature next to its body is a ready-made replay.
 const PRESET_HEADERS: Record<Preset, string[]> = {
   github: [
     "x-github-event",
@@ -232,23 +260,38 @@ const PRESET_HEADERS: Record<Preset, string[]> = {
     "x-github-hook-id",
     "x-github-hook-installation-target-id",
     "x-github-hook-installation-target-type",
-    "x-hub-signature-256",
   ],
-  "standard-webhooks": ["webhook-id", "webhook-timestamp", "webhook-signature"],
+  "standard-webhooks": ["webhook-id", "webhook-timestamp"],
+  // The hmac preset's own header is its signature: never kept.
   hmac: [],
   // The token header *is* the secret: never kept.
   token: [],
   unverified: [],
 };
-const NEVER_KEPT = new Set(["cookie", "authorization", "proxy-authorization", "set-cookie"]);
+const NEVER_KEPT = new Set([
+  "cookie",
+  "authorization",
+  "proxy-authorization",
+  "set-cookie",
+  "x-hub-signature",
+  "x-hub-signature-256",
+  "webhook-signature",
+]);
 
-/** The headers an event keeps: the preset's allowlist, lowercased; never cookies or credentials. */
+/** A header that carries this hook's signature or token, whatever the preset calls it. */
+function isCredentialHeader(config: VerifyConfig, name: string): boolean {
+  return NEVER_KEPT.has(name) || ((config.preset === "hmac" || config.preset === "token") && name === config.header);
+}
+
+/**
+ * The headers an event keeps: the preset's allowlist, lowercased; never cookies, credentials or
+ * signatures. Every kept header is the sender's claim: none is covered by a signature.
+ */
 export function keptHeaders(config: VerifyConfig, headers: Headers): Record<string, string> {
   const names = [...COMMON_HEADERS, ...PRESET_HEADERS[config.preset]];
-  if (config.preset === "hmac" && config.header) names.push(config.header);
   const out: Record<string, string> = {};
   for (const n of names) {
-    if (NEVER_KEPT.has(n)) continue;
+    if (isCredentialHeader(config, n)) continue;
     const v = headers.get(n);
     if (v !== null) out[n] = v.slice(0, 1024);
   }
