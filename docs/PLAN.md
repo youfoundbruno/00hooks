@@ -203,6 +203,31 @@ a self-hosted one are interchangeable.
 
 ## 5. Running automations on your machine
 
+### 5.0 The event catalogue
+
+The first time a new kind of event arrives, its structure is saved, so filters, field rules (§6a) and
+automations can be built later by picking real fields instead of typing paths.
+
+- **A kind** is the hook (or messaging channel) plus the provider's event type (`pull_request`,
+  `checkout.session.completed`), or, when there is none, the payload's shape hash (its field paths and
+  types, not values).
+- **What's kept for each kind**:
+  - its **field tree**: every path with its type (`repository.full_name: string`,
+    `pull_request.additions: number`, `labels[]: object`) and how often it's present;
+  - **one sample event**, the first one, so the builder can show real values next to each field;
+  - for short, repeating fields (status, action, currency), the **values seen**, up to 20, so a filter
+    can offer "action is one of opened / closed / reopened" as a menu;
+  - first seen, last seen and a count.
+- **Kept on your machine only**, in the runner's store (or 00next's), never at the relay. Samples and
+  seen values are content, so each kind has *Clear sample*, the whole catalogue can be cleared, and a
+  hook can be set to keep structure only (no sample, no values) for sensitive sources.
+- **Noticed, not noisy**: a new kind shows up once in the Automations screen as *New from GitHub:
+  "issues.labeled"*, with *Add an automation* and *Add a screen rule* right there, and it's marked when
+  a known kind gains or loses fields (*shape changed on 14 Oct: added `pull_request.auto_merge`*).
+- **Used everywhere a field is chosen**: the automation builder's filters, the screen's field rules,
+  and templates (`{{payload.pull_request.title}}` with autocomplete and the sample's value as a
+  preview). Filters on a field a kind no longer has are flagged instead of silently never matching.
+
 ### 5.1 Matching
 
 An automation's **trigger** is a hook plus optional filters:
@@ -369,7 +394,9 @@ unless they keep matching (default 90 days).
    | similar text | `message.text` is like this one | MinHash on that one field, so a long template with a changed name still matches |
    | one of | `repository.full_name` is one of a list you keep | for allow lists too |
 
-   Field rules keep the values you chose, because that is what they match on. Only the ticked
+   The fields come from the event catalogue (§5.0), so a rule can also be written before anything is
+   blocked, by picking a kind and its fields. Field rules keep the values you chose, because that is
+   what they match on. Only the ticked
    fields' values are kept, never the rest of the item, and they stay **in the harness** (your
    machine), shown in plain text in the rule so you can see exactly what's blocked. A rule can also
    be pushed to the edge *(optional)*: `is`, `domain is` and `one of` go as keyed hashes (the relay
