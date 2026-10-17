@@ -713,7 +713,10 @@ export function handshakeAnswer(config: VerifyConfig, body: Uint8Array): Respons
   });
 }
 
-const COMMON_HEADERS = ["content-type", "user-agent"];
+// `00hooks-origin` and `00hooks-hop` are what a 00hooks runner puts on its own outbound calls, so
+// it can recognise its own call coming back and stop loops (PLAN §5.3). Like every kept header, they
+// are the sender's claim; the runner only ever *drops* on them. Sealed like the rest.
+const COMMON_HEADERS = ["content-type", "user-agent", "00hooks-origin", "00hooks-hop"];
 const NEVER_KEPT = new Set([
   "cookie",
   "authorization",

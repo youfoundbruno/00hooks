@@ -26,8 +26,47 @@ allowed.
 
 - `relay/`: the Cloudflare Worker and Durable Object (TypeScript). How to run, test and self-host
   it: [`relay/README.md`](relay/README.md).
-- `cli/`: the `00hooks` CLI and the `hooks-client` library (Rust), also embedded by
-  [00next](https://github.com/youfoundbruno/00next).
+- `cli/`: the `00hooks` CLI, the `hooks-client` library and the `hooks-runner` automation runner
+  (Rust), also embedded by [00next](https://github.com/youfoundbruno/00next).
+
+## Automations
+
+`00hooks run` listens and runs the automations in `~/.config/00hooks/automations.yaml` (or
+`--automations <file>`, or `HOOKS_AUTOMATIONS`); `00hooks service install` runs it at login.
+
+```yaml
+version: 1
+notify: system                # or `none`: notifications are only recorded
+hooks:
+  payments: { structure_only: true }   # the catalogue keeps no sample or values for this hook
+automations:
+  - name: New issues
+    when: { hook: github, kinds: [issues] }   # or `kinds: any`, `new_kind: true`, `shape_changed: true`
+    only_if: payload.action == "opened" and payload.repository.full_name in ["acme/web"]
+    verified_only: true       # the default
+    rate_limit: 30/hour       # the default; repeated failures pause it (pause_after: 5, pause_for: 15m)
+    allow_hosts: [api.example.com]
+    allow_commands: [/usr/bin/say]
+    then:
+      - notify: "#{{payload.issue.number}} {{payload.issue.title | truncate:60}}"
+      - call:
+          url: https://api.example.com/issues/{{payload.issue.number}}
+          headers: { Authorization: "Bearer {{secret.API_TOKEN}}" }   # `00hooks secrets set API_TOKEN`
+          body: { title: "{{payload.issue.title}}" }
+      - run: { command: say, args: ["New issue {{payload.issue.number}}"], timeout: 10s }
+      - write: { append: ~/hooks/issues.jsonl }
+```
+
+- **Filters** compare fields (`payload.…`, `headers.…`, `event.…`) with `==`, `!=`, `>`, `<`, `>=`,
+  `<=`, `in`, `contains`, `matches` (a literal regular expression) and combine them with `and`,
+  `or`, `not`. They can't run anything.
+- **Templates** fill `{{path}}` slots, with the filters `money`, `truncate`, `json` and `upper`.
+- **Actions** never use a shell: a command gets an argument list and the event on stdin (or in a
+  file named by `HOOKS_EVENT_FILE`), with only `PATH`, `HOME` and `LANG` from your environment; a
+  call's host must be in `allow_hosts`; a file's folder is fixed and its name sanitised.
+- `00hooks kinds` lists the kinds of events seen and `00hooks kinds show <hook/kind>` their fields;
+  `00hooks automations check` validates the file against them; `00hooks runs` and
+  `00hooks replay <event>` show and repeat runs.
 
 ## License
 

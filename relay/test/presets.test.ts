@@ -227,6 +227,19 @@ describe("keptHeaders", () => {
     );
   });
 
+  it("keeps the runner's loop-prevention headers for every preset", () => {
+    const h = new Headers({ "00hooks-origin": "dev_abc", "00hooks-hop": "2", "X-Other": "x" });
+    for (const config of [
+      { preset: "github" },
+      { preset: "standard-webhooks" },
+      { preset: "hmac", header: "x-sig", algorithm: "sha256", encoding: "hex" },
+      { preset: "token", header: "x-token" },
+      { preset: "unverified" },
+    ] as const) {
+      expect(keptHeaders(config, h)).toEqual({ "00hooks-origin": "dev_abc", "00hooks-hop": "2" });
+    }
+  });
+
   it("never keeps a signature header, whatever the preset calls it", () => {
     const h = new Headers({
       "Content-Type": "application/json",

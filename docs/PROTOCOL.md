@@ -333,7 +333,8 @@ An event, as one device receives it in `event: hook` (each device gets its own e
 first one is the boundary.
 
 - `headers` keeps only an allowlist per preset (the provider's event and delivery headers,
-  `content-type`, `user-agent`), lowercased, each value at most 1,024 characters. None of them is
+  `content-type`, `user-agent`, and the runner's loop-prevention headers `00hooks-origin` and
+  `00hooks-hop`), lowercased, each value at most 1,024 characters. None of them is
   covered by a signature. Never `cookie`, `authorization`, or any signature or token header: once
   verified they're no use to a reader, and a stored signature beside its body is a ready-made replay.
   A strict hook's envelope is the exception: it carries the signature headers its device needs
