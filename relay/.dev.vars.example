@@ -1,0 +1,13 @@
+# Copy to .dev.vars (gitignored) for `pnpm dev`; in production use `wrangler secret put <NAME>`.
+
+# AES-256-GCM key that seals hook signing secrets at rest: 32 random bytes, base64.
+#   openssl rand -base64 32
+SECRETS_KEY=REPLACE_WITH_32_RANDOM_BYTES_BASE64
+
+# HMAC key for hashing enrolment codes and client IPs: any long random string.
+#   openssl rand -base64 32
+HASH_PEPPER=REPLACE_WITH_A_LONG_RANDOM_STRING
+
+# Optional. When set, creating an account needs `Authorization: Bearer <SIGNUP_TOKEN>`.
+# Leave it unset only for local development: signups are then open to anyone.
+# SIGNUP_TOKEN=REPLACE_WITH_A_LONG_RANDOM_STRING

@@ -1,0 +1,87 @@
+# 00hooks relay
+
+The relay half of 00hooks: a Cloudflare Worker and one Durable Object class. Webhooks arrive at
+`/h/<hook id>`; the relay verifies them over the raw bytes, dedupes them, appends them to the
+account's ordered log, and streams them to the account's devices over SSE, resumably. The contract
+with clients is [`docs/PROTOCOL.md`](../docs/PROTOCOL.md); the design and the security model are in
+[`docs/PLAN.md`](../docs/PLAN.md).
+
+```
+provider ──POST /h/<hook>──▶ Worker ── verify, rate limit, size ──▶ AccountObject (one per account)
+                                                                    SQLite: log, cursors, nonces,
+CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hibernatable ── dedupe marks; alarm prunes
+                                                       WebSocket
+```
+
+- `src/index.ts`: routes. `src/auth.ts`: signed requests. `src/accounts.ts`: accounts, devices,
+  enrolments. `src/hooks.ts`: the hook API. `src/presets.ts`: verification presets.
+  `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE bridge.
+  `src/account-object.ts`: the Durable Object. `migrations/`: the D1 schema.
+- Phase 0 stores payloads in plain text in the object's SQLite; sealing them to device keys is
+  phase 1 (PLAN §4.4).
+
+## Develop
+
+From the repository root (a pnpm workspace; `pnpm install` once):
+
+```sh
+cp relay/.dev.vars.example relay/.dev.vars    # then fill in the two secrets
+pnpm --filter ./relay exec wrangler d1 migrations apply 00hooks --local
+pnpm --filter ./relay dev                     # http://localhost:8787, all local
+pnpm --filter ./relay test                    # vitest inside workerd (Miniflare)
+pnpm --filter ./relay typecheck
+pnpm check                                    # everything a change must pass
+```
+
+The tests run the real Worker, Durable Object (SQLite storage, alarms, hibernatable WebSockets), D1
+and Rate Limiting binding in workerd. After changing `wrangler.jsonc`, regenerate the binding types
+with `pnpm --filter ./relay types`.
+
+## Self-hosting
+
+You need a Cloudflare account on the Workers Paid plan (Durable Objects with SQLite storage and the
+Rate Limiting binding). In `relay/`:
+
+1. `wrangler d1 create 00hooks`, and put the database id in `wrangler.jsonc`.
+2. `wrangler d1 migrations apply 00hooks --remote`.
+3. Set the secrets with `wrangler secret put <NAME>`:
+
+   | Name | What | Example |
+   |---|---|---|
+   | `SECRETS_KEY` | AES-256-GCM key sealing hook signing secrets at rest: 32 random bytes, base64 | `openssl rand -base64 32` |
+   | `HASH_PEPPER` | HMAC key for enrolment-code and client-IP hashes | `openssl rand -base64 32` |
+   | `SIGNUP_TOKEN` | Optional. When set, creating an account needs `Authorization: Bearer <token>`. Without it, anyone can sign up: development only (`/v1/info` reports `signupOpen`) | `openssl rand -base64 24` |
+
+4. `wrangler deploy`.
+
+Bindings (all in `wrangler.jsonc`): `ACCOUNT` (the `AccountObject` Durable Object, SQLite-backed),
+`DB` (D1: accounts, devices, hooks with their sealed secrets, enrolments, and the routing from a
+hook id to its account), `HOOK_LIMIT` (Rate Limiting: 60 requests per 10 s per hook). Variable:
+`RETENTION_DAYS` (default 7), how long unacknowledged events are kept.
+
+Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
+
+## Security notes
+
+- **Requests are signed by device keys** (Ed25519 over the device id, host, method, path and query,
+  time, nonce and body hash; PROTOCOL §1 has a test vector the relay's tests check). The private key never leaves the device. Requests more than 300 s off the relay's
+  clock are refused (`clock_skew`, with the server's time), and every nonce is spent in the
+  account's Durable Object, strongly consistent, GET requests included, so a captured stream request
+  can't be replayed into a live copy of the account's events.
+- **Revoking a device** closes its open stream at once (`4401`) and stops it holding events back.
+- **Hook secrets** are generated from 32 random bytes, shown once (create or rotate), and stored
+  sealed with AES-256-GCM under `SECRETS_KEY`, with the hook id as associated data. Rotation keeps
+  the previous secret valid for 24 hours. A secret you supply is never echoed back.
+- **Verification** runs over the raw bytes before anything is parsed, with constant-time
+  comparisons, and checks every valid secret, not just until one matches. Failures answer `401`
+  `signature` and are counted, never stored.
+- **Replays**: GitHub deliveries dedupe on `X-GitHub-Delivery`, Standard Webhooks on `webhook-id`
+  within a 300 s timestamp window, generic HMAC on the body hash. The dedupe mark is written in the
+  same Durable Object transaction as the event, so a crash can't lose an event that was marked.
+- **Limits**: bodies are checked against the hook's limit (1 MiB by default) from `Content-Length`
+  and again while streaming; each hook is rate limited at the edge.
+- **What's kept**: only an allowlist of headers per preset (event, delivery and signature headers,
+  `content-type`, `user-agent`), never `cookie` or `authorization`. Enrolment codes and client IPs
+  are stored only as HMACs under `HASH_PEPPER`.
+- **Errors** are fixed sentences: they never quote a secret, a signature or payload content.
+- **Webhook content is data**: the relay never acts on it.

@@ -1,0 +1,16 @@
+{
+  "data": {
+    "viewer": {
+      "accounts": [
+        {
+          "periodic": [
+            { "sum": { "activeTime": 1200000, "cpuTime": 25000, "inboundWebsocketMsgCount": 14400, "outboundWebsocketMsgCount": 0 } },
+            { "sum": { "activeTime": 800000, "cpuTime": 15000, "inboundWebsocketMsgCount": 14400, "outboundWebsocketMsgCount": 0 } }
+          ],
+          "invocations": [{ "sum": { "requests": 18 } }, { "sum": { "requests": 12 } }]
+        }
+      ]
+    }
+  },
+  "errors": null
+}

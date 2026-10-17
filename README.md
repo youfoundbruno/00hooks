@@ -24,7 +24,8 @@ allowed.
 
 ## Components
 
-- `relay/`: the Cloudflare Worker and Durable Object (TypeScript).
+- `relay/`: the Cloudflare Worker and Durable Object (TypeScript). How to run, test and self-host
+  it: [`relay/README.md`](relay/README.md).
 - `cli/`: the `00hooks` CLI and the `hooks-client` library (Rust), also embedded by
   [00next](https://github.com/youfoundbruno/00next).
 
