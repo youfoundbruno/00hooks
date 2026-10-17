@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use hooks_client::{Event, StreamEvent, SubscribeOptions, describe_skew, subscribe};
 
 use crate::ctx::{CliResult, Ctx, Failure, sentence};
-use crate::output::{Line, Output, clock, duration, sanitize, size};
+use crate::output::{Line, Output, clock, duration, json_line, sanitize, size};
 
 /// Bodies longer than this are cut in human mode (`--json` always has the whole event).
 const SHOW_BODY: usize = 64 * 1024;
@@ -185,7 +185,9 @@ pub async fn run(as_json: bool, filters: Vec<String>) -> CliResult {
                 let name = names.get(&ctx, &e.hook_id).await;
                 let mut l = vec![Line::Err(summary(&e, name.as_deref()))];
                 if as_json {
-                    l.push(Line::Out(serde_json::to_string(&e).unwrap_or_default()));
+                    // C1 controls and bidi characters as `\u` escapes: the line is for programs,
+                    // but it is often read in a terminal too.
+                    l.push(Line::Out(json_line(&e)));
                 } else if let Some(body) = render_body(&e) {
                     l.push(Line::Out(body));
                 }
@@ -276,6 +278,18 @@ mod tests {
         let e = event(&[0xff, 0xfe, 0x00], None, true);
         assert_eq!(render_body(&e).unwrap(), "(3 B of binary data)");
         assert_eq!(render_body(&event(b"", None, true)), None);
+    }
+
+    #[test]
+    fn json_mode_escapes_c1_and_bidi_in_events() {
+        let e = event(b"{}", Some("push\u{9b}2J\u{202e}gnp.exe"), true);
+        let line = json_line(&e);
+        assert!(
+            !line.contains('\u{9b}') && !line.contains('\u{202e}'),
+            "{line:?}"
+        );
+        let back: Event = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.event_type, e.event_type);
     }
 
     #[test]

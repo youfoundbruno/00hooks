@@ -209,7 +209,8 @@ fn main() {
         .expect("tokio runtime");
     if let Err(f) = runtime.block_on(dispatch(cli.cmd)) {
         if !f.message.is_empty() {
-            eprintln!("{}", f.message);
+            // Every failure is printed through `sanitize`: some carry text from the relay.
+            eprintln!("{}", output::sanitize(&f.message, true));
         }
         std::process::exit(f.code);
     }

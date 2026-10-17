@@ -6,8 +6,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 
+/// Bidirectional formatting characters (marks, embeddings, overrides, isolates) and the Unicode
+/// line and paragraph separators: invisible, and able to reorder or break what a terminal shows.
+fn is_bidi_or_separator(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// Remove characters that could drive the terminal (C0 and C1 controls, DEL, bidirectional
-/// overrides). `multiline` keeps `\n` and `\t`; otherwise they become spaces.
+/// formatting, line separators). `multiline` keeps `\n` and `\t`; otherwise they become spaces.
 pub fn sanitize(s: &str, multiline: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -15,8 +30,25 @@ pub fn sanitize(s: &str, multiline: bool) -> String {
             '\n' | '\t' if multiline => out.push(c),
             '\n' | '\t' | '\r' => out.push(' '),
             c if c.is_control() => {}
-            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {}
+            c if is_bidi_or_separator(c) => {}
             c => out.push(c),
+        }
+    }
+    out
+}
+
+/// One JSON line that is safe to print: serde already escapes C0 controls, and this also writes
+/// DEL, C1 controls, bidirectional formatting characters and line separators as `\uXXXX` escapes.
+/// The value is unchanged for any JSON reader; only what reaches the terminal differs. (Outside
+/// strings, JSON is ASCII, so every such character is inside a string where an escape is valid.)
+pub fn json_line<T: serde::Serialize + ?Sized>(v: &T) -> String {
+    let raw = serde_json::to_string(v).unwrap_or_default();
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) || is_bidi_or_separator(c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
         }
     }
     out
@@ -210,6 +242,26 @@ mod tests {
         assert_eq!(sanitize(evil, true), "ok[31mred2Jtxt \nnext\tcol");
         assert_eq!(sanitize(evil, false), "ok[31mred2Jtxt  next col");
         assert_eq!(sanitize("plain é ✓", false), "plain é ✓");
+        assert_eq!(
+            sanitize("a\u{2066}b\u{2028}c\u{061c}d\u{7f}e", false),
+            "abcde"
+        );
+    }
+
+    #[test]
+    fn json_lines_escape_what_serde_leaves_raw() {
+        let v = serde_json::json!({
+            "t": "c1\u{9b}2J del\u{7f} rlo\u{202e}x lsep\u{2028} esc\u{1b} é ✓"
+        });
+        let line = json_line(&v);
+        for c in ['\u{9b}', '\u{7f}', '\u{202e}', '\u{2028}', '\u{1b}'] {
+            assert!(!line.contains(c), "{line:?} carries {c:?}");
+        }
+        assert!(line.contains("\\u009b") && line.contains("\\u202e") && line.contains("\\u007f"));
+        assert!(line.contains("é ✓"), "printable text stays as it is");
+        // Same value for a JSON reader.
+        let back: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, v);
     }
 
     #[test]

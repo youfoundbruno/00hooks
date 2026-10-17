@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::account::confirm;
 use crate::ctx::{CliResult, Ctx, Failure};
-use crate::output::{date_time, sanitize, size, table};
+use crate::output::{date_time, json_line, sanitize, size, table};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Preset {
@@ -142,7 +142,7 @@ pub async fn create(name: String, preset: Preset, args: VerifyArgs, as_json: boo
         if let Some(s) = &created.secret {
             v["secret"] = json!(s.expose());
         }
-        println!("{v}");
+        println!("{}", json_line(&v));
     } else {
         eprintln!(
             "Created hook {} ({}).",
@@ -195,7 +195,7 @@ pub async fn list(as_json: bool) -> CliResult {
     let ctx = Ctx::load()?;
     let hooks = ctx.client.hooks().await.map_err(|e| ctx.explain(e))?;
     if as_json {
-        println!("{}", json!({ "hooks": hooks }));
+        println!("{}", json_line(&json!({ "hooks": hooks })));
         return Ok(());
     }
     if hooks.is_empty() {
@@ -261,7 +261,7 @@ pub async fn show(which: String, as_json: bool) -> CliResult {
     let ctx = Ctx::load()?;
     let h = resolve(&ctx, &which).await?;
     if as_json {
-        println!("{}", json!(h));
+        println!("{}", json_line(&json!(h)));
     } else {
         print!("{}", describe(&h));
     }

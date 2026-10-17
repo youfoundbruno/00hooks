@@ -145,7 +145,7 @@ pub async fn login(args: Login) -> CliResult {
     };
     println!(
         "{how} {}. This computer is device {} ({}).",
-        joined.account_id,
+        sanitize(&joined.account_id, false),
         joined.device_id,
         sanitize(&name, false)
     );
@@ -172,7 +172,7 @@ pub async fn devices_list() -> CliResult {
         }
         rows.push(vec![
             name,
-            d.id,
+            sanitize(&d.id, false),
             date_time(d.created_at),
             d.last_seen_at
                 .map(date_time)

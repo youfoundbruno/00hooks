@@ -7,6 +7,8 @@ use hooks_client::{
     Client, Config, DeviceKey, Error, KeyStore, KeychainStore, StateDir, describe_skew,
 };
 
+use crate::output::sanitize;
+
 /// A failure to show the person: what happened, then what to do about it.
 #[derive(Debug)]
 pub struct Failure {
@@ -65,7 +67,9 @@ pub fn explain(e: Error, relay: &str) -> Failure {
         Error::Closed { .. } => sentence(&e.to_string()),
         other => sentence(&other.to_string()),
     };
-    Failure::new(message)
+    // The relay's message, a close reason and network details are text from elsewhere: nothing in
+    // them may drive the terminal.
+    Failure::new(sanitize(&message, false))
 }
 
 /// Capitalise and end with a full stop.
@@ -184,6 +188,31 @@ mod tests {
             f.message,
             "The relay refused the request: Name is too long. (field: name)"
         );
+    }
+
+    #[test]
+    fn relay_text_is_sanitised() {
+        let f = explain(
+            Error::Api {
+                status: 400,
+                code: "invalid".into(),
+                message: "bad\u{1b}]0;pwned\u{7}\u{9b}2J\u{202e}name".into(),
+                field: Some("na\u{1b}[2Jme".into()),
+            },
+            "x",
+        );
+        for c in ['\u{1b}', '\u{7}', '\u{9b}', '\u{202e}'] {
+            assert!(!f.message.contains(c), "{:?}", f.message);
+        }
+        let f = explain(
+            Error::Closed {
+                code: 4409,
+                reason: "replaced\u{1b}[31m\u{2066}".into(),
+            },
+            "x",
+        );
+        assert!(!f.message.contains('\u{1b}') && !f.message.contains('\u{2066}'));
+        assert!(f.message.contains("replaced"), "{}", f.message);
     }
 
     #[test]
