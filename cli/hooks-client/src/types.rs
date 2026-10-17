@@ -23,6 +23,72 @@ pub struct Info {
     #[serde(default)]
     pub relay_key: Option<String>,
     pub server_time: i64,
+    /// What the relay's screen takes (PROTOCOL §4b), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<ScreenInfo>,
+    /// Optional hosted extras the relay announces (PROTOCOL §2): data, shown only when present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extras: Vec<Extra>,
+}
+
+/// `/v1/info`'s `screen`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenInfo {
+    pub edge: bool,
+    pub max_rules: u32,
+    /// How long a held event waits at the relay.
+    pub held_days: f64,
+}
+
+/// A hosted extra a relay announces (fingerprint sync, reputation lists, a longer hold, evaluator
+/// credits): never hard-coded in a client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Extra {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// One event the relay's screen holds (`GET /v1/held`): metadata, never content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldEvent {
+    pub id: String,
+    pub hook_id: String,
+    pub received_at: i64,
+    pub verified: bool,
+    #[serde(default)]
+    pub strict: bool,
+    pub preset: String,
+    #[serde(default)]
+    pub event_type: Option<String>,
+    /// The edge rule that held it.
+    pub rule: String,
+    pub size: u64,
+    pub expires_at: i64,
+}
+
+/// Where a delivery came from, as the relay's edge saw it (sealed with the content, PROTOCOL §4b).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Origin {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+}
+
+impl Origin {
+    pub fn is_empty(&self) -> bool {
+        self.ip.is_none() && self.asn.is_none() && self.country.is_none()
+    }
 }
 
 impl Info {
@@ -182,6 +248,12 @@ pub struct Event {
     /// sealed content, so only the relay could have said so.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notice: bool,
+    /// Held by the relay's screen and released (PROTOCOL §4b): relay-signed metadata.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
+    /// Where it came from, as the edge saw it: read from the sealed content only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

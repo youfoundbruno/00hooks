@@ -85,6 +85,11 @@ automations:
 - `00hooks kinds` lists the kinds of events seen and `00hooks kinds show <hook/kind>` their fields;
   `00hooks automations check` validates the file against them; `00hooks runs` and
   `00hooks replay <event>` show and repeat runs.
+- **The screen** (optional, `00hooks screen on`) decides before any automation whether an event
+  passes, is held for you or is dropped: rules on origin, headers, size and fields, similarity to
+  what you dropped, and an optional AI evaluator that only answers typed questions.
+  `00hooks screen held`, `release`, `drop --always` and `sync` (the rules that can run at the relay,
+  with field values as keyed hashes). See PLAN §6a and PROTOCOL §4b.
 
 ## License
 

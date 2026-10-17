@@ -37,6 +37,8 @@ pub enum RunStatus {
     Dropped,
     /// A crash stopped it part-way.
     Interrupted,
+    /// The screen held it in the quarantine list (PLAN §6a): nothing ran; releasing it runs it.
+    Held,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,6 +103,9 @@ pub struct RunRecord {
     pub shape_change: Option<ShapeChange>,
     #[serde(default)]
     pub automations: Vec<AutomationRun>,
+    /// The quarantine list's id for it, when the screen held it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
 }
 
 impl RunRecord {
@@ -218,6 +223,7 @@ impl RunLog {
                     new_kind: false,
                     shape_change: None,
                     automations: Vec::new(),
+                    held: None,
                 };
                 runs_file.append(&Line::End {
                     record: rec.clone(),
@@ -379,6 +385,7 @@ mod tests {
             new_kind: false,
             shape_change: None,
             automations: vec![],
+            held: None,
         }
     }
 

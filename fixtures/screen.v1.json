@@ -1,0 +1,292 @@
+{
+  "about": "Screen vectors (PROTOCOL §4b): the Rust harness (cli/hooks-screen) and the relay (relay/src/screen.ts) compute these alike.",
+  "domains": [
+    {
+      "domain": "mail.deals.example",
+      "suffixes": [
+        "mail.deals.example",
+        "deals.example",
+        "example"
+      ],
+      "value": "Promo@Mail.Deals.Example."
+    },
+    {
+      "domain": "bit.ly",
+      "suffixes": [
+        "bit.ly",
+        "ly"
+      ],
+      "value": "https://user@Bit.ly:443/x?y"
+    },
+    {
+      "domain": "deals.example",
+      "suffixes": [
+        "deals.example",
+        "example"
+      ],
+      "value": "deals.example"
+    },
+    {
+      "domain": "[::1]",
+      "suffixes": [
+        "[::1]"
+      ],
+      "value": "http://[::1]:80/"
+    }
+  ],
+  "edgePatterns": [
+    {
+      "edge": true,
+      "pattern": "bit\\.ly/\\w+"
+    },
+    {
+      "edge": false,
+      "pattern": "(a+)+$"
+    },
+    {
+      "edge": false,
+      "pattern": "(\\w)\\1"
+    },
+    {
+      "edge": false,
+      "pattern": "(?=x)"
+    },
+    {
+      "edge": false,
+      "pattern": "a*b*c*"
+    },
+    {
+      "edge": true,
+      "pattern": "[(*+]x{2,5}"
+    },
+    {
+      "edge": true,
+      "pattern": "a{2,}b+"
+    }
+  ],
+  "fieldHashes": [
+    {
+      "hash": "qCDc6F0m0O4yRgNjxImAuA",
+      "normalised": "promo@deals.example",
+      "op": "is",
+      "path": "payload.message.from",
+      "value": "  PROMO@deals.example "
+    },
+    {
+      "hash": "N3NwClZpcsKjC1vCxIXrQg",
+      "normalised": "deals.example",
+      "op": "domain_is",
+      "path": "payload.message.from",
+      "value": "deals.example"
+    },
+    {
+      "hash": "QD9i9_U68Z9estLuVJkobg",
+      "normalised": "2",
+      "op": "one_of",
+      "path": "payload.id",
+      "value": "2"
+    },
+    {
+      "hash": "Y65kHjfGHU4Crc1zcMJuZA",
+      "normalised": "promo",
+      "op": "is",
+      "path": "headers.x-kind",
+      "value": "Promo"
+    }
+  ],
+  "items": [
+    {
+      "body": "{\"a\":[\"One\",3,{\"y\":null,\"z\":\"Four\"}],\"b\":\"two\",\"c\":true}",
+      "contentType": "application/json",
+      "name": "json",
+      "shape": "e70e466e77c0c25e4d51aefe91421a14b11ea606b8705398039b00d8a3c307f8",
+      "signature": "Mz4ZyK46X2V42_VUhlQxeIZm2gaMUSsCaGi_WhU9n-D2BBtRFnojQKI3XeBjS49e75UGDCi2rvGhLC1iuAFawT6m0D6Dz1bEEEAQUusgN4o94KXfkB7MtN7x5XncwNvbDYgeam-Kl2p5iFT8QkDoBafypAncJ3ARd8oZGlW0HkRn2r7hn8g3jOGo0XnkKB6DEYWK8xl2MmrZ35Dn4-GuMjrZLDCEyd1IM2yHPUNJJfcpI_Vte6jdxe40UQks9z1tuTvk_z9QhjXGwaufKfWZNl-msYxCLtP9vvNai3Bvq5Y9QyIVmB0KfW3touD_iKRSVZ0YgkrufqONFaIp5XS2yA",
+      "text": "One Four two",
+      "tokens": [
+        "one",
+        "four",
+        "two"
+      ]
+    },
+    {
+      "body": "{\"id\":1,\"message\":{\"from\":\"promo@mail.deals.example\",\"text\":\"Congratulations! You have won a FREE crypto wallet worth 5000 dollars. Click bit.ly/claim-now to claim your prize before midnight, only for today.\"}}",
+      "contentType": "application/json",
+      "name": "junk",
+      "shape": "5d5a68e3071ad3401429230b39cd9d028f65f92c6b825cdbec0c1ec6758523e0",
+      "signature": "BRGebQ_cmRgFEjXnCdOr2AltAlwFuNJAAkHt_SWldpQIB69MAHYABAcuJy8E2LwwBxh2xQ29H3IK736qADxajAIv-N4TdPHPBpKobwjOaHYTRnzUA_kihCTuYDQCAed8CxekpAPSDmsQ_8qRF0IWIQBR5zID59SzBFD_HQUOvQsJVCuVBt1O1ACrhN4DpHMIBqklRgC492sA-KhvAtiQqQ-NoVYHLaijAcEGrBbZ2wABL7eiDwar6w8x8hkNQY3tB7SiQRxNirICckxTJyW8IDHU-24RbDYHFyYkAAUlKUgASqqeA7KM7QH1_qYBDgS8BcVr4gKgDhEEPI7XARvM0A",
+      "text": "promo@mail.deals.example Congratulations! You have won a FREE crypto wallet worth 5000 dollars. Click bit.ly/claim-now to claim your prize before midnight, only for today.",
+      "tokens": [
+        "promo",
+        "mail",
+        "deals",
+        "example",
+        "congratulations",
+        "you",
+        "have",
+        "won",
+        "a",
+        "free",
+        "crypto",
+        "wallet",
+        "worth",
+        "5000",
+        "dollars",
+        "click",
+        "bit",
+        "ly",
+        "claim",
+        "now",
+        "to",
+        "claim",
+        "your",
+        "prize",
+        "before",
+        "midnight",
+        "only",
+        "for",
+        "today"
+      ]
+    },
+    {
+      "body": "{\"id\":2,\"message\":{\"from\":\"promo@deals.example\",\"text\":\"Congratulations! You have won a FREE crypto wallet worth 7000 dollars. Click bit.ly/claim-now to claim your prize before midnight, only for today.\"}}",
+      "contentType": "application/json",
+      "name": "junk-2",
+      "shape": "5d5a68e3071ad3401429230b39cd9d028f65f92c6b825cdbec0c1ec6758523e0",
+      "signature": "BRGebR_CzMQFEjXnFAfheAltAlwPoLibAkHt_RXFhkoTQDRkAHYABBN2a5IU47RVBajiCyadypMK736qADxajAIv-N4N-AGxBpKobwjOaHYE4Vr3A5QGtwJUk5oK9e_BCxekpAPSDmsSN5DHG5JCfwBR5zID59SzBFD_HQUOvQsOqbGBCztS1gd1wy4Qk0BXBqklRgC492sJibW7AtiQqQX-a-oTo6FBAcEGrBbZ2wABL7eiGs_XBQ8x8hkUFjMuB7SiQQutakECckxTA4cBhxP8PwURbDYHFyYkAAUlKUgASqqeA7KM7QH1_qYDPeN3BcVr4gFqsWUEPI7XBW89lg",
+      "text": "promo@deals.example Congratulations! You have won a FREE crypto wallet worth 7000 dollars. Click bit.ly/claim-now to claim your prize before midnight, only for today.",
+      "tokens": [
+        "promo",
+        "deals",
+        "example",
+        "congratulations",
+        "you",
+        "have",
+        "won",
+        "a",
+        "free",
+        "crypto",
+        "wallet",
+        "worth",
+        "7000",
+        "dollars",
+        "click",
+        "bit",
+        "ly",
+        "claim",
+        "now",
+        "to",
+        "claim",
+        "your",
+        "prize",
+        "before",
+        "midnight",
+        "only",
+        "for",
+        "today"
+      ]
+    },
+    {
+      "body": "From=%2B15550001111&Body=Hello+there%2C+friend&Body=again&MessageSid=SM1",
+      "contentType": "application/x-www-form-urlencoded",
+      "name": "form",
+      "shape": "d50c30f513930345ed89d23862a9591a870fc43bb3e3ce14f78266537f1f08b3",
+      "signature": "uG4RFwZDP1VIuCXGbQuwEEOa2vY7c4uGZzxX1IjN5tpoDcnxcfhrjQInr6kNwB2UfRlWwGtMqG2qei323yi5lQnVflxp6pLZcASZK5esGq9PtjKuCamxF2itBNI9LKjQtuskosSPvBo2IQY5E1MtJYRYxjNAyhIKRkzmiXJnPYJvWBjIR_sf1hc9yl81Tw-LA5X-ZJ-fTFy50oQHjGWXDXSeRrtRzlKym2Ei0GCydN-OzvO3U_zpaSbbVqhBAZnCBHN-dIsSgzxpBzOSchb2lFLCUyIlCimtF-Djvx0wjmk_R7WtatUdr2lmMPTUKxB-W9KVeo3RTIEOnP-bY_So5w",
+      "text": "Hello there, friend again +15550001111 SM1",
+      "tokens": [
+        "hello",
+        "there",
+        "friend",
+        "again",
+        "15550001111",
+        "sm1"
+      ]
+    },
+    {
+      "body": "Plain ÜNÏCODE text — ΣΑΣ, numbers 42 and_snake",
+      "contentType": "text/plain",
+      "name": "text",
+      "shape": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "JEFVsBAwf7BUDgjlID--yU5VLNxrEXUthJgyAV2wIFE6S2rpByj4TwPBwUk1P6zXIv3MQwCQWXBawhvYYm9_QA8No3QObSHhK38g2gvNvLxOd_BQGq4dChyOsv9FL5Y9BlItxw898tIplMs9afitlhAaxnKH793BL3ilR1VWcgkZ20FGA1rP_jP1bZ84upYFIcAXhBH0zjQiqss9FNBy0Q4wyXgZgRJoOJLBKGP90MYXRH_UBzupDmOB9f9Ma3QqmRdi6FJfpsgHJf1AFPXWYwbjKFExIC5SFpuLtoOONgUq-x4MLoGovy-y2wwsXWfZGeTA0Tp-iSlUpbdQcmjmEg",
+      "text": "Plain ÜNÏCODE text — ΣΑΣ, numbers 42 and_snake",
+      "tokens": [
+        "plain",
+        "ünïcode",
+        "text",
+        "σας",
+        "numbers",
+        "42",
+        "and",
+        "snake"
+      ]
+    },
+    {
+      "body": "{\"Z\":\"big zed\",\"a.b\":\"dotted\",\"z\":\"zed\",\"é\":\"acute\",\"日本\":\"kanji\"}",
+      "contentType": "application/json",
+      "name": "unicode-keys",
+      "shape": "4a7274c3d55c4385ddce4fae2cb275073f61d5e0371b30cec3ec3e15169f2f61",
+      "signature": "bMgiAh_x4BERhiDTFWojxb3xb6YEDczpvuHIhzcU6t1HFqwNDJgbhjAJ4yMvPZ1xmQoz8xoOCNAGIbE1g8kt-3wb4agpC3bHExnvKWnHmmNRQuR_fatkhdOs7uMggpBzTTKcVlqBoaCBgSQaDnWHJT4fmO4b7ug1yxarLyAhdlEv7ogvcGKcZGB82sAGEhcxcoCANTAHjXKl6q8gSIyTpHr0wl0E5ePPrJJT3DC0DsZWNDkfI5VpDjrUyMkTF2XGGdPzzJs3lM40pyEOZiMx-h2k99gL0iBmjwW4XUhowiu2CcHBjPRtfDMBZAlXTcahU_rAz19kWfBSfPfAXWllhQ",
+      "text": "big zed dotted zed acute kanji",
+      "tokens": [
+        "big",
+        "zed",
+        "dotted",
+        "zed",
+        "acute",
+        "kanji"
+      ]
+    },
+    {
+      "body": "",
+      "contentType": null,
+      "name": "empty",
+      "shape": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": null,
+      "text": "",
+      "tokens": []
+    }
+  ],
+  "murmur": [
+    {
+      "hash": 0,
+      "text": ""
+    },
+    {
+      "hash": 1009084850,
+      "text": "a"
+    },
+    {
+      "hash": 2613040991,
+      "text": "ab"
+    },
+    {
+      "hash": 3017643002,
+      "text": "abc"
+    },
+    {
+      "hash": 1139631978,
+      "text": "abcd"
+    },
+    {
+      "hash": 1586663183,
+      "text": "hello world"
+    },
+    {
+      "hash": 2568969942,
+      "text": "ünïcode σας"
+    }
+  ],
+  "screenKey": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+  "similar": [
+    {
+      "a": "junk",
+      "b": "junk-2",
+      "similarity": 0.515625
+    },
+    {
+      "a": "junk",
+      "b": "json",
+      "similarity": 0.0
+    }
+  ],
+  "version": 1
+}

@@ -9,6 +9,7 @@ mod doctor;
 mod hooks;
 mod listen;
 mod output;
+mod screen;
 mod service;
 
 use std::path::PathBuf;
@@ -145,6 +146,55 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretsCmd,
     },
+    /// The screen: a firewall that decides what happens to each event before any automation sees
+    /// it (pass, hold for you, or drop), here and at the relay.
+    Screen {
+        #[command(subcommand)]
+        cmd: Option<ScreenCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScreenCmd {
+    /// Whether it's on, and how many rules and held items there are.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Screen every webhook before automations run.
+    On {
+        /// Also ask the AI evaluator (set it up in the screen's settings.json) about what rules
+        /// don't settle.
+        #[arg(long)]
+        evaluate: bool,
+    },
+    /// Stop screening.
+    Off,
+    /// What is held, here and at the relay.
+    Held {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a held event now (hld_…), or have the relay stream one it held (evt_…).
+    Release {
+        id: String,
+        #[arg(long, env = "HOOKS_AUTOMATIONS", value_name = "FILE")]
+        automations: Option<PathBuf>,
+    },
+    /// Drop a held event.
+    Drop {
+        id: String,
+        /// Also drop everything similar from now on (a learned rule, kept as a fingerprint).
+        #[arg(long)]
+        always: bool,
+    },
+    /// The rules, with what they matched and when.
+    Rules {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send the rules marked for the edge to the relay (field values as keyed hashes).
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -441,6 +491,16 @@ async fn dispatch(cmd: Cmd) -> CliResult {
             ServiceCmd::Install { automations, print } => service::install(automations, print),
             ServiceCmd::Uninstall => service::uninstall(),
             ServiceCmd::Status => service::status(),
+        },
+        Cmd::Screen { cmd } => match cmd.unwrap_or(ScreenCmd::Status { json: false }) {
+            ScreenCmd::Status { json } => screen::status(json),
+            ScreenCmd::On { evaluate } => screen::set_on(true, evaluate),
+            ScreenCmd::Off => screen::set_on(false, false),
+            ScreenCmd::Held { json } => screen::held(json).await,
+            ScreenCmd::Release { id, automations } => screen::release(id, automations).await,
+            ScreenCmd::Drop { id, always } => screen::drop(id, always).await,
+            ScreenCmd::Rules { json } => screen::rules(json),
+            ScreenCmd::Sync => screen::sync().await,
         },
         Cmd::Secrets { cmd } => match cmd {
             SecretsCmd::Set { name } => automate::secrets_set(name),

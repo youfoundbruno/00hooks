@@ -901,6 +901,7 @@ dependencies = [
  "dirs",
  "getrandom 0.3.4",
  "hooks-client",
+ "hooks-screen",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -915,6 +916,28 @@ dependencies = [
  "tokio",
  "url",
  "yaml-rust2",
+]
+
+[[package]]
+name = "hooks-screen"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "getrandom 0.3.4",
+ "hmac",
+ "hooks-client",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "regex",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "url",
 ]
 
 [[package]]

@@ -9,6 +9,9 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use url::Url;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
 use crate::keys::DeviceKey;
 use crate::seal::Opener;
 use crate::signing::{new_nonce, sign_with};
@@ -487,6 +490,101 @@ impl Client {
     pub async fn delete_hook(&self, id: &str) -> Result<()> {
         check_id("hk_", id)?;
         self.call_empty(Method::DELETE, &format!("/v1/hooks/{id}"))
+            .await
+    }
+
+    /// `GET /v1/hooks/<id>/screen` (PROTOCOL §4b): the hook's edge screen, or `None`.
+    pub async fn hook_screen(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        check_id("hk_", id)?;
+        #[derive(serde::Deserialize)]
+        struct R {
+            screen: Option<serde_json::Value>,
+        }
+        let r: R = self
+            .call(
+                Method::GET,
+                &format!("/v1/hooks/{id}/screen"),
+                None,
+                Auth::Signed,
+            )
+            .await?;
+        Ok(r.screen)
+    }
+
+    /// `PUT /v1/hooks/<id>/screen`: replace the hook's edge screen (`None` removes it). Returns it as
+    /// the relay keeps it.
+    pub async fn put_hook_screen(
+        &self,
+        id: &str,
+        screen: Option<&serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>> {
+        check_id("hk_", id)?;
+        #[derive(serde::Deserialize)]
+        struct R {
+            screen: Option<serde_json::Value>,
+        }
+        let r: R = self
+            .call(
+                Method::PUT,
+                &format!("/v1/hooks/{id}/screen"),
+                Some(json!({ "screen": screen })),
+                Auth::Signed,
+            )
+            .await?;
+        Ok(r.screen)
+    }
+
+    /// `GET /v1/screen/key`: the account's screen key, which field values are hashed with before
+    /// they go to the edge.
+    pub async fn screen_key(&self) -> Result<Vec<u8>> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            key: String,
+        }
+        let r: R = self
+            .call(Method::GET, "/v1/screen/key", None, Auth::Signed)
+            .await?;
+        URL_SAFE_NO_PAD
+            .decode(r.key.as_bytes())
+            .ok()
+            .filter(|k| k.len() == 32)
+            .ok_or_else(|| Error::Invalid("the relay's screen key isn't 32 bytes".into()))
+    }
+
+    /// `GET /v1/held`: the events the relay's screen holds.
+    pub async fn held(&self) -> Result<Vec<HeldEvent>> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            held: Vec<HeldEvent>,
+        }
+        let r: R = self
+            .call(Method::GET, "/v1/held", None, Auth::Signed)
+            .await?;
+        Ok(r.held)
+    }
+
+    /// `POST /v1/held/<id>/release`: the event is streamed now. Returns its seq.
+    pub async fn release_held(&self, id: &str) -> Result<u64> {
+        check_id("evt_", id)?;
+        #[derive(serde::Deserialize)]
+        struct R {
+            seq: u64,
+        }
+        let r: R = self
+            .call(
+                Method::POST,
+                &format!("/v1/held/{id}/release"),
+                None,
+                Auth::Signed,
+            )
+            .await?;
+        Ok(r.seq)
+    }
+
+    /// `DELETE /v1/held/<id>`: the event is never streamed.
+    pub async fn drop_held(&self, id: &str) -> Result<()> {
+        check_id("evt_", id)?;
+        self.call_empty(Method::DELETE, &format!("/v1/held/{id}"))
             .await
     }
 

@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 hooks-client = { path = "../hooks-client" }
+hooks-screen = { path = "../hooks-screen" }
 base64 = "0.22"
 dirs = "7"
 getrandom = "0.3"

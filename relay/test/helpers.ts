@@ -5,7 +5,7 @@ import { expect } from "vitest";
 import type { AccountObject } from "../src/account-object.ts";
 import { generateDeviceKey, signRequest, type DeviceKey } from "../src/canonical.ts";
 import { fromBase64, toBase64Url, utf8 } from "../src/encoding.ts";
-import { SUITE, decodeContent, envelopeSigString, openWith, sealAad, sealKid, type SealedContent } from "../src/envelope.ts";
+import { SUITE, decodeContent, envelopeSigString, heldAad, openWith, sealAad, sealKid, type SealedContent } from "../src/envelope.ts";
 
 export const BASE = "https://relay.test";
 
@@ -215,6 +215,8 @@ export interface StreamedEvent {
   strict: boolean;
   preset: string;
   eventType: string | null;
+  /** Released from the screen's hold (PROTOCOL §4b). */
+  held?: boolean;
   sealed: { kid: string; enc: string; ct: string };
   sig: string;
 }
@@ -229,7 +231,8 @@ export async function openEvent(dev: TestDevice, ev: StreamedEvent): Promise<Sea
   const toSign = await envelopeSigString({ ...ev, deviceId: dev.deviceId }, { kid: ev.sealed.kid, enc: ev.sealed.enc, ct });
   const key = await crypto.subtle.importKey("raw", fromBase64(RELAY_PUBLIC_KEY)!, { name: "Ed25519" }, false, ["verify"]);
   if (!(await crypto.subtle.verify("Ed25519", key, fromBase64(ev.sig)!, utf8(toSign)))) throw new Error("bad relay signature");
-  const pt = await openWith(dev.seal!.privateKey, fromBase64(ev.sealed.enc)!, ct, sealAad(ev.hookId, ev.seq, ev.id));
+  const aad = ev.held ? heldAad(ev.hookId, ev.id) : sealAad(ev.hookId, ev.seq, ev.id);
+  const pt = await openWith(dev.seal!.privateKey, fromBase64(ev.sealed.enc)!, ct, aad);
   const content = decodeContent(pt);
   return { ...content, text: new TextDecoder().decode(content.body) };
 }

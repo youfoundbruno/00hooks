@@ -136,6 +136,8 @@ pub struct SealedContent {
     pub url: Option<String>,
     /// The relay answered this delivery with the hook's offline notice (PROTOCOL §4a).
     pub notice: bool,
+    /// Where it came from, as the edge saw it (PROTOCOL §4b).
+    pub origin: Option<crate::types::Origin>,
     pub body: Vec<u8>,
 }
 
@@ -148,6 +150,8 @@ struct ContentMeta {
     url: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     notice: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<crate::types::Origin>,
 }
 
 /// The plaintext: the JSON of everything but the body, `\n`, then the body's raw bytes.
@@ -157,6 +161,7 @@ pub fn encode_content(c: &SealedContent) -> Vec<u8> {
         content_type: c.content_type.clone(),
         url: c.url.clone(),
         notice: c.notice,
+        origin: c.origin.clone().filter(|o| !o.is_empty()),
     };
     let mut out = serde_json::to_vec(&meta).expect("json");
     out.push(b'\n');
@@ -176,6 +181,7 @@ pub fn decode_content(pt: &[u8]) -> std::result::Result<SealedContent, String> {
         content_type: meta.content_type,
         url: meta.url,
         notice: meta.notice,
+        origin: meta.origin,
         body: pt[nl + 1..].to_vec(),
     })
 }
@@ -190,7 +196,7 @@ pub fn envelope_sig_string(device_id: &str, e: &Event, kid: &str, enc: &str, ct:
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    [
+    let mut lines = vec![
         ENVELOPE_SIG_VERSION.to_string(),
         device_id.to_string(),
         e.seq.to_string(),
@@ -204,8 +210,27 @@ pub fn envelope_sig_string(device_id: &str, e: &Event, kid: &str, enc: &str, ct:
         kid.to_string(),
         enc.to_string(),
         ct_hash,
-    ]
-    .join("\n")
+    ];
+    // A released event (PROTOCOL §4b) says so, signed.
+    if e.held {
+        lines.push("held".into());
+    }
+    lines.join("\n")
+}
+
+/// The associated data of an event the relay's screen held (PROTOCOL §4b): `held` stands where the
+/// seq would be, since it had none when it was sealed.
+pub fn held_aad(hook_id: &str, id: &str) -> Vec<u8> {
+    format!("00hooks-seal-v1\n{hook_id}\nheld\n{id}").into_bytes()
+}
+
+/// The associated data an event was sealed with: held, or at its seq.
+pub fn event_aad(e: &Event) -> Vec<u8> {
+    if e.held {
+        held_aad(&e.hook_id, &e.id)
+    } else {
+        seal_aad(&e.hook_id, e.seq, &e.id)
+    }
 }
 
 /// A strict hook's verification, as this device keeps it (in the key store, beside the device keys).
@@ -359,7 +384,7 @@ impl Opener {
             &enc,
             SEAL_INFO,
             &ct,
-            &seal_aad(&e.hook_id, e.seq, &e.id),
+            &event_aad(&e),
         )
         .map_err(|_| "the envelope doesn't open with this device's key")?;
         let content = decode_content(&pt)?;
@@ -369,6 +394,8 @@ impl Opener {
         e.headers = content.headers;
         e.content_type = content.content_type;
         e.notice = content.notice;
+        // Only the sealed content says where it came from.
+        e.origin = content.origin;
         e.body = STANDARD.encode(&content.body);
         Ok(e)
     }
@@ -430,7 +457,7 @@ pub fn seal_event(
         &pk,
         SEAL_INFO,
         &encode_content(content),
-        &seal_aad(&meta.hook_id, meta.seq, &meta.id),
+        &event_aad(meta),
     )
     .map_err(|e| Error::Invalid(format!("sealing failed: {e:?}")))?;
     let kid = seal_kid(recipient);
@@ -592,6 +619,56 @@ mod tests {
     }
 
     #[test]
+    fn a_released_event_opens_with_the_held_aad_and_its_held_flag_is_signed() {
+        let relay = SigningKey::from_bytes(&[5; 32]);
+        let key = SealKey::generate().unwrap();
+        let mut opener = Opener::new(
+            "dev_1",
+            Some(&URL_SAFE_NO_PAD.encode(relay.verifying_key().as_bytes())),
+        )
+        .unwrap();
+        let pk = key.public_bytes();
+        opener.add_key(key);
+        let meta = Event {
+            seq: 9,
+            id: "evt_h".into(),
+            hook_id: "hk_h".into(),
+            received_at: 1,
+            verified: true,
+            preset: "github".into(),
+            held: true,
+            ..Event::default()
+        };
+        let content = SealedContent {
+            body: b"{\"a\":1}".to_vec(),
+            origin: Some(crate::types::Origin {
+                ip: Some("203.0.113.4".into()),
+                asn: Some(64500),
+                country: Some("PT".into()),
+            }),
+            ..SealedContent::default()
+        };
+        let sealed = seal_event(&relay, "dev_1", &pk, &meta, &content).unwrap();
+        let opened = opener.open(sealed.clone()).unwrap();
+        assert!(opened.held);
+        assert_eq!(opened.origin.unwrap().asn, Some(64500));
+        // Claiming it wasn't held breaks the relay's signature; so does claiming an ordinary one was.
+        let mut unflagged = sealed.clone();
+        unflagged.held = false;
+        assert!(opener.open(unflagged).unwrap_err().contains("signature"));
+        // The origin comes from the sealed content only, never the clear metadata.
+        let mut plain_meta = meta.clone();
+        plain_meta.held = false;
+        let mut claimed =
+            seal_event(&relay, "dev_1", &pk, &plain_meta, &SealedContent::default()).unwrap();
+        claimed.origin = Some(crate::types::Origin {
+            ip: Some("1.2.3.4".into()),
+            ..Default::default()
+        });
+        assert_eq!(opener.open(claimed).unwrap().origin, None);
+    }
+
+    #[test]
     fn the_offline_notice_flag_is_read_from_the_sealed_content_only() {
         let relay = SigningKey::from_bytes(&[4; 32]);
         let key = SealKey::generate().unwrap();
@@ -614,6 +691,7 @@ mod tests {
         let mut content = SealedContent {
             content_type: Some("application/x-www-form-urlencoded".into()),
             notice: true,
+            origin: None,
             body: b"From=%2B15005550001&Body=hi".to_vec(),
             ..SealedContent::default()
         };
@@ -675,6 +753,7 @@ mod tests {
             content_type: Some("application/json".into()),
             url: Some("https://relay.example/h/hk_x".into()),
             notice: false,
+            origin: None,
             body: body.to_vec(),
         };
         let opened = opener

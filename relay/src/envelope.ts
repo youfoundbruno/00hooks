@@ -41,7 +41,16 @@ export interface SealedContent {
   url?: string;
   /** The relay answered this delivery with the hook's offline notice (PROTOCOL §4a). */
   notice?: true;
+  /** Where the delivery came from, as Cloudflare saw it (PROTOCOL §4b): for the device's screen. */
+  origin?: Origin;
   body: Uint8Array;
+}
+
+/** The sender's address, network and country, as the edge saw them. */
+export interface Origin {
+  ip?: string;
+  asn?: number;
+  country?: string;
 }
 
 /** The metadata the relay signs with each envelope (the event's plaintext fields). */
@@ -55,6 +64,11 @@ export interface EnvelopeMeta {
   strict: boolean;
   preset: string;
   eventType: string | null;
+  /**
+   * Held by the screen and released later (PROTOCOL §4b): sealed before it had a seq, with the
+   * held associated data, and signed with a last line `held`.
+   */
+  held?: boolean;
 }
 
 /** A device sealing key's id: the first 16 bytes of SHA-256("00hooks-seal-kid-v1\n" ‖ key), base64url. */
@@ -79,6 +93,15 @@ export function sealAad(hookId: string, seq: number, id: string): Uint8Array<Arr
 }
 
 /**
+ * The associated data of an event the screen held (PROTOCOL §4b): sealed before it had a place in
+ * the log, so `held` stands where the seq would be. The relay's signature binds the seq it gets on
+ * release.
+ */
+export function heldAad(hookId: string, id: string): Uint8Array<ArrayBuffer> {
+  return utf8(`00hooks-seal-v1\n${hookId}\nheld\n${id}`);
+}
+
+/**
  * The sealed plaintext: the JSON of everything but the body, a newline, then the body's raw bytes.
  * JSON never holds a raw newline, so the first one is the boundary.
  */
@@ -86,6 +109,7 @@ export function encodeContent(c: SealedContent): Uint8Array<ArrayBuffer> {
   const meta: Record<string, unknown> = { headers: c.headers, contentType: c.contentType };
   if (c.url !== undefined) meta.url = c.url;
   if (c.notice) meta.notice = true;
+  if (c.origin && Object.keys(c.origin).length > 0) meta.origin = c.origin;
   return concatBytes(utf8(JSON.stringify(meta)), utf8("\n"), c.body);
 }
 
@@ -97,12 +121,14 @@ export function decodeContent(pt: Uint8Array): SealedContent {
     contentType: string | null;
     url?: string;
     notice?: boolean;
+    origin?: Origin;
   };
   return {
     headers: meta.headers,
     contentType: meta.contentType,
     ...(meta.url !== undefined ? { url: meta.url } : {}),
     ...(meta.notice === true ? { notice: true as const } : {}),
+    ...(meta.origin ? { origin: meta.origin } : {}),
     body: pt.slice(nl + 1),
   };
 }
@@ -129,7 +155,7 @@ export async function openWith(privateKey: Uint8Array, enc: Uint8Array, ct: Uint
  * base64url of its UTF-8 (`-` for none), so no value can contain the separator.
  */
 export async function envelopeSigString(meta: EnvelopeMeta, sealed: { kid: string; enc: string; ct: Uint8Array }): Promise<string> {
-  return [
+  const lines = [
     ENVELOPE_SIG_VERSION,
     meta.deviceId,
     String(meta.seq),
@@ -143,7 +169,10 @@ export async function envelopeSigString(meta: EnvelopeMeta, sealed: { kid: strin
     sealed.kid,
     sealed.enc,
     await sha256Hex(sealed.ct as Uint8Array<ArrayBuffer>),
-  ].join("\n");
+  ];
+  // A released event (PROTOCOL §4b) says so, signed: its client opens it with the held associated data.
+  if (meta.held) lines.push("held");
+  return lines.join("\n");
 }
 
 const PKCS8_ED25519_PREFIX = new Uint8Array([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20]);
@@ -191,6 +220,28 @@ export async function sealEnvelope(
   return { deviceId: device.deviceId, kid: device.kid, enc: encB64, ct, sig: toBase64Url(sig) };
 }
 
+/** Seals a held event to one device (no signature yet: it has no seq until it is released). */
+export async function sealHeld(
+  device: { deviceId: string; kid: string; publicKey: Uint8Array },
+  hookId: string,
+  id: string,
+  plaintext: Uint8Array,
+): Promise<Omit<SealedEnvelope, "sig">> {
+  const { enc, ct } = await sealTo(device.publicKey, plaintext, heldAad(hookId, id));
+  return { deviceId: device.deviceId, kid: device.kid, enc: toBase64Url(enc), ct };
+}
+
+/** Signs a released event's envelope for its device, now that it has a seq. */
+export async function signEnvelope(
+  relay: RelayKey,
+  deviceId: string,
+  meta: Omit<EnvelopeMeta, "deviceId">,
+  sealed: { kid: string; enc: string; ct: Uint8Array },
+): Promise<string> {
+  const toSign = await envelopeSigString({ ...meta, deviceId }, sealed);
+  return toBase64Url(new Uint8Array(await crypto.subtle.sign("Ed25519", relay.privateKey, utf8(toSign))));
+}
+
 /** The event message of PROTOCOL §5 for one device's envelope. */
 export function eventMessage(meta: Omit<EnvelopeMeta, "deviceId">, env: { kid: string; enc: string; ct: Uint8Array; sig: string }): string {
   return JSON.stringify({
@@ -202,6 +253,7 @@ export function eventMessage(meta: Omit<EnvelopeMeta, "deviceId">, env: { kid: s
     strict: meta.strict,
     preset: meta.preset,
     eventType: meta.eventType,
+    ...(meta.held ? { held: true } : {}),
     sealed: { kid: env.kid, enc: env.enc, ct: toBase64(env.ct) } satisfies Sealed,
     sig: env.sig,
   });

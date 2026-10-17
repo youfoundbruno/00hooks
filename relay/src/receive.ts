@@ -2,10 +2,12 @@
 // dedupe and append in the account's Durable Object.
 
 import { accountStub } from "./auth.ts";
-import { isId } from "./encoding.ts";
+import { isId, newId } from "./encoding.ts";
 import { error, json, notFound, readLimited, tooLarge, unavailable } from "./http.ts";
 import { constantTimeEqualStrings } from "./encoding.ts";
-import { currentSecrets, offlineNoticeOf, verifyTokenHash, type HookRow } from "./hooks.ts";
+import { currentSecrets, offlineNoticeOf, screenOf, verifyTokenHash, type HookRow } from "./hooks.ts";
+import { decide, screenKey } from "./screen.ts";
+import type { Origin } from "./envelope.ts";
 import { clientKey } from "./ip.ts";
 import { pepperedHash } from "./seal.ts";
 import {
@@ -68,11 +70,37 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   if (handshake) return handshake;
 
   const strict = config.strict === true;
+  const origin = originOf(request);
+
+  // The screen (PROTOCOL §4b), after the signature (a forgery keeps its 401) and before anything is
+  // stored. A drop is answered as a delivery would be, with an id that names nothing, so a sender
+  // can't tell; a hold is stored aside and not streamed until a device releases it.
+  const screen = screenOf(hook);
+  let held: string | undefined;
+  if (screen && screen.rules.length > 0) {
+    const verdict = await decide(screen, {
+      ip: origin.ip ?? null,
+      asn: origin.asn ?? null,
+      country: origin.country ?? null,
+      headers: request.headers,
+      body,
+      contentType: request.headers.get("content-type"),
+      strict,
+      key: await screenKey(env.HASH_PEPPER, hook.account_id),
+    });
+    if (verdict?.verdict === "drop") {
+      ctx.waitUntil(stub.countAudit("screen.dropped", hookId, hook.name).catch(() => {}));
+      const nobody = newId("evt");
+      return providerAnswer(config, null, { received: nobody }) ?? json({ received: nobody });
+    }
+    if (verdict?.verdict === "quarantine") held = verdict.rule;
+  }
+
   // The offline notice (PROTOCOL §4a): only for a delivery the relay verified itself, from a sender
   // it can name; the DO decides (no device connected for long enough, and not yet today for this
   // sender) in the same transaction as the append. The sender is kept only as a keyed hash.
   const offline = offlineNoticeOf(hook);
-  const sender = offline && verdict.verified && !strict ? noticeSender(config, body, request.headers) : null;
+  const sender = offline && verdict.verified && !strict && held === undefined ? noticeSender(config, body, request.headers) : null;
   const notice =
     offline && sender
       ? { mark: await pepperedHash(env.HASH_PEPPER, `notice:${hookId}:${sender}`), afterMs: offline.afterMinutes * 60_000 }
@@ -92,10 +120,12 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
       // A strict hook seals the signature headers and the URL too: its devices verify.
       headers: strict ? strictHeaders(config, request.headers) : keptHeaders(config, request.headers),
       ...(strict ? { url } : {}),
+      origin,
     },
     body,
     receivedAt: now,
     ...(notice ? { notice } : {}),
+    ...(held !== undefined ? { held } : {}),
   });
   if (result.duplicate) return providerAnswer(config, null, { duplicate: true }) ?? json({ duplicate: true });
   if (result.full) {
@@ -108,11 +138,26 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
     );
   }
   ctx.waitUntil(env.DB.prepare("UPDATE hooks SET last_event_at = ? WHERE id = ?").bind(now, hookId).run());
+  if (result.held) ctx.waitUntil(stub.countAudit("screen.held", hookId, hook.name).catch(() => {}));
   // GitHub's `ping` (sent when a webhook is created) is stored like any event, so a new hook can be
   // seen working end to end, and answered 200 like any delivery. A provider that takes its answer
   // in the response (Twilio's TwiML) gets one, with the notice when it was due.
   const said = result.notice && offline ? offline.text : null;
   return providerAnswer(config, said, { received: result.id }) ?? json({ received: result.id });
+}
+
+/**
+ * Where a delivery came from, as Cloudflare saw it: the client's address, its network (ASN) and its
+ * country. Sealed with the content, so the devices' screen can use it too.
+ */
+export function originOf(request: Request): Origin {
+  const cf = (request as Request & { cf?: { asn?: unknown; country?: unknown } }).cf;
+  const ip = request.headers.get("CF-Connecting-IP")?.trim();
+  const out: Origin = {};
+  if (ip && ip.length <= 64) out.ip = ip;
+  if (typeof cf?.asn === "number" && Number.isInteger(cf.asn)) out.asn = cf.asn;
+  if (typeof cf?.country === "string" && /^[A-Z]{2}$/.test(cf.country)) out.country = cf.country;
+  return out;
 }
 
 /**

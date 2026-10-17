@@ -45,6 +45,8 @@ use std::fmt;
 pub use ask::{AskReply, AskRequest, Asker};
 pub use catalogue::{Catalogue, KindRecord};
 pub use config::{Automations, Problem};
+/// The screen (PLAN §6a), for hosts that share one across their sources.
+pub use hooks_screen;
 pub use runner::{Runner, RunnerOptions};
 pub use runs::{RunLog, RunRecord};
 

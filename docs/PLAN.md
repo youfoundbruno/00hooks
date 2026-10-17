@@ -11,7 +11,8 @@ It's a standalone open-source project (Apache-2.0). 00next bundles it as its **A
 and anyone can use the CLI on its own or run their own relay.
 
 Status: phases 0 and 1 are built (the relay, the CLI's `login`/`devices`/`hooks`/`keys`/`audit`/
-`listen`, presets, sealing, API keys and the audit); the rest is planned. Sections marked
+`listen`, presets, sealing, API keys and the audit); so is the screen of phase 5 (§6a, "Built"),
+in the relay, the `hooks-screen` crate, the runner, the CLI and 00next; the rest is planned. Sections marked
 *(suggestion)* go beyond the original brief and are open for a decision.
 
 ---
@@ -488,6 +489,45 @@ thresholds, fallback, daily cap) and a **Quarantine** list shared by all of them
 Always and a preview of the item as untrusted text. The screen runs before the access profile's
 responder is ever woken, so a dropped message costs no agent turn.
 
+### Built (phase 5)
+
+- **Edge** (`relay/src/screen.ts`, `held.ts`; PROTOCOL §4b; tests in `relay/test/screen.test.ts`
+  under Miniflare). Per-hook rules a device pushes (`PUT /v1/hooks/<id>/screen`): address and CIDR
+  lists (`not` makes an allow list; a provider's published ranges go as a list labelled with
+  `preset`, the relay fetches none), ASN and country from `request.cf`, header conditions, size;
+  fingerprints (shape hash and MinHash); field rules `is`, `domain is` and `one of` as keyed hashes
+  under the account's screen key; `contains`, `pattern` (a safe subset for a backtracking engine)
+  and `similar text` only with `consent.words`. Drop answers `200` with an id that names nothing;
+  quarantine seals the event with held associated data and keeps it aside until a device releases
+  it (`/v1/held`), then it is signed for its new seq with a `held` line and streamed; forged
+  signatures keep `401`; decisions keep only the rule's id and hourly counts. The origin the edge saw
+  travels sealed, for the devices' own screen. `/v1/info` announces `screen` and the operator's
+  `extras` (`HOSTED_EXTRAS`), as data.
+- **Harness** (`cli/hooks-screen`): the same rules plus learned rules (*Always … similar*, *Block on
+  fields…*, *Off*, 90-day expiry unless matched), MinHash over word 5-grams with a configurable
+  Jaccard threshold (0.8 by default), per-field MinHash for *similar text*, field rules of every kind
+  joined by and/or, each saying pass, quarantine or drop; the quarantine list (Release once, Drop,
+  Always, fields for the picker; content cleared once decided); the evaluator behind a `Decider`
+  trait: an OpenRouter-style Decisions endpoint (`state` plus `noul`, `choice` and `score`
+  questions, URL configurable), any chat model through structured output, or a local model on
+  loopback; thresholds configurable; verdicts cached by fingerprint; no tools; zero retention and no
+  training asked for, and a decider that can't promise it refused for a sensitive source; a daily cap
+  and cost per source; it fails closed to the source's fallback (quarantine for an agent, pass for a
+  notification). `fixtures/screen.v1.json` holds both halves to the same words, shapes, signatures,
+  domains and keyed hashes.
+- **Runner and CLI**: the runner screens every live event before any automation (not replays,
+  releases, or events released at the relay); a held event's run is `held`, a dropped one's
+  `dropped`, and `Runner::release` runs a held one once. `00hooks screen status|on|off|held|release|
+  drop [--always]|rules|sync`.
+- **00next**: see its `docs/messaging.md` and `docs/access.md` (the screen before any responder or
+  conversation agent, one Quarantine list in the Inbox, Settings › Screen).
+- **Not built**: time windows in rules; per-hook or per-channel rates beyond the relay's limits;
+  TLS fingerprints; a hosted relay's reputation lists, fingerprint sync across devices and evaluator
+  credits (announced as `extras` when a relay offers them, not implemented here). Known differences
+  between the halves: the edge's `pattern` is JavaScript's syntax over 2,048 characters, the
+  harness's is Rust's over 64 KiB; a JSON number written `1.0` reads `1.0` in the harness and `1` at
+  the edge.
+
 ## 7. Phases
 
 | # | Phase | Exit test |
@@ -497,7 +537,7 @@ responder is ever woken, so a dropped message costs no agent turn.
 | 2 | CLI `run` with plain actions, run records, retries, rate limits, service install | a Stripe test event sends a notification and appends a line to a file, at most once |
 | 3 | 00next: hooks-client in the node, Access profiles + egress broker, Automations screen, agent actions | a GitHub PR event wakes a responder agent that can reach only api.github.com and comments with an approved token, and the supervisor never ran |
 | 4 | messaging and routines use access profiles; templates; email-in hooks *(suggestion)* | an inbound Telegram message is answered by a Replier-profile agent that cannot reach any other site |
-| 5 | the screen: rules and similarity at the edge and in the harness, quarantine with Release/Drop/Always, the Decisions-API evaluator, local-model option, entitlements for hosted extras | a flood of near-identical junk is dropped at the edge after one Drop + Always; a prompt-injection message is quarantined before any agent runs; the evaluator failing quarantines instead of passing |
+| 5 ✓ | the screen: rules and similarity at the edge and in the harness, quarantine with Release/Drop/Always, the Decisions-API evaluator, local-model option, entitlements for hosted extras | a flood of near-identical junk is dropped at the edge after one Drop + Always; a prompt-injection message is quarantined before any agent runs; the evaluator failing quarantines instead of passing |
 
 ## 8. Decisions to make
 

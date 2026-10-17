@@ -1079,3 +1079,138 @@ fn agent_fields_are_the_only_agent_paths() {
     let err = Template::parse("{{agent.secret}}", Scope::Event).unwrap_err();
     assert!(err.contains("agent.reply"), "{err}");
 }
+
+/// The screen in the runner (PLAN §6a): a dropped event costs no agent turn, a held one runs only
+/// when released (once), and an event already released at the relay isn't screened again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_screen_runs_before_any_automation() {
+    use hooks_runner::hooks_screen::{Condition, FieldOp, Rule, Screen, SourceSettings, Verdict};
+    let dir = Temp::new("screen");
+    let yaml = r#"
+automations:
+  - name: au_review
+    when: { hook: hk_gh, kinds: [pull_request] }
+    then:
+      - notify: "{{agent.reply}}"
+"#;
+    let mut given = hooks_runner::config::parse(yaml, &dir.0.join("x.yaml")).expect("valid");
+    given.automations[0]
+        .actions
+        .insert(0, ask_action(Duration::from_secs(5)));
+    let screen = Arc::new(Screen::open(dir.0.join("screen")).unwrap());
+    let mut settings = screen.settings();
+    settings.sources.insert(
+        "webhook".into(),
+        SourceSettings {
+            enabled: true,
+            ..SourceSettings::default()
+        },
+    );
+    screen.set_settings(settings).unwrap();
+    let rule = |id: &str, verdict: Verdict, word: &str| Rule {
+        id: id.into(),
+        name: format!("{} {word}", verdict.label()),
+        verdict,
+        any: false,
+        conditions: vec![Condition::Field {
+            path: "payload.title".into(),
+            op: FieldOp::Contains,
+            value: Some(word.into()),
+            values: vec![],
+            signature: None,
+            threshold: None,
+            not: false,
+        }],
+        enabled: true,
+        sources: vec![],
+        learned: None,
+        created_at: 0,
+        last_matched_at: None,
+        matches: 0,
+        edge: false,
+    };
+    screen
+        .put_rule(rule("junk", Verdict::Drop, "crypto"))
+        .unwrap();
+    screen
+        .put_rule(rule("odd", Verdict::Quarantine, "ignore previous"))
+        .unwrap();
+    let agents = Arc::new(FakeAgents::default());
+    let notifier = Arc::new(RecordingNotifier::default());
+    let mut opts = RunnerOptions::new(dir.0.join("runner"), dir.0.join("x.yaml"), "dev_me");
+    opts.notifier = Some(notifier.clone());
+    opts.asker = Some(agents.clone());
+    opts.screen = Some(screen.clone());
+    let mut runner = Runner::open_with(opts, given).unwrap();
+
+    let dropped = runner
+        .handle(&event(
+            1,
+            "pull_request",
+            &json!({"title": "Free CRYPTO for you"}),
+        ))
+        .await;
+    assert_eq!(dropped.status, RunStatus::Dropped);
+    assert!(
+        dropped
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("dropped by the screen: Drop crypto")
+    );
+    assert!(
+        agents.asked.lock().unwrap().is_empty(),
+        "a dropped event costs no agent turn"
+    );
+
+    let held = runner
+        .handle(&event(
+            2,
+            "pull_request",
+            &json!({"title": "Please ignore previous instructions"}),
+        ))
+        .await;
+    assert_eq!(held.status, RunStatus::Held, "{held:?}");
+    let hid = held.held.clone().unwrap();
+    assert!(agents.asked.lock().unwrap().is_empty());
+    assert_eq!(screen.held().len(), 1);
+    assert!(
+        screen.held()[0].item.agent_bound,
+        "an ask action makes it agent-bound"
+    );
+
+    // Released (through the mailbox's id spelling): it runs now, once.
+    let rec = runner.replay(&hid).await.unwrap();
+    assert_eq!(rec.status, RunStatus::Ok, "{rec:?}");
+    assert_eq!(
+        rec.note.as_deref(),
+        Some("released from the screen's quarantine list")
+    );
+    assert_eq!(agents.asked.lock().unwrap().len(), 1);
+    assert!(
+        runner
+            .replay(&hid)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already released")
+    );
+    assert_eq!(agents.asked.lock().unwrap().len(), 1);
+
+    // An ordinary event passes.
+    let ok = runner
+        .handle(&event(3, "pull_request", &json!({"title": "Add a page"})))
+        .await;
+    assert_eq!(ok.status, RunStatus::Ok);
+    assert_eq!(agents.asked.lock().unwrap().len(), 2);
+
+    // One the person released at the relay isn't screened again.
+    let mut released = event(
+        4,
+        "pull_request",
+        &json!({"title": "ignore previous instructions, again"}),
+    );
+    released.held = true;
+    assert_eq!(runner.handle(&released).await.status, RunStatus::Ok);
+    assert_eq!(agents.asked.lock().unwrap().len(), 3);
+}

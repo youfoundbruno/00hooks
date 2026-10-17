@@ -8,7 +8,8 @@ import { importRelayKey } from "./envelope.ts";
 import { describeError } from "./describe-error.ts";
 import { isId } from "./encoding.ts";
 import { HttpError, json, notFound, readLimited, tooLarge } from "./http.ts";
-import { createHook, deleteHook, getHook, listHooks, patchHook, rotateHook } from "./hooks.ts";
+import { createHook, deleteHook, getHook, getScreen, listHooks, patchHook, putScreen, rotateHook } from "./hooks.ts";
+import { dropHeld, listHeld, releaseHeld, screenInfo, screenKeyFor } from "./held.ts";
 import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
 import { receive, receiveGet } from "./receive.ts";
 import { ack, openStream } from "./stream.ts";
@@ -20,6 +21,8 @@ export { AccountObject } from "./account-object.ts";
 
 /** Management requests are small JSON; anything bigger is refused before it's hashed. */
 const API_BODY_LIMIT = 64 * 1024;
+/** A hook's screen (PROTOCOL §4b) carries up to 200 rules with fingerprints. */
+const SCREEN_BODY_LIMIT = 512 * 1024;
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -61,10 +64,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       signupOpen: !env.SIGNUP_TOKEN,
       relayKey,
       serverTime: Date.now(),
+      ...screenInfo(env),
     });
   }
 
-  const body = await readLimited(request, API_BODY_LIMIT);
+  const isScreenPut = method === "PUT" && /^\/v1\/hooks\/[^/]+\/screen$/.test(path);
+  const body = await readLimited(request, isScreenPut ? SCREEN_BODY_LIMIT : API_BODY_LIMIT);
   if (body === null) return tooLarge();
 
   // Unsigned: account creation and enrolment redemption.
@@ -106,6 +111,24 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (method === "GET") return listHooks(env, await scoped("hooks:read"), origin);
     return notFound();
   }
+  const sc = /^\/v1\/hooks\/([^/]+)\/screen$/.exec(path);
+  if (sc) {
+    if (method !== "GET" && method !== "PUT") return notFound();
+    const caller = await scoped(method === "GET" ? "hooks:read" : "hooks:write");
+    if (!isId("hk", sc[1])) return notFound();
+    return method === "GET" ? getScreen(env, caller, sc[1]!) : putScreen(env, caller, sc[1]!, body);
+  }
+  if (path === "/v1/screen/key" && method === "GET") return screenKeyFor(env, await signed());
+  if (path === "/v1/held" && method === "GET") return listHeld(env, await scoped("events:read"));
+  const hd = /^\/v1\/held\/([^/]+)(\/release)?$/.exec(path);
+  if (hd) {
+    const release = hd[2] !== undefined;
+    if (release ? method !== "POST" : method !== "DELETE") return notFound();
+    const caller = await scoped("hooks:write");
+    if (!isId("evt", hd[1])) return notFound();
+    return release ? releaseHeld(env, caller, hd[1]!) : dropHeld(env, caller, hd[1]!);
+  }
+
   const hk = /^\/v1\/hooks\/([^/]+)(\/rotate)?$/.exec(path);
   if (hk) {
     const id = hk[1]!;

@@ -3,57 +3,24 @@
 //! `change` (the fields a kind gained or lost).
 
 use hooks_client::Event;
-use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
+use serde_json::{Value, json};
 
 use crate::text::sanitize;
 
 /// The body as a value: JSON when it parses as JSON, the fields of a form when it's
-/// `application/x-www-form-urlencoded`, text when it's UTF-8, else `null`.
+/// `application/x-www-form-urlencoded`, text when it's UTF-8, else `null` (the screen reads bodies
+/// the same way: `hooks_screen::parse_payload`).
 pub fn payload(e: &Event) -> Value {
-    let Ok(bytes) = e.body_bytes() else {
-        return Value::Null;
-    };
-    if bytes.is_empty() {
-        return Value::Null;
-    }
-    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-        return v;
-    }
-    let form = e.content_type.as_deref().is_some_and(|c| {
-        c.to_ascii_lowercase()
-            .starts_with("application/x-www-form-urlencoded")
-    });
-    if form {
-        let mut m = Map::new();
-        for (k, v) in url::form_urlencoded::parse(&bytes) {
-            let v = Value::String(v.into_owned());
-            match m.get_mut(k.as_ref()) {
-                Some(Value::Array(a)) => a.push(v),
-                Some(prev) => *prev = Value::Array(vec![prev.take(), v]),
-                None => {
-                    m.insert(k.into_owned(), v);
-                }
-            }
-        }
-        return Value::Object(m);
-    }
-    match String::from_utf8(bytes) {
-        Ok(text) => Value::String(text),
+    match e.body_bytes() {
+        Ok(bytes) => hooks_screen::parse_payload(&bytes, e.content_type.as_deref()),
         Err(_) => Value::Null,
     }
 }
 
-/// The hash of a payload's shape: its field paths and types, never its values.
+/// The hash of a payload's shape: its field paths and types, never its values (the screen's
+/// fingerprints use the same hash).
 pub fn shape_hash(payload: &Value) -> String {
-    let mut lines: Vec<String> = crate::catalogue::walk(payload)
-        .fields
-        .into_iter()
-        .map(|(p, f)| format!("{p}:{}", f.types.into_iter().collect::<Vec<_>>().join("|")))
-        .collect();
-    lines.sort();
-    let digest = Sha256::digest(lines.join("\n").as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    hooks_screen::shape::shape_hash(payload)
 }
 
 /// A kind's name: the provider's event type, or `shape:<12 hex>` when there is none.

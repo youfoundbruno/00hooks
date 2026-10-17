@@ -117,6 +117,7 @@ fn status_word(s: RunStatus) -> &'static str {
         RunStatus::Failed => "failed",
         RunStatus::Dropped => "dropped",
         RunStatus::Interrupted => "interrupted",
+        RunStatus::Held => "held",
     }
 }
 
@@ -155,7 +156,8 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
     let _lock = mailbox::lock(&rdir)
         .map_err(|e| Failure::new(sentence(&e.to_string())))?
         .ok_or_else(|| Failure::new("Another runner is running for this state folder."))?;
-    let opts = RunnerOptions::new(&rdir, &path, &ctx.config.device_id);
+    let mut opts = RunnerOptions::new(&rdir, &path, &ctx.config.device_id);
+    opts.screen = Some(crate::screen::open(&rdir)?);
     let mut runner = Runner::open(opts).map_err(|e| fail(e, &path))?;
     match ctx.client.hooks().await {
         Ok(hooks) => {
@@ -802,6 +804,7 @@ mod tests {
                     actions: vec![],
                 },
             ],
+            held: None,
         };
         let lines = describe_run(&r);
         assert_eq!(

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["cli/hooks-client", "cli/hooks-runner", "cli/00hooks"]
+members = ["cli/hooks-client", "cli/hooks-screen", "cli/hooks-runner", "cli/00hooks"]
 
 [workspace.package]
 version = "0.1.0"

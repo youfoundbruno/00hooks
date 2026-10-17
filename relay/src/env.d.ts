@@ -12,4 +12,11 @@ interface __BaseEnv_Env {
   RELAY_SIGNING_KEY?: string;
   /** When set, account creation needs `Authorization: Bearer <SIGNUP_TOKEN>`. */
   SIGNUP_TOKEN?: string;
+  /** How many days the screen holds an event before dropping it (PROTOCOL §4b); 7 when unset. */
+  SCREEN_HELD_DAYS?: string;
+  /**
+   * Optional hosted extras this relay offers, as JSON (PROTOCOL §2, `/v1/info` `extras`): a list of
+   * `{ "id", "title", "description"?, "url"? }`. A self-hosted relay leaves it unset.
+   */
+  HOSTED_EXTRAS?: string;
 }

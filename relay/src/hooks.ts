@@ -16,6 +16,7 @@ import {
   type VerifyConfig,
 } from "./presets.ts";
 import { openSecret, pepperedHash, sealSecret } from "./seal.ts";
+import { parseScreen, type EdgeScreen } from "./screen.ts";
 
 export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 /** Phase 0 keeps bodies in the object's SQLite rows (2 MB each at most), so stay under that. */
@@ -39,6 +40,17 @@ export interface HookRow {
   handshake_token_hash: string | null;
   /** The offline notice, as JSON (PROTOCOL §4a), or null. */
   offline_notice: string | null;
+  /** The screen's rules, as JSON (PROTOCOL §4b), or null. */
+  screen?: string | null;
+}
+
+export function screenOf(row: HookRow): EdgeScreen | null {
+  if (!row.screen) return null;
+  try {
+    return JSON.parse(row.screen) as EdgeScreen;
+  } catch {
+    return null;
+  }
 }
 
 /** The keyed hash a hook's verify token is kept as. */
@@ -70,6 +82,7 @@ export function hookJson(row: HookRow, origin: string) {
     createdAt: row.created_at,
     lastEventAt: row.last_event_at,
     offlineNotice: offlineNoticeOf(row),
+    screenRules: screenOf(row)?.rules.length ?? 0,
   };
 }
 
@@ -211,4 +224,25 @@ export async function deleteHook(env: Env, caller: Principal, id: string): Promi
   await env.DB.prepare("DELETE FROM hooks WHERE id = ? AND account_id = ?").bind(id, caller.accountId).run();
   await accountStub(env, caller.accountId).audit({ kind: "hook.deleted", actor: caller.actor, subject: id, name: row.name });
   return new Response(null, { status: 204 });
+}
+
+/** `GET /v1/hooks/<id>/screen`: the hook's screen as the relay holds it (hashes, not values). */
+export async function getScreen(env: Env, caller: Principal, id: string): Promise<Response> {
+  return json({ screen: screenOf(await load(env, caller, id)) });
+}
+
+/**
+ * `PUT /v1/hooks/<id>/screen` `{ "screen": EdgeScreen | null }`: replaces the hook's screen. Rules
+ * that make the relay read words need `consent.words`; the answer is the screen as kept.
+ */
+export async function putScreen(env: Env, caller: Principal, id: string, body: Uint8Array): Promise<Response> {
+  const row = await load(env, caller, id);
+  const input = parseJsonObject(body);
+  if (!("screen" in input)) throw new HttpError(invalid("screen", "Send screen: an object, or null to remove it."));
+  const screen = parseScreen(input.screen);
+  await env.DB.prepare("UPDATE hooks SET screen = ? WHERE id = ?")
+    .bind(screen && screen.rules.length > 0 ? JSON.stringify(screen) : null, id)
+    .run();
+  await accountStub(env, caller.accountId).audit({ kind: "hook.screen", actor: caller.actor, subject: id, name: row.name });
+  return json({ screen: screen && screen.rules.length > 0 ? screen : null });
 }

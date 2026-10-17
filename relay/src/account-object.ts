@@ -17,6 +17,8 @@ import {
   eventMessage,
   importRelayKey,
   sealEnvelope,
+  sealHeld,
+  signEnvelope,
   type RelayKey,
   type SealedContent,
   type SealedEnvelope,
@@ -85,12 +87,35 @@ export interface AppendInput {
    * hash, `afterMs` how long no device stream may have been connected before a notice is due.
    */
   notice?: { mark: string; afterMs: number };
+  /** The screen held it (PROTOCOL §4b): the rule's id. It is kept aside, not streamed, until released. */
+  held?: string;
 }
 
 export type AppendResult =
   | { duplicate: true }
   | { duplicate: false; full: true }
-  | { duplicate: false; full: false; seq: number; id: string; sealedFor: number; notice: boolean };
+  | { duplicate: false; full: false; held: true; id: string; sealedFor: number; notice: false }
+  | { duplicate: false; full: false; held?: false; seq: number; id: string; sealedFor: number; notice: boolean };
+
+/** One event the screen holds (PROTOCOL §4b), as `GET /v1/held` lists it: metadata only. */
+export interface HeldSummary {
+  id: string;
+  hookId: string;
+  receivedAt: number;
+  verified: boolean;
+  strict: boolean;
+  preset: string;
+  eventType: string | null;
+  /** The rule that held it. */
+  rule: string;
+  /** Bytes held for it (its envelopes). */
+  size: number;
+  /** When it is dropped if nobody releases it. */
+  expiresAt: number;
+}
+
+/** Held events wait this many days by default (`SCREEN_HELD_DAYS`). */
+export const DEFAULT_HELD_DAYS = 7;
 
 /** The per-socket state, kept in the WebSocket's attachment so it survives hibernation. */
 interface Attachment {
@@ -112,6 +137,7 @@ interface EventRow extends Record<string, SqlStorageValue> {
   strict: number;
   preset: string;
   event_type: string | null;
+  held: number;
 }
 
 interface EnvelopeRow extends Record<string, SqlStorageValue> {
@@ -133,7 +159,7 @@ export interface AuditEntry {
 }
 
 /** Kinds counted per hour rather than recorded one by one. */
-export type CountedKind = "key.used";
+export type CountedKind = "key.used" | "screen.held" | "screen.dropped";
 
 export interface EventSummary {
   seq: number;
@@ -179,19 +205,22 @@ export class AccountObject extends DurableObject<Env> {
   /** Columns added after phase 0, for objects created before them. */
   private migrate(): void {
     const version = this.sql.exec<{ value: number }>("SELECT value FROM meta WHERE key = 'schema'").toArray()[0]?.value ?? 1;
-    if (version >= 2) return;
-    for (const stmt of [
+    if (version >= 3) return;
+    const steps = [
       "ALTER TABLE events ADD COLUMN strict INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE devices ADD COLUMN seal_key BLOB",
       "ALTER TABLE devices ADD COLUMN seal_kid TEXT",
-    ]) {
+      // Schema 3: events released from the screen's hold (PROTOCOL §4b).
+      "ALTER TABLE events ADD COLUMN held INTEGER NOT NULL DEFAULT 0",
+    ];
+    for (const stmt of steps) {
       try {
         this.sql.exec(stmt);
       } catch {
         // Already there: the table was created with it.
       }
     }
-    this.sql.exec("INSERT INTO meta (key, value) VALUES ('schema', 2) ON CONFLICT(key) DO UPDATE SET value = 2");
+    this.sql.exec("INSERT INTO meta (key, value) VALUES ('schema', 3) ON CONFLICT(key) DO UPDATE SET value = 3");
   }
 
   private signingKey(): Promise<RelayKey | null> {
@@ -364,6 +393,39 @@ export class AccountObject extends DurableObject<Env> {
       const usage = this.usage();
       const quota = this.quota();
       if (usage.events + 1 > quota.events || usage.bytes + estimate > quota.bytes) return { duplicate: false, full: true };
+      if (input.held !== undefined) {
+        const id = newId("evt");
+        const sealed: Omit<SealedEnvelope, "sig">[] = [];
+        for (const d of devices) {
+          sealed.push(await sealHeld({ deviceId: d.id, kid: d.seal_kid, publicKey: new Uint8Array(d.seal_key) }, input.hookId, id, plaintext));
+        }
+        plaintext.fill(0);
+        plaintext = null;
+        let bytes = 2;
+        this.ctx.storage.transactionSync(() => {
+          for (const key of new Set(input.dedupeKeys)) {
+            this.sql.exec("INSERT INTO seen (hook_id, key, at) VALUES (?, ?, ?)", input.hookId, key, input.receivedAt);
+          }
+          this.sql.exec(
+            `INSERT INTO held_events (id, hook_id, received_at, verified, strict, preset, event_type, rule)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            id,
+            input.hookId,
+            input.receivedAt,
+            input.verified ? 1 : 0,
+            input.strict ? 1 : 0,
+            input.preset,
+            input.eventType,
+            input.held!,
+          );
+          for (const e of sealed) {
+            this.sql.exec("INSERT INTO held_envelopes (id, device_id, kid, enc, ct) VALUES (?, ?, ?, ?, ?)", id, e.deviceId, e.kid, e.enc, e.ct);
+            bytes += e.ct.byteLength + ENVELOPE_OVERHEAD;
+          }
+          this.setUsage({ events: usage.events + 1, bytes: usage.bytes + bytes });
+        });
+        return { duplicate: false, full: false, held: true, id, sealedFor: sealed.length, notice: false };
+      }
       // Decided before sealing, so the devices read that the sender was answered.
       const notice = input.notice ? this.noticeDue(input.hookId, input.notice, input.receivedAt) : false;
       if (notice) {
@@ -436,6 +498,147 @@ export class AccountObject extends DurableObject<Env> {
       return { duplicate: false, full: false, seq, id, sealedFor: envelopes.length, notice };
     });
     if (!result.duplicate && !result.full) {
+      if (!result.held) this.deliverLive(result.seq);
+      await this.ensureAlarm();
+    }
+    return result;
+  }
+
+  // ── the screen's hold (PROTOCOL §4b) ───────────────────────────────────────
+
+  private heldMs(): number {
+    const days = Number(this.env.SCREEN_HELD_DAYS);
+    return (Number.isFinite(days) && days > 0 ? days : DEFAULT_HELD_DAYS) * 24 * 3600_000;
+  }
+
+  /** Held events, newest first: metadata, never content. */
+  async listHeld(): Promise<HeldSummary[]> {
+    const ttl = this.heldMs();
+    return this.sql
+      .exec<{
+        id: string;
+        hook_id: string;
+        received_at: number;
+        verified: number;
+        strict: number;
+        preset: string;
+        event_type: string | null;
+        rule: string;
+        size: number | null;
+      }>(
+        `SELECT h.*, (SELECT sum(length(ct)) FROM held_envelopes e WHERE e.id = h.id) AS size
+         FROM held_events h ORDER BY received_at DESC LIMIT 500`,
+      )
+      .toArray()
+      .map((r) => ({
+        id: r.id,
+        hookId: r.hook_id,
+        receivedAt: r.received_at,
+        verified: r.verified === 1,
+        strict: r.strict === 1,
+        preset: r.preset,
+        eventType: r.event_type,
+        rule: r.rule,
+        size: r.size ?? 0,
+        expiresAt: r.received_at + ttl,
+      }));
+  }
+
+  /** Deletes held envelopes matching `where`, keeping the usage counter right. */
+  private deleteHeldEnvelopes(where: string, ...args: SqlStorageValue[]): void {
+    const gone = this.sql
+      .exec<{ n: number; b: number | null }>(`SELECT count(*) AS n, sum(length(ct) + ${ENVELOPE_OVERHEAD}) AS b FROM held_envelopes WHERE ${where}`, ...args)
+      .one();
+    if (gone.n === 0) return;
+    const u = this.usage();
+    this.sql.exec(`DELETE FROM held_envelopes WHERE ${where}`, ...args);
+    this.setUsage({ events: u.events, bytes: u.bytes - (gone.b ?? 0) });
+  }
+
+  /** Forgets one held event: dropped by a person, or past its wait. */
+  private forgetHeld(id: string): boolean {
+    const n = this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM held_events WHERE id = ?", id).one().n;
+    if (n === 0) return false;
+    this.ctx.storage.transactionSync(() => {
+      this.deleteHeldEnvelopes("id = ?", id);
+      this.sql.exec("DELETE FROM held_events WHERE id = ?", id);
+      const u = this.usage();
+      this.setUsage({ events: u.events - 1, bytes: u.bytes - 2 });
+    });
+    return true;
+  }
+
+  /** Drops a held event: it is never streamed. False when there is none. */
+  async dropHeld(id: string): Promise<boolean> {
+    const gone = this.forgetHeld(id);
+    if (gone) await this.ensureAlarm();
+    return gone;
+  }
+
+  /**
+   * Releases a held event: it takes the next seq, each envelope is signed for it (with the `held`
+   * line, so its device opens it with the held associated data), and it is streamed like any
+   * event. Devices revoked meanwhile get nothing; null when there is no such held event.
+   */
+  async releaseHeld(id: string): Promise<{ seq: number } | null> {
+    const relay = await this.signingKey();
+    if (!relay) throw new Error("RELAY_SIGNING_KEY is missing or malformed");
+    const result = await this.ctx.blockConcurrencyWhile(async (): Promise<{ seq: number } | null> => {
+      const h = this.sql
+        .exec<{ hook_id: string; received_at: number; verified: number; strict: number; preset: string; event_type: string | null }>(
+          "SELECT hook_id, received_at, verified, strict, preset, event_type FROM held_events WHERE id = ?",
+          id,
+        )
+        .toArray()[0];
+      if (!h) return null;
+      const envs = this.sql
+        .exec<{ device_id: string; kid: string; enc: string; ct: ArrayBuffer }>(
+          `SELECT e.device_id, e.kid, e.enc, e.ct FROM held_envelopes e JOIN devices d ON d.id = e.device_id
+           WHERE e.id = ? AND d.revoked = 0 ORDER BY e.device_id`,
+          id,
+        )
+        .toArray();
+      const seq = this.head() + 1;
+      const meta = {
+        seq,
+        id,
+        hookId: h.hook_id,
+        receivedAt: h.received_at,
+        verified: h.verified === 1,
+        strict: h.strict === 1,
+        preset: h.preset,
+        eventType: h.event_type,
+        held: true,
+      };
+      const signed: { device_id: string; kid: string; enc: string; ct: Uint8Array<ArrayBuffer>; sig: string }[] = [];
+      for (const e of envs) {
+        const ct = new Uint8Array(e.ct);
+        signed.push({ ...e, ct, sig: await signEnvelope(relay, e.device_id, meta, { kid: e.kid, enc: e.enc, ct }) });
+      }
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", seq);
+        this.sql.exec(
+          `INSERT INTO events (seq, id, hook_id, received_at, verified, strict, preset, event_type, content_type, headers, body, held)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', x'', 1)`,
+          seq,
+          id,
+          h.hook_id,
+          h.received_at,
+          h.verified,
+          h.strict,
+          h.preset,
+          h.event_type,
+        );
+        for (const e of signed) {
+          this.sql.exec("INSERT INTO envelopes (seq, device_id, kid, enc, ct, sig) VALUES (?, ?, ?, ?, ?, ?)", seq, e.device_id, e.kid, e.enc, e.ct, e.sig);
+        }
+        // The bytes move from the hold to the log: the usage counters don't change.
+        this.sql.exec("DELETE FROM held_envelopes WHERE id = ?", id);
+        this.sql.exec("DELETE FROM held_events WHERE id = ?", id);
+      });
+      return { seq };
+    });
+    if (result) {
       this.deliverLive(result.seq);
       await this.ensureAlarm();
     }
@@ -509,6 +712,7 @@ export class AccountObject extends DurableObject<Env> {
       }
     }
     this.deleteEnvelopes("device_id = ?", deviceId);
+    this.deleteHeldEnvelopes("device_id = ?", deviceId);
     this.pruneAcknowledged();
     await this.ensureAlarm();
   }
@@ -569,7 +773,15 @@ export class AccountObject extends DurableObject<Env> {
         limit,
       )
       .toArray()
-      .map((r): AuditEntry => ({ at: r.hour, kind: r.kind, actor: r.subject, subject: r.subject, name: r.name, count: r.count }));
+      .map((r): AuditEntry => ({
+        at: r.hour,
+        kind: r.kind,
+        // A key's own uses are by the key; the screen's counts are the relay's.
+        actor: r.kind === "key.used" ? r.subject : null,
+        subject: r.subject,
+        name: r.name,
+        count: r.count,
+      }));
     const failures = this.sql
       .exec<{ hour: number; hook_id: string; count: number }>(
         "SELECT hour, hook_id, count FROM verify_failures WHERE hour >= ? ORDER BY hour DESC LIMIT ?",
@@ -747,6 +959,7 @@ export class AccountObject extends DurableObject<Env> {
           strict: row.strict === 1,
           preset: row.preset,
           eventType: row.event_type,
+          ...(row.held === 1 ? { held: true } : {}),
         },
         { kid: env.kid, enc: env.enc, ct: new Uint8Array(env.ct), sig: env.sig },
       ),
@@ -832,6 +1045,9 @@ export class AccountObject extends DurableObject<Env> {
     this.sql.exec("DELETE FROM nonces WHERE at <= ?", now - NONCE_TTL_MS);
     this.sql.exec("DELETE FROM seen WHERE at <= ?", now - DEDUPE_TTL_MS);
     this.sql.exec("DELETE FROM notices WHERE at <= ?", now - NOTICE_TTL_MS);
+    for (const r of this.sql.exec<{ id: string }>("SELECT id FROM held_events WHERE received_at <= ?", now - this.heldMs()).toArray()) {
+      this.forgetHeld(r.id);
+    }
     this.pruneAudit(now);
     await this.ensureAlarm(true);
   }
@@ -847,6 +1063,7 @@ export class AccountObject extends DurableObject<Env> {
       [q("SELECT min(received_at) AS t FROM events"), this.retentionMs()],
       [q("SELECT min(at) AS t FROM seen"), DEDUPE_TTL_MS],
       [q("SELECT min(at) AS t FROM notices"), NOTICE_TTL_MS],
+      [q("SELECT min(received_at) AS t FROM held_events"), this.heldMs()],
     ];
     let next = Infinity;
     for (const [t, ttl] of due) if (t !== null) next = Math.min(next, t + ttl + 1);
@@ -866,6 +1083,7 @@ export class AccountObject extends DurableObject<Env> {
     head: number;
     events: number;
     envelopes: number;
+    held: number;
     usage: Quota;
     devices: { id: string; acked: number; revoked: boolean; sealKid: string | null }[];
   }> {
@@ -873,6 +1091,7 @@ export class AccountObject extends DurableObject<Env> {
       head: this.head(),
       events: this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM events").one().n,
       envelopes: this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM envelopes").one().n,
+      held: this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM held_events").one().n,
       usage: this.usage(),
       devices: this.sql
         .exec<{ id: string; acked: number; revoked: number; seal_kid: string | null }>(
@@ -913,6 +1132,13 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS notices (hook_id TEXT NOT NULL, mark TEXT NOT NULL, at INTEGER NOT NULL,
      PRIMARY KEY (hook_id, mark)) WITHOUT ROWID`,
   "CREATE INDEX IF NOT EXISTS notices_at ON notices(at)",
+  // The screen's hold (PROTOCOL §4b): events sealed (with the held associated data) and kept aside
+  // until a device releases or drops them. Metadata and ciphertext only, as in the log.
+  `CREATE TABLE IF NOT EXISTS held_events (id TEXT PRIMARY KEY, hook_id TEXT NOT NULL, received_at INTEGER NOT NULL,
+     verified INTEGER NOT NULL, strict INTEGER NOT NULL, preset TEXT NOT NULL, event_type TEXT, rule TEXT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS held_received ON held_events(received_at)",
+  `CREATE TABLE IF NOT EXISTS held_envelopes (id TEXT NOT NULL, device_id TEXT NOT NULL, kid TEXT NOT NULL, enc TEXT NOT NULL,
+     ct BLOB NOT NULL, PRIMARY KEY (id, device_id)) WITHOUT ROWID`,
   "CREATE TABLE IF NOT EXISTS pruned (from_seq INTEGER NOT NULL, to_seq INTEGER NOT NULL, reason TEXT NOT NULL)",
   `CREATE TABLE IF NOT EXISTS verify_failures (hook_id TEXT NOT NULL, hour INTEGER NOT NULL, count INTEGER NOT NULL,
      PRIMARY KEY (hook_id, hour)) WITHOUT ROWID`,

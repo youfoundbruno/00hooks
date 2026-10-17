@@ -31,6 +31,13 @@ Additive within version 2 (webhook channels): the `meta` preset and its GET hand
 TwiML answers for Twilio deliveries (§4); a hook's `offlineNotice` (§3, §4a); and `notice` in the
 sealed content (§5). A client that ignores them keeps working.
 
+Additive within version 2 (the screen, §4b): a hook's edge screen (`/v1/hooks/<id>/screen`), the
+account's screen key (`/v1/screen/key`), the hold (`/v1/held`), `screen` and `extras` in
+`/v1/info`, `screenRules` in `Hook`, `origin` in the sealed content (§5), and released events, which
+carry `held: true` and a last signed line `held` (§5). A client that predates them keeps working
+for every event except a released one, which it can't verify and so quarantines (§7), never
+handing it over unverified.
+
 ## 1. Signed requests
 
 Every `/v1/*` request except account creation and enrolment is signed by a **device**. A device has an
@@ -156,7 +163,12 @@ characters); both sides compute it.
   `unauthorized`. A newly enrolled device **starts at the head** of the log: it doesn't receive the
   older backlog and doesn't hold it back from deletion.
 - `GET /v1/info` (unsigned) → `{ "version", "protocol": 2, "protocols": [2], "signupOpen": bool,
-  "relayKey", "serverTime" }`. `relayKey` is the relay's Ed25519 public key (unpadded base64url, 43
+  "relayKey", "serverTime", "screen": { "edge": true, "maxRules": 200, "heldDays" }, "extras": [] }`.
+  `screen` says what the edge screen takes (§4b). `extras` lists the optional hosted extras this
+  relay offers (fingerprint sync across devices, reputation lists shared as hashes, a longer hold,
+  evaluator credits…), each `{ "id", "title", "description"?, "url"? }`, as the operator sets them
+  in `HOSTED_EXTRAS`; it is data, never prices or code, a client shows only what is there, and a
+  self-hosted relay announces none. `relayKey` is the relay's Ed25519 public key (unpadded base64url, 43
   characters) that signs every envelope (§5); a client **pins it at login** and refuses envelopes it
   doesn't verify. It is null only on a relay with no `RELAY_SIGNING_KEY`, which takes no deliveries
   (§4) and which the reference client refuses to log in to.
@@ -177,7 +189,8 @@ characters); both sides compute it.
 - `DELETE /v1/hooks/<id>` (`hooks:write`) → `204`. Events already in the log stay until acknowledged.
 
 `Hook`: `{ "id", "name", "url", "enabled", "verify": { "preset", …non-secret fields }, "maxBodyBytes",
-"createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null }`.
+"createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null, "screenRules" }`
+(`screenRules`: how many edge rules the hook's screen has, §4b).
 
 ### Presets
 
@@ -306,6 +319,10 @@ mode removes the secret, and the parsing, not the transit.
 4. Verify with the preset (for a strict hook, the edge checks of §3) → `401` `{"error":"signature"}`
    on failure (counted per hour in the audit, §9, never stored).
 5. A handshake the preset answers (Slack's `url_verification`) → answered, not stored.
+5a. The hook's screen (§4b), when it has one: **drop** → `200` `{"received": "<evt_…>"}` with an id
+   that names nothing (the sender can't tell it from a delivery), nothing stored, counted per hour
+   (`screen.dropped`); **quarantine** → the event is held (step 8 stores it aside); **pass** or no
+   rule → on. Always after step 4, so a forged signature keeps its `401`.
 6. Dedupe → a duplicate (any of the delivery's marks seen before) answers `200` `{"duplicate":true}`
    and is not stored again.
 7. Quota: an account's log holds at most `ACCOUNT_MAX_EVENTS` events (default 10,000) and
@@ -348,6 +365,96 @@ wrote: the relay never reads a message to choose a reply, and nothing is answere
 - The event is stored and delivered as always, and its sealed content says `"notice": true` (§5),
   so the device can show that the sender was answered.
 
+## 4b. The screen at the edge
+
+An optional firewall (PLAN §6a) for each hook: rules a device pushes, checked after the signature
+and before anything is stored or streamed. The first rule that holds decides its verdict: `pass`
+(on as usual; an allow rule above a block wins), `quarantine` (held at the relay, not streamed until
+a device releases it) or `drop` (§4 step 5a). No rule holding is a pass. Nothing it reads is kept:
+a decision leaves the rule's id and an hourly count.
+
+**What it reads.** The client's address (`CF-Connecting-IP`), its network (`request.cf.asn`) and
+country (`request.cf.country`), the headers, the body's size and, unless the hook is strict, the
+body itself, read as the harness reads it: JSON, else a form's fields (a repeated name becomes a
+list), else UTF-8 text. A strict hook's body is never parsed, so conditions on its body never hold
+there (its devices still screen it).
+
+**`PUT /v1/hooks/<id>/screen`** (device, or `hooks:write`) `{ "screen": EdgeScreen | null }` →
+`{ "screen": EdgeScreen | null }`, the screen as kept (`null` or no rules removes it). The body may
+be up to 512 KiB. **`GET /v1/hooks/<id>/screen`** (`hooks:read`) → the same. Every change is an
+audit line (`hook.screen`).
+
+```
+EdgeScreen = { "rules": [EdgeRule], "consent": { "words": bool } }       at most 200 rules
+EdgeRule   = { "id": [A-Za-z0-9_-]{1,64}, "verdict": "pass" | "quarantine" | "drop",
+               "any"?: true,                    conditions joined by or (default: and)
+               "conditions": [Condition] }      1 to 20
+Condition  =
+  { "on": "ip", "in": [address or CIDR…], "not"?: true, "preset"?: "github" }
+  { "on": "asn", "in": [number…], "not"?: true }
+  { "on": "country", "in": ["PT"…], "not"?: true }
+  { "on": "header", "name", "op": "present" | "absent" | "is" | "contains", "value"? }
+  { "on": "size", "op": "gt" | "lt", "bytes" }
+  { "on": "field", "path", "op": "is" | "domain_is" | "one_of", "hashes": [22 chars…], "not"?: true }
+  { "on": "field", "path", "op": "contains", "words", "not"?: true }         needs consent.words
+  { "on": "field", "path", "op": "pattern", "pattern", "not"?: true }        needs consent.words
+  { "on": "field", "path", "op": "similar_text", "signature", "threshold"? } needs consent.words
+  { "on": "similar", "shape"?: 64 hex, "text"?: signature, "threshold"? }
+```
+
+Lists hold 1 to 1,000 entries. `not` turns a list into an allow list: `{"on": "ip", "in": <GitHub's
+published hook ranges>, "not": true, "preset": "github"}` with `drop` drops what doesn't come from
+GitHub. The relay fetches no list itself: the client sends the ranges, and `preset` only names
+them. An address that isn't known (no `CF-Connecting-IP`) never matches, `not` or not; so does a
+missing network, country or field.
+
+- **Fields** are named by their catalogue path (PLAN §5.0): `payload.sender.email`,
+  `payload.items[].sku` (any item), `headers.<name>`. Only scalars count: strings as they are,
+  numbers and booleans as their JSON text.
+- **Keyed hashes.** `is` and `one_of` compare a value trimmed and lower-cased; `domain_is` compares
+  the domain of an address (after the last `@`) or a URL (its host, without user, port or a trailing
+  dot), and matches the domain or any parent of it. Each value travels only as
+  `HMAC-SHA256(screenKey, "00hooks-screen-field-v1\n" + path + "\n" + normalised)`, its first 16
+  bytes in unpadded base64url; the relay hashes the incoming field (each parent domain, for
+  `domain_is`) and compares. `GET /v1/screen/key` (device only) → `{ "key" }`: the account's screen
+  key, 32 bytes, unpadded base64url (`HMAC-SHA256(HASH_PEPPER, "screen-key:" + accountId)`), so
+  another account's hashes never match here. A keyed hash keeps the value from storage and logs,
+  not from the relay's operator, who holds the key and could test guesses.
+- **Words.** `contains` (the words appear in order and adjacent, case-insensitive), `pattern` (a
+  JavaScript regular expression over the first 2,048 characters, from a safe subset: no
+  back-references, no look-around, no repeated groups, at most two unbounded repeats, 200
+  characters) and `similar_text` make the relay read the words, so a screen with any of them is
+  refused (`400`, `field: "screen.consent"`) unless `consent.words` is `true`; the screen kept says
+  whether it reads words.
+- **Fingerprints** (`similar`): `shape` is the payload's shape hash (its field paths and types:
+  every path `payload.a`, `payload.l[]`… with its types sorted and joined by `|`, the lines
+  `path:types` sorted and joined by `\n`, then hex SHA-256; at most 2,000 fields, 32 levels and 50
+  items of a list); `text` is a MinHash signature of every string of the payload (keys in
+  code-point order, joined by spaces), lower-cased words (runs of letters and digits, at most
+  10,000), word 5-grams (fewer words make one shingle), 64 slots of `fmix32(murmur3_32(shingle, 0) ^
+  seed_i)` with `seed_i = fmix32(0x9e3779b9 · (i + 1))`, each slot big-endian, 256 bytes in unpadded
+  base64url (342 characters). A fingerprint holds when the shape is equal (if given) and the share of
+  equal slots is at least `threshold` (0.5 to 1; 0.8 when absent).
+
+`fixtures/screen.v1.json` pins words, shapes, signatures, domains, keyed hashes and safe patterns;
+the relay's tests and the harness's (`cli/hooks-screen`) both run it.
+
+**The hold.** A quarantined event is sealed to every device as usual, but with the associated data
+`00hooks-seal-v1\n<hookId>\nheld\n<id>` (it has no seq yet), kept aside with its dedupe marks, and
+counted in the account's quota. It is not streamed.
+
+- `GET /v1/held` (device, or `events:read`) → `{ "held": [{ "id", "hookId", "receivedAt",
+  "verified", "strict", "preset", "eventType", "rule", "size", "expiresAt" }] }`, newest first,
+  metadata only.
+- `POST /v1/held/<id>/release` (device, or `hooks:write`) → `{ "released": "<id>", "seq" }`: the
+  event takes the next seq, each envelope is signed for it with the extra line `held` (§5), and it
+  is streamed like any event (devices revoked meanwhile get nothing). A second release is `404`.
+- `DELETE /v1/held/<id>` (device, or `hooks:write`) → `204`: it is never streamed; `404` when it
+  isn't held.
+- A held event waits `SCREEN_HELD_DAYS` (7 by default), then is dropped by the alarm.
+- Audit: `screen.held` and `screen.dropped` are counted per hook per hour (`actor` null);
+  `held.released` and `held.dropped` name the device or key.
+
 ## 5. Events
 
 An event, as one device receives it in `event: hook` (each device gets its own envelope):
@@ -377,9 +484,11 @@ An event, as one device receives it in `event: hook` (each device gets its own e
   client sets it after verifying (§3).
 
 **What is sealed** (the plaintext): the UTF-8 JSON `{"headers": {…}, "contentType": … | null,
-"url"?: "…", "notice"?: true}`, one newline byte (`0x0a`), then the raw body bytes. JSON has no raw
-newline, so the first one is the boundary. `notice` is present when the relay answered this delivery
-with the hook's offline notice (§4a); a client reads it only from the sealed content.
+"url"?: "…", "notice"?: true, "origin"?: { "ip"?, "asn"?, "country"? }}`, one newline byte
+(`0x0a`), then the raw body bytes. JSON has no raw newline, so the first one is the boundary.
+`notice` is present when the relay answered this delivery with the hook's offline notice (§4a);
+`origin` is where the edge saw the delivery come from (§4b), for the device's own screen. A client
+reads both only from the sealed content.
 
 - `headers` keeps only an allowlist per preset (the provider's event and delivery headers,
   `content-type`, `user-agent`, and the runner's loop-prevention headers `00hooks-origin` and
@@ -396,7 +505,9 @@ ChaCha20-Poly1305 (suite `0x0020, 0x0001, 0x0003`), single-shot, to the device's
 
 - `info` = the UTF-8 bytes of `00hooks seal v1`;
 - `aad` = the UTF-8 bytes of `00hooks-seal-v1\n<hookId>\n<seq>\n<id>`, so a stored ciphertext can't
-  be moved to another event, hook or position;
+  be moved to another event, hook or position; for an event the screen held and a device released
+  (`"held": true`, §4b), `00hooks-seal-v1\n<hookId>\nheld\n<id>`, since it was sealed before it had
+  a seq (the relay's signature binds the seq it got);
 - `kid` names the device key (§2), so keys can be replaced; `enc` is the encapsulated key (unpadded
   base64url); `ct` the ciphertext with its tag (standard padded base64).
 
@@ -417,6 +528,7 @@ as `relayKey` (§2), of these lines joined with `\n` (no trailing newline):
 <sealed.kid>
 <sealed.enc>
 <hex SHA-256 of the ciphertext bytes>
+held                                    (only for a released event, "held": true)
 ```
 
 HPKE alone says nothing about who sealed (anyone with a device's public key can seal to it); the
@@ -565,7 +677,10 @@ scope, or on a route only a device may use, is `403` `forbidden`.
 | `events:read` | `GET /v1/events` |
 | `devices:write` | `GET /v1/devices`, `DELETE /v1/devices/<id>` |
 | `audit:read` | `GET /v1/audit` |
-| *(device only)* | `/v1/stream`, `/v1/ack`, `/v1/enrolments`, `PUT /v1/devices/<id>/seal-key`, `/v1/keys` |
+| `hooks:read` (screen) | `GET /v1/hooks/<id>/screen` |
+| `hooks:write` (screen) | `PUT /v1/hooks/<id>/screen`, `POST /v1/held/<id>/release`, `DELETE /v1/held/<id>` |
+| `events:read` (screen) | `GET /v1/held` |
+| *(device only)* | `/v1/stream`, `/v1/ack`, `/v1/enrolments`, `PUT /v1/devices/<id>/seal-key`, `/v1/keys`, `/v1/screen/key` |
 
 The device-only routes are what would turn a stolen key into a reader of the account's events (a
 stream, a new device, a sealing key) or into more keys.
@@ -583,6 +698,9 @@ Names and ids only: never a secret, a token, a header value or a payload.
 | `key.created`, `key.revoked` | the key | the device | the key's name |
 | `key.used` | the key | the key | the key's name; `count` uses in the hour starting at `at` |
 | `verify.failed` | the hook | null | the hook's name, while it exists; `count` failures in the hour starting at `at` |
+| `hook.screen` | the hook | the device or key | the hook's name |
+| `screen.held`, `screen.dropped` | the hook | null | the hook's name; `count` in the hour starting at `at` |
+| `held.released`, `held.dropped` | the event | the device or key | null |
 
 **The events list**: `GET /v1/events?limit=<1–500, default 50>` (device, or `events:read`) →
 `{ "events": [{ "seq", "id", "hookId", "receivedAt", "verified", "strict", "preset", "eventType",

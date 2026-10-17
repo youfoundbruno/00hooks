@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use hooks_client::Event;
+use hooks_screen::{Screen, SourceKind, Verdict};
 use serde_json::{Value, json};
 
 use crate::actions::{self, Failure, Notifier, NullNotifier, SystemNotifier};
@@ -37,6 +38,9 @@ pub struct RunnerOptions {
     pub retry_base: Duration,
     /// Runs "ask an agent" actions; `None` (the CLI) makes them fail, saying why.
     pub asker: Option<Arc<dyn Asker>>,
+    /// The screen (PLAN §6a): every event meets it before any automation runs. A host shares one
+    /// screen across its sources; `None` runs without one.
+    pub screen: Option<Arc<Screen>>,
 }
 
 impl RunnerOptions {
@@ -51,6 +55,7 @@ impl RunnerOptions {
             secrets,
             retry_base: Duration::from_secs(1),
             asker: None,
+            screen: None,
         }
     }
 }
@@ -328,7 +333,7 @@ impl Runner {
         confirm: &mut (dyn FnMut(&str) + Send),
     ) -> RunRecord {
         self.reload_if_changed();
-        let rec = self.process(e, false, confirm).await;
+        let rec = self.process(e, false, false, confirm).await;
         if !rec.replay {
             self.count_catch_up(&rec).await;
         }
@@ -337,13 +342,82 @@ impl Runner {
 
     /// Run a recorded event again, now, against the current automations.
     pub async fn replay(&mut self, event_id: &str) -> Result<RunRecord> {
+        // `00hooks screen release` asks a running runner through the same mailbox.
+        if event_id.starts_with("hld_") {
+            return self.release(event_id).await;
+        }
         self.reload_if_changed();
         let e = self.runs.event(event_id)?.ok_or_else(|| {
             Error::Other(format!(
                 "no recorded event {event_id}; `00hooks runs` lists the ones that can be replayed"
             ))
         })?;
-        Ok(self.process(&e, true, &mut |_| {}).await)
+        Ok(self.process(&e, true, false, &mut |_| {}).await)
+    }
+
+    /// The screen this runner checks events with, if any.
+    pub fn screen(&self) -> Option<&Arc<Screen>> {
+        self.opts.screen.as_ref()
+    }
+
+    /// Release an event the screen held: it runs now, once, against the current automations.
+    pub async fn release(&mut self, held_id: &str) -> Result<RunRecord> {
+        self.reload_if_changed();
+        let screen = self
+            .opts
+            .screen
+            .clone()
+            .ok_or_else(|| Error::Other("this runner has no screen".into()))?;
+        let h = screen.release(held_id).map_err(Error::Other)?;
+        let e: Event = serde_json::from_value(h.host["event"].clone())
+            .map_err(|_| Error::Other("the held item carries no event to run".into()))?;
+        Ok(self.process(&e, true, true, &mut |_| {}).await)
+    }
+
+    /// The screen's view of an event (PLAN §6a): its payload and headers, where the edge saw it come
+    /// from, and whether an agent (or anything) would act on it.
+    fn screen_item(
+        &self,
+        e: &Event,
+        payload: &Value,
+        kind: &str,
+        triggered: &[&Automation],
+    ) -> hooks_screen::Item {
+        let hook = self
+            .names
+            .get(&e.hook_id)
+            .cloned()
+            .unwrap_or_else(|| e.hook_id.clone());
+        let origin = e.origin.clone().unwrap_or_default();
+        let names: Vec<String> = triggered.iter().map(|a| a.name.clone()).collect();
+        hooks_screen::Item {
+            id: e.id.clone(),
+            source: hooks_screen::Source {
+                kind: SourceKind::Webhook,
+                id: e.hook_id.clone(),
+                name: hook.clone(),
+            },
+            payload: payload.clone(),
+            headers: e.headers.clone(),
+            origin: hooks_screen::Origin {
+                ip: origin.ip,
+                asn: origin.asn,
+                country: origin.country,
+                sender: None,
+                known: None,
+            },
+            size: e.body_len(),
+            received_at: e.received_at,
+            agent_bound: triggered.iter().any(|a| {
+                a.actions
+                    .iter()
+                    .any(|x| matches!(x.kind, ActionKind::Ask { .. }))
+            }),
+            consequential: !triggered.is_empty(),
+            purpose: (!names.is_empty())
+                .then(|| format!("events for these automations: {}", names.join("; "))),
+            summary: crate::text::cut(&crate::text::sanitize(&format!("{kind} from {hook}")), 120),
+        }
     }
 
     fn dropped(&self, e: &Event, note: String) -> RunRecord {
@@ -364,6 +438,7 @@ impl Runner {
             new_kind: false,
             shape_change: None,
             automations: Vec::new(),
+            held: None,
         }
     }
 
@@ -378,6 +453,7 @@ impl Runner {
         &mut self,
         e: &Event,
         replay: bool,
+        released: bool,
         confirm: &mut (dyn FnMut(&str) + Send),
     ) -> RunRecord {
         // At least once from the relay, at most once here.
@@ -480,6 +556,75 @@ impl Runner {
             );
         }
 
+        // The screen (PLAN §6a), before any automation: not for a replay or a release (the person
+        // asked for those), nor for an event the person already released at the relay.
+        if !replay
+            && !e.held
+            && let Some(screen) = self.opts.screen.clone()
+        {
+            let triggered: Vec<&Automation> = self
+                .config
+                .automations
+                .iter()
+                .filter(|a| self.triggered(a, e, &kind, &observation).is_some())
+                .collect();
+            let item = self.screen_item(e, &ctx["payload"], &kind, &triggered);
+            let decision = screen.check(&item).await;
+            let screened = |status: RunStatus, note: String, held: Option<String>| RunRecord {
+                run: run.clone(),
+                event_id: e.id.clone(),
+                seq: e.seq,
+                hook_id: e.hook_id.clone(),
+                hook: hook_name.clone(),
+                kind: kind.clone(),
+                verified: e.verified,
+                started_at,
+                finished_at: now_ms(),
+                replay,
+                status,
+                note: Some(note),
+                new_kind: observation.new_kind,
+                shape_change: observation.change.clone(),
+                automations: Vec::new(),
+                held,
+            };
+            match decision.verdict {
+                Verdict::Pass => {}
+                Verdict::Drop => {
+                    let reason = crate::text::sanitize(&decision.reason);
+                    self.say(format!("Dropped {label} by the screen: {reason}"));
+                    let rec = screened(
+                        RunStatus::Dropped,
+                        format!("dropped by the screen: {reason}"),
+                        None,
+                    );
+                    return self.finish(rec);
+                }
+                Verdict::Quarantine => {
+                    let reason = crate::text::sanitize(&decision.reason);
+                    let rec = match screen.hold(&item, &decision, json!({ "event": e })) {
+                        Ok(h) => {
+                            self.say(format!("Held {label} by the screen: {reason}. `00hooks screen held` lists it."));
+                            screened(
+                                RunStatus::Held,
+                                format!("held by the screen: {reason}"),
+                                Some(h.id),
+                            )
+                        }
+                        Err(err) => screened(
+                            RunStatus::Held,
+                            format!(
+                                "held by the screen ({reason}), but the quarantine list couldn't keep it: {err}; `00hooks replay {}` runs it",
+                                e.id
+                            ),
+                            None,
+                        ),
+                    };
+                    return self.finish(rec);
+                }
+            }
+        }
+
         let mut autos = Vec::new();
         if let Err(err) = self.states.reload() {
             self.say(format!("Couldn't read the automations' state: {err}"));
@@ -511,10 +656,11 @@ impl Runner {
             finished_at: now_ms(),
             replay,
             status,
-            note: None,
+            note: released.then(|| "released from the screen's quarantine list".to_string()),
             new_kind: observation.new_kind,
             shape_change: observation.change,
             automations: autos,
+            held: None,
         };
         self.finish(rec)
     }

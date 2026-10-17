@@ -378,3 +378,70 @@ async fn a_refused_signup_or_code_is_explained_as_such() {
     assert!(err.contains("code is wrong, used or expired"), "{err}");
     assert!(!err.contains("--force"), "{err}");
 }
+
+/// `00hooks screen`: off until switched on; a held item is dropped with --always, which learns a
+/// rule kept as a fingerprint; ids are checked before anything is asked of the relay.
+#[test]
+fn the_screen_commands_work_on_this_computer() {
+    use hooks_runner::hooks_screen::{Decision, Item, Screen, Source, SourceKind};
+    let home = TempHome::new("cli-screen");
+    let out = run(&home.0, &["screen"]);
+    assert!(
+        text(&out.stdout).contains("The screen is off for webhooks."),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = run(&home.0, &["screen", "on"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = run(&home.0, &["screen", "status", "--json"]);
+    assert!(
+        text(&out.stdout).contains("\"on\":true"),
+        "{}",
+        text(&out.stdout)
+    );
+    // Something the runner held (made here directly, as the runner would).
+    let dir = home.0.join("runner").join("screen");
+    let s = Screen::open(&dir).unwrap();
+    let item = Item {
+        id: "evt_1".into(),
+        source: Source {
+            kind: SourceKind::Webhook,
+            id: "hk_1".into(),
+            name: "shop".into(),
+        },
+        payload: serde_json::json!({"text": "Win a free crypto wallet today, click the link and claim your prize now"}),
+        headers: Default::default(),
+        origin: Default::default(),
+        size: 10,
+        received_at: 1,
+        agent_bound: true,
+        consequential: true,
+        purpose: None,
+        summary: "order from shop".into(),
+    };
+    let d: Decision = serde_json::from_value(
+        serde_json::json!({"verdict": "quarantine", "by": "rule", "reason": "doubtful"}),
+    )
+    .unwrap();
+    let h = s.hold(&item, &d, serde_json::Value::Null).unwrap();
+    let out = run(&home.0, &["screen", "drop", &h.id, "--always"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("Learned: Drop items like order from shop"),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = run(&home.0, &["screen", "rules"]);
+    assert!(
+        text(&out.stdout).contains("always"),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = run(&home.0, &["screen", "release", "nonsense"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("starts with hld_"),
+        "{}",
+        text(&out.stderr)
+    );
+}
