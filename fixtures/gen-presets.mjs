@@ -287,6 +287,33 @@ add({
   expect: { ok: false },
 });
 
+// ── meta ── https://developers.facebook.com/docs/graph-api/webhooks/getting-started (scheme:
+// `X-Hub-Signature-256: sha256=` + hex HMAC-SHA256 of the raw body under the app secret; Meta
+// publishes no fixed vector). The body is a WhatsApp Cloud API message notification.
+const metaSecret = "meta-app-secret-0001";
+const metaBody =
+  '{"object":"whatsapp_business_account","entry":[{"id":"102290129340398","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"display_phone_number":"15550783881","phone_number_id":"106540352242922"},"contacts":[{"profile":{"name":"Sheena Nelson"},"wa_id":"16505551234"}],"messages":[{"from":"16505551234","id":"wamid.HBgLMTY1MDM4Nzk0MzkVAgASGBQzQTRBNjU5OUFFRTAzODEwMTQ0RgA=","timestamp":"1749416383","type":"text","text":{"body":"Does it come in another color?"}}]}}]}]}';
+add({
+  name: "meta: a WhatsApp message notification, typed by its signed object",
+  source: "computed (Meta's documented scheme)",
+  verify: { preset: "meta" },
+  secrets: [metaSecret],
+  now: T * 1000,
+  headers: { "x-hub-signature-256": `sha256=${hmac("sha256", metaSecret, metaBody, "hex")}` },
+  body: metaBody,
+  expect: { ok: true, eventType: "whatsapp_business_account" },
+});
+add({
+  name: "meta: signed with another app's secret",
+  source: "computed, wrong secret",
+  verify: { preset: "meta" },
+  secrets: [metaSecret],
+  now: T * 1000,
+  headers: { "x-hub-signature-256": `sha256=${hmac("sha256", "another-app-secret", metaBody, "hex")}` },
+  body: metaBody,
+  expect: { ok: false },
+});
+
 // ── hmac ── RFC 4231 test case 2 (SHA-256), RFC 2202 test case 2 (SHA-1)
 add({
   name: "hmac: sha256 hex with a prefix (RFC 4231 case 2)",

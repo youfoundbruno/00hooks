@@ -89,11 +89,14 @@ pub struct Hook {
     pub created_at: i64,
     #[serde(default)]
     pub last_event_at: Option<i64>,
+    /// The offline notice, when one is set (PROTOCOL §4a).
+    #[serde(default)]
+    pub offline_notice: Option<OfflineNotice>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
-/// `POST /v1/hooks` → `{ hook, url, secret? }`. The secret appears here only.
+/// `POST /v1/hooks` → `{ hook, url, secret?, verifyToken? }`. The secret appears here only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreatedHook {
@@ -101,6 +104,9 @@ pub struct CreatedHook {
     pub url: String,
     #[serde(default)]
     pub secret: Option<Secret>,
+    /// Meta's verify token, when the relay generated it: shown here only.
+    #[serde(default)]
+    pub verify_token: Option<Secret>,
 }
 
 /// `POST /v1/hooks/<id>/rotate` → `{ secret }`.
@@ -119,6 +125,19 @@ pub struct HookPatch {
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_body_bytes: Option<u64>,
+    /// `Some(None)` clears the offline notice; `Some(Some(_))` sets it (PROTOCOL §4a).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline_notice: Option<Option<OfflineNotice>>,
+}
+
+/// A hook's offline notice (PROTOCOL §4a): what the relay answers, at most once a day per sender,
+/// while no device stream has been connected for `after_minutes`. Only for presets whose provider
+/// takes a reply in the webhook's response (`twilio`, `slack` slash commands).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OfflineNotice {
+    pub text: String,
+    pub after_minutes: u32,
 }
 
 /// `sealed` in an event (PROTOCOL §5): an HPKE envelope for this device.
@@ -159,6 +178,10 @@ pub struct Event {
     /// The relay's signature over the envelope, until it is opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// The relay answered the sender with the hook's offline notice (PROTOCOL §4a): read from the
+    /// sealed content, so only the relay could have said so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notice: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

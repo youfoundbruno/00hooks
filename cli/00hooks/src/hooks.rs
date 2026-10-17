@@ -20,6 +20,8 @@ pub enum Preset {
     Linear,
     Shopify,
     Twilio,
+    /// Meta: WhatsApp Cloud API, Messenger and Instagram webhooks.
+    Meta,
     Hmac,
     Token,
     Unverified,
@@ -36,6 +38,7 @@ impl Preset {
             Preset::Linear => "linear",
             Preset::Shopify => "shopify",
             Preset::Twilio => "twilio",
+            Preset::Meta => "meta",
             Preset::Hmac => "hmac",
             Preset::Token => "token",
             Preset::Unverified => "unverified",
@@ -46,7 +49,12 @@ impl Preset {
     fn provider_issued(self) -> bool {
         matches!(
             self,
-            Preset::Stripe | Preset::Slack | Preset::Linear | Preset::Shopify | Preset::Twilio
+            Preset::Stripe
+                | Preset::Slack
+                | Preset::Linear
+                | Preset::Shopify
+                | Preset::Twilio
+                | Preset::Meta
         )
     }
 }
@@ -263,6 +271,9 @@ pub async fn create(
         if let Some(s) = &created.secret {
             v["secret"] = json!(s.expose());
         }
+        if let Some(t) = &created.verify_token {
+            v["verifyToken"] = json!(t.expose());
+        }
         println!("{}", json_line(&v));
     } else {
         eprintln!(
@@ -274,6 +285,12 @@ pub async fn create(
         if let Some(s) = &created.secret {
             println!("Secret  {}", sanitize(s.expose(), false));
         }
+        if let Some(t) = &created.verify_token {
+            println!("Verify token  {}", sanitize(t.expose(), false));
+        }
+    }
+    if created.verify_token.is_some() {
+        eprintln!("{SAVE_NOW} Meta asks for the verify token when you add the callback URL.");
     }
     if created.secret.is_some() {
         eprintln!("{SAVE_NOW} Paste it into the sender's webhook settings.");

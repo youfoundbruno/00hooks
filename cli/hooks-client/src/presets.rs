@@ -231,6 +231,22 @@ fn spec(verify: &Value) -> Option<Spec> {
             timestamp: None,
             event_type: None,
         },
+        // Meta (WhatsApp, Messenger, Instagram): GitHub's header and scheme under the app secret,
+        // typed by the signed body's `object`.
+        "meta" => Spec {
+            mac: Mac_::HmacSha256,
+            key: KeyForm::Utf8,
+            sig: sig(
+                "x-hub-signature-256",
+                SigFormat::Single {
+                    prefix: "sha256=".into(),
+                },
+                Encoding::Hex,
+            ),
+            signed: BODY,
+            timestamp: None,
+            event_type: Some(TypeSource::BodyFields(&["object"])),
+        },
         "hmac" => Spec {
             mac: if field("algorithm") == Some("sha1") {
                 Mac_::HmacSha1
@@ -710,6 +726,7 @@ mod tests {
             "linear",
             "shopify",
             "twilio",
+            "meta",
             "hmac",
             "token",
         ] {

@@ -27,6 +27,10 @@ Version 2 changes from 1: devices publish a sealing key (§2); events are sealed
 (§5); `ready` gains `protocol` and `sealKid`, and `gap` gains the reason `no_key` (§6); new presets
 and strict mode (§3); API keys, the audit log and the events list (§9); the error `forbidden` (§8).
 
+Additive within version 2 (webhook channels): the `meta` preset and its GET handshake (§3, §4);
+TwiML answers for Twilio deliveries (§4); a hook's `offlineNotice` (§3, §4a); and `notice` in the
+sealed content (§5). A client that ignores them keeps working.
+
 ## 1. Signed requests
 
 Every `/v1/*` request except account creation and enrolment is signed by a **device**. A device has an
@@ -159,11 +163,13 @@ characters); both sides compute it.
 
 ## 3. Hooks
 
-- `POST /v1/hooks` (signed, or `hooks:write`) `{ "name", "verify": <Verify> }` → `201`
-  `{ "hook": <Hook>, "url", "secret"? }`. `secret` appears **only here** and only when the relay
-  generated it.
+- `POST /v1/hooks` (signed, or `hooks:write`) `{ "name", "verify": <Verify>, "offlineNotice"? }` →
+  `201` `{ "hook": <Hook>, "url", "secret"?, "verifyToken"? }`. `secret` appears **only here** and
+  only when the relay generated it; so does `verifyToken` (a `meta` hook's, when the caller gave
+  none). `offlineNotice` is §4a's, for the presets that can carry one.
 - `GET /v1/hooks` (`hooks:read`) → `{ "hooks": [<Hook>] }`; `GET /v1/hooks/<id>` → `<Hook>`.
-- `PATCH /v1/hooks/<id>` (`hooks:write`) `{ "name"?, "enabled"?, "maxBodyBytes"? }` → `<Hook>`.
+- `PATCH /v1/hooks/<id>` (`hooks:write`) `{ "name"?, "enabled"?, "maxBodyBytes"?, "offlineNotice"? }`
+  → `<Hook>`. `"offlineNotice": null` clears it.
 - `POST /v1/hooks/<id>/rotate` (`hooks:write`) → `{ "secret" }`; the previous secret keeps working for
   24 h. Only for presets whose secret the relay generates; a provider-issued secret (Stripe, Slack,
   Linear, Shopify, Twilio) is rotated at the provider, and a strict hook's secret is on the devices:
@@ -171,7 +177,7 @@ characters); both sides compute it.
 - `DELETE /v1/hooks/<id>` (`hooks:write`) → `204`. Events already in the log stay until acknowledged.
 
 `Hook`: `{ "id", "name", "url", "enabled", "verify": { "preset", …non-secret fields }, "maxBodyBytes",
-"createdAt", "lastEventAt" }`.
+"createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null }`.
 
 ### Presets
 
@@ -191,6 +197,7 @@ scheme with Node's own crypto where they don't).
 | `slack` | `secret` (required) | provider's | `X-Slack-Signature: v0=<hex HMAC-SHA256("v0:" ts ":" body)>`, `X-Slack-Request-Timestamp` within 300 s; answers `url_verification` (below) |
 | `linear` | `secret` (required) | provider's | `Linear-Signature: <hex HMAC-SHA256(body)>`; the body's `webhookTimestamp` (ms, signed) within **60 s** |
 | `shopify` | `secret` (required) | provider's | `X-Shopify-Hmac-Sha256: <base64 HMAC-SHA256(body)>` |
+| `meta` | `secret` (required: the app secret), `verifyToken`? (8 to 200 printable characters) | provider's; the verify token is generated when absent | `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(body)>` under the app secret (WhatsApp Cloud API, Messenger, Instagram); answers the GET handshake (§4) |
 | `twilio` | `secret` (required: the auth token) | provider's | `X-Twilio-Signature: <base64 HMAC-SHA1>` over the **public URL the relay was reached at**, then, for a form body, every parameter name and value (names sorted by code point, each name's distinct values sorted); for a JSON body, the URL alone, whose `bodySHA256` query parameter must equal the body's hex SHA-256. Tried with the URL as reached, without its port, and with the scheme's default port, as Twilio's own libraries do |
 | `hmac` | `header` (required), `algorithm` (`sha256` default, or `sha1`), `encoding` (`hex` default, or `base64`), `prefix`?, `secret`? | generated when absent | HMAC of the raw body |
 | `token` | `header` (default `Authorization`), `secret`? | generated when absent | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength; **no dedupe** |
@@ -213,6 +220,7 @@ a duplicate when **any** mark was seen in the last 7 days):
 | `linear` | the body (with `webhookTimestamp` and `type`) | `Linear-Delivery` | the delivery id, the body's hash | the body's `type` (signed) |
 | `shopify` | the body | `X-Shopify-Webhook-Id`, `X-Shopify-Topic` | the webhook id, the body's hash | `X-Shopify-Topic` (claimed) |
 | `twilio` | the URL and the form parameters (or the URL, with the JSON body's hash in it) | `I-Twilio-Idempotency-Token` | the token, the body's hash | none |
+| `meta` | the body | — | the body's hash (Meta sends no delivery id, and retries the same body) | the body's `object` (signed): `whatsapp_business_account`, `page`, `instagram` |
 | `hmac` | the body | — | the body's hash | none |
 | `token` | nothing (the token proves the sender knows the secret; the body has no integrity) | — | none | none |
 | `unverified` | nothing | — | none | none |
@@ -229,6 +237,15 @@ id and the mark), never the ids themselves: an event id read from a body is cont
 `[A-Za-z0-9._~-]`, or it is treated as an ordinary event) **after** the signature verifies, and it is
 not stored: it carries no event. GitHub's `ping` (sent when a webhook is created) is verified, deduped
 and stored as a normal event with `eventType: "ping"`, so a new hook can be tested end to end.
+
+**Meta's endpoint check.** Before Meta sends anything to a callback URL it asks
+`GET /h/<hookId>?hub.mode=subscribe&hub.verify_token=…&hub.challenge=…`. A `meta` hook keeps its
+verify token only as `HMAC-SHA256(HASH_PEPPER, "verify-token:" hookId ":" token)`; the relay answers
+`200` `text/plain` with the challenge (at most 200 characters of `[A-Za-z0-9._~-]`) only when the
+token it carries hashes to that, compared in constant time. Anything else (another mode, a missing
+or unsafe challenge, a wrong token) is `401` `signature`, counted like a failed verification; nothing
+is stored. Hooks of other presets answer `GET` with `404`. The verify token is not a signing secret
+(it proves nothing about later deliveries), so a strict `meta` hook keeps it at the relay too.
 
 `maxBodyBytes` is at most 1,835,008 (bodies live in 2 MB SQLite rows; larger ones move to R2 in a
 later phase). Secrets are stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM, the hook id
@@ -274,7 +291,7 @@ mode removes the secret, and the parsing, not the transit.
 
 ## 4. Receiving
 
-`POST /h/<hookId>` (also PUT and PATCH). In order:
+`POST /h/<hookId>` (also PUT and PATCH; `GET` is only ever §3's Meta endpoint check). In order:
 
 0. A relay whose rate limit bindings or `RELAY_SIGNING_KEY` are missing refuses everything here with
    `503` `unavailable` (it fails closed rather than take a flood at full cost, or take events it
@@ -299,6 +316,37 @@ mode removes the secret, and the parsing, not the transit.
    append the event, its envelopes and its dedupe marks in one Durable Object transaction → `200`
    `{"received": "<evt_…>"}`. The account's object takes no other request while it seals (the seq is
    part of what is sealed), and the plaintext is never written to storage or logs.
+
+**Answers a provider reads.** A `twilio` delivery is answered with TwiML instead of JSON, `200`
+`text/xml`: `<?xml version="1.0" encoding="UTF-8"?><Response></Response>`, or, when §4a's notice is
+due, `<Response><Message>…</Message></Response>` with the notice's text XML-escaped. A duplicate gets
+the empty one. A Slack slash command that gets a notice is answered
+`{"response_type":"ephemeral","text":…,"received":…}`; every other delivery keeps the JSON above.
+
+## 4a. Offline notices
+
+While your devices are off, the relay can answer a sender at once with a fixed notice the hook
+carries ("Thanks, we got your message and will reply soon."). It is not an answer to what they
+wrote: the relay never reads a message to choose a reply, and nothing is answered by a model.
+
+- **Only where the provider takes a reply in the webhook's response**: `twilio` (SMS and WhatsApp
+  through Twilio, as TwiML) and `slack` (slash commands only; events can't be answered that way).
+  Providers that need an API call to answer (Meta's WhatsApp Cloud API, Messenger, Instagram) can't
+  have one: setting it is `400` `invalid` with `field: "offlineNotice"`.
+- `offlineNotice`: `{ "text": 1–320 characters, no control characters but line breaks,
+  "afterMinutes": 1–10080 }`.
+- **When it is sent**, decided by the account's object in the same transaction as the append:
+  1. the delivery verified at the relay (never for a strict hook, whose sender the relay can't vouch
+     for) and is a message from a sender it can name: Twilio's `From` on an incoming message (it has
+     a `MessageSid` and no `MessageStatus`), Slack's `team_id` and `user_id` on a slash command;
+  2. no device stream is connected, and none has been for `afterMinutes`. A stream counts as
+     connected while its socket is open and has shown life in the last 90 s (it opened, or answered
+     the Worker's 30 s ping); the object notes when the last one went;
+  3. this sender hasn't had a notice from this hook in the last 24 hours.
+- **What is kept**: the sender only as `HMAC-SHA256(HASH_PEPPER, "notice:" hookId ":" sender)` with
+  the time, for 24 hours, then pruned by the alarm. No address, no text.
+- The event is stored and delivered as always, and its sealed content says `"notice": true` (§5),
+  so the device can show that the sender was answered.
 
 ## 5. Events
 
@@ -329,8 +377,9 @@ An event, as one device receives it in `event: hook` (each device gets its own e
   client sets it after verifying (§3).
 
 **What is sealed** (the plaintext): the UTF-8 JSON `{"headers": {…}, "contentType": … | null,
-"url"?: "…"}`, one newline byte (`0x0a`), then the raw body bytes. JSON has no raw newline, so the
-first one is the boundary.
+"url"?: "…", "notice"?: true}`, one newline byte (`0x0a`), then the raw body bytes. JSON has no raw
+newline, so the first one is the boundary. `notice` is present when the relay answered this delivery
+with the hook's offline notice (§4a); a client reads it only from the sealed content.
 
 - `headers` keeps only an allowlist per preset (the provider's event and delivery headers,
   `content-type`, `user-agent`, and the runner's loop-prevention headers `00hooks-origin` and

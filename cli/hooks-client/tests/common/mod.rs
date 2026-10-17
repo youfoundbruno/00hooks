@@ -124,6 +124,7 @@ pub fn sealed_for(s: &State, device: &str, e: &Value) -> Value {
         headers: meta.headers.clone(),
         content_type: meta.content_type.clone(),
         url: None,
+        notice: false,
         body: meta.body_bytes().unwrap(),
     };
     let sealed = seal_event(&relay_signing_key(), device, pk, &meta, &content).unwrap();

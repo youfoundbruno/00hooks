@@ -74,13 +74,17 @@ Three rules hold it together:
    event and kept 7 days: GitHub, Shopify and Twilio sign no timestamp and retry for hours, so for
    them the id is the only defence.
 4. **Handshakes**: providers that verify an endpoint before use (Slack's `url_verification`, Meta's
-   `hub.challenge`, Twitch, Microsoft Graph) are answered by the preset, after verification.
+   `hub.challenge`, Twitch, Microsoft Graph) are answered by the preset, after verification. Slack's
+   and Meta's are built (Meta's is a `GET` carrying the hook's verify token, kept as a keyed hash).
 5. **Seal and store**: the body and the headers you chose to keep are sealed to every device allowed on
    this hook (§4.4) and appended to the account's log with a monotonic sequence number.
 6. **Answer fast**: `200` (or the hook's configured static response) as soon as the event is durably
    stored, so providers never time out or retry needlessly. Dynamic responses produced by an agent are
-   out of scope: they'd be too slow for a provider's timeout. *(Static responses cover Slack slash
-   commands that only need an acknowledgement and Twilio's empty TwiML.)*
+   out of scope: they'd be too slow for a provider's timeout. Twilio gets TwiML (empty).
+7. **Offline notices** (PROTOCOL §4a): a hook whose provider takes its reply in the response
+   (Twilio, Slack slash commands) can carry a fixed notice the relay sends while no device has been
+   connected for a set time, at most once a day per sender (kept only as a keyed hash). Providers
+   that answer through an API call (Meta's) can't: there, a notice needs something that is on.
 
 ### 3.2 Streaming
 
@@ -149,7 +153,8 @@ signed sample event).
 | GitHub | `X-Hub-Signature-256` HMAC over the raw body | medium: no timestamp, so `X-GitHub-Delivery` dedupe is the replay defence |
 | Shopify | `X-Shopify-Hmac-SHA256` (base64) | medium: dedupe on `X-Shopify-Webhook-Id` |
 | Twilio | HMAC-SHA1 over the exact public URL and sorted parameters | medium: verified against the URL the provider was given, byte for byte |
-| Meta, Calendly, Typeform and more | each provider's documented HMAC, added as table entries | per provider |
+| Meta (WhatsApp Cloud API, Messenger, Instagram) | `X-Hub-Signature-256` HMAC over the raw body under the app secret; the GET verify-token handshake answered at the edge | medium: no timestamp, so the body hash is the replay defence |
+| Calendly, Typeform and more | each provider's documented HMAC, added as table entries | per provider |
 | Generic HMAC | you choose the header, algorithm and encoding | strong if the sender supports it |
 | Secret header or bearer token | constant-time compare | medium: no body integrity |
 | Secret in the URL path | the URL itself is the secret | weak: labelled as such |

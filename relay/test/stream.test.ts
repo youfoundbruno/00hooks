@@ -127,7 +127,8 @@ describe("stream", () => {
     await deliver(hook.id, { live: true });
     expect((await hooks(sse, 1))[0]!.seq).toBe(151);
     await sse.cancel();
-  });
+    // 150 seals and 1.5 MB through the bridge: about 4 s alone, more beside the other files.
+  }, 20_000);
 
   it("refuses a replayed stream request (GET spends the nonce)", async () => {
     const dev = await newAccount();

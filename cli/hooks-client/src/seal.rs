@@ -134,6 +134,8 @@ pub struct SealedContent {
     pub content_type: Option<String>,
     /// Strict hooks only: the public URL the relay was reached at.
     pub url: Option<String>,
+    /// The relay answered this delivery with the hook's offline notice (PROTOCOL §4a).
+    pub notice: bool,
     pub body: Vec<u8>,
 }
 
@@ -144,6 +146,8 @@ struct ContentMeta {
     content_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    notice: bool,
 }
 
 /// The plaintext: the JSON of everything but the body, `\n`, then the body's raw bytes.
@@ -152,6 +156,7 @@ pub fn encode_content(c: &SealedContent) -> Vec<u8> {
         headers: c.headers.clone(),
         content_type: c.content_type.clone(),
         url: c.url.clone(),
+        notice: c.notice,
     };
     let mut out = serde_json::to_vec(&meta).expect("json");
     out.push(b'\n');
@@ -170,6 +175,7 @@ pub fn decode_content(pt: &[u8]) -> std::result::Result<SealedContent, String> {
         headers: meta.headers,
         content_type: meta.content_type,
         url: meta.url,
+        notice: meta.notice,
         body: pt[nl + 1..].to_vec(),
     })
 }
@@ -362,6 +368,7 @@ impl Opener {
         }
         e.headers = content.headers;
         e.content_type = content.content_type;
+        e.notice = content.notice;
         e.body = STANDARD.encode(&content.body);
         Ok(e)
     }
@@ -585,6 +592,47 @@ mod tests {
     }
 
     #[test]
+    fn the_offline_notice_flag_is_read_from_the_sealed_content_only() {
+        let relay = SigningKey::from_bytes(&[4; 32]);
+        let key = SealKey::generate().unwrap();
+        let mut opener = Opener::new(
+            "dev_1",
+            Some(&URL_SAFE_NO_PAD.encode(relay.verifying_key().as_bytes())),
+        )
+        .unwrap();
+        let pk = key.public_bytes();
+        opener.add_key(key);
+        let meta = Event {
+            seq: 3,
+            id: "evt_n".into(),
+            hook_id: "hk_n".into(),
+            received_at: 1,
+            verified: true,
+            preset: "twilio".into(),
+            ..Event::default()
+        };
+        let mut content = SealedContent {
+            content_type: Some("application/x-www-form-urlencoded".into()),
+            notice: true,
+            body: b"From=%2B15005550001&Body=hi".to_vec(),
+            ..SealedContent::default()
+        };
+        let opened = opener
+            .open(seal_event(&relay, "dev_1", &pk, &meta, &content).unwrap())
+            .unwrap();
+        assert!(opened.notice);
+        content.notice = false;
+        let plain = opener
+            .open(seal_event(&relay, "dev_1", &pk, &meta, &content).unwrap())
+            .unwrap();
+        assert!(!plain.notice);
+        // A flag beside the envelope (not sealed) is the sender's word, and is replaced on open.
+        let mut claimed = seal_event(&relay, "dev_1", &pk, &meta, &content).unwrap();
+        claimed.notice = true;
+        assert!(!opener.open(claimed).unwrap().notice);
+    }
+
+    #[test]
     fn seals_and_opens_a_strict_event_verifying_the_provider_signature_at_received_at() {
         let relay = SigningKey::from_bytes(&[3; 32]);
         let key = SealKey::generate().unwrap();
@@ -626,6 +674,7 @@ mod tests {
             headers: BTreeMap::from([("stripe-signature".into(), format!("t={t},v1={sig}"))]),
             content_type: Some("application/json".into()),
             url: Some("https://relay.example/h/hk_x".into()),
+            notice: false,
             body: body.to_vec(),
         };
         let opened = opener

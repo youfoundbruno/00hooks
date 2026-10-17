@@ -39,6 +39,8 @@ export interface SealedContent {
   contentType: string | null;
   /** Strict hooks only: the public URL the relay was reached at (Twilio signs it). */
   url?: string;
+  /** The relay answered this delivery with the hook's offline notice (PROTOCOL §4a). */
+  notice?: true;
   body: Uint8Array;
 }
 
@@ -83,6 +85,7 @@ export function sealAad(hookId: string, seq: number, id: string): Uint8Array<Arr
 export function encodeContent(c: SealedContent): Uint8Array<ArrayBuffer> {
   const meta: Record<string, unknown> = { headers: c.headers, contentType: c.contentType };
   if (c.url !== undefined) meta.url = c.url;
+  if (c.notice) meta.notice = true;
   return concatBytes(utf8(JSON.stringify(meta)), utf8("\n"), c.body);
 }
 
@@ -93,8 +96,15 @@ export function decodeContent(pt: Uint8Array): SealedContent {
     headers: Record<string, string>;
     contentType: string | null;
     url?: string;
+    notice?: boolean;
   };
-  return { headers: meta.headers, contentType: meta.contentType, ...(meta.url !== undefined ? { url: meta.url } : {}), body: pt.slice(nl + 1) };
+  return {
+    headers: meta.headers,
+    contentType: meta.contentType,
+    ...(meta.url !== undefined ? { url: meta.url } : {}),
+    ...(meta.notice === true ? { notice: true as const } : {}),
+    body: pt.slice(nl + 1),
+  };
 }
 
 /** Seals `plaintext` to one device key. */

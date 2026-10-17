@@ -10,7 +10,7 @@ import { isId } from "./encoding.ts";
 import { HttpError, json, notFound, readLimited, tooLarge } from "./http.ts";
 import { createHook, deleteHook, getHook, listHooks, patchHook, rotateHook } from "./hooks.ts";
 import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
-import { receive } from "./receive.ts";
+import { receive, receiveGet } from "./receive.ts";
 import { ack, openStream } from "./stream.ts";
 import { PROTOCOLS, STREAM_PROTOCOL, VERSION } from "./version.ts";
 
@@ -43,6 +43,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   // Webhook deliveries.
   const h = /^\/h\/([^/]+)\/?$/.exec(path);
   if (h) {
+    // GET is only ever an endpoint check (Meta's verify token), answered by the presets that have one.
+    if (method === "GET") return receiveGet(request, env, ctx, h[1]!);
     if (method !== "POST" && method !== "PUT" && method !== "PATCH") return notFound();
     return receive(request, env, ctx, h[1]!);
   }

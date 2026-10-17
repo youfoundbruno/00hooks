@@ -29,6 +29,7 @@ export const PRESETS = [
   "linear",
   "shopify",
   "twilio",
+  "meta",
   "hmac",
   "token",
   "unverified",
@@ -89,6 +90,17 @@ export interface Spec {
   keep: string[];
   /** An endpoint check the preset answers after verification. */
   handshake?: "slack-url-verification";
+  /**
+   * An endpoint check made with a GET before the provider sends anything (Meta's `hub.challenge`):
+   * answered at the edge when the request carries the hook's verify token. Never stored.
+   */
+  getHandshake?: "meta-subscribe";
+  /**
+   * The provider takes a reply in the HTTP response, so the relay can answer with the hook's
+   * offline notice while no device is connected (PROTOCOL §4a). How to name the sender (for the
+   * once-a-day cap) and how to write the answer.
+   */
+  notice?: "twiml" | "slack-command";
 }
 
 const GITHUB_KEEP = [
@@ -164,6 +176,7 @@ export const SPECS: Record<Preset, Spec> = {
     eventTypeSource: "signed",
     keep: ["x-slack-retry-num", "x-slack-retry-reason"],
     handshake: "slack-url-verification",
+    notice: "slack-command",
   },
   linear: {
     secret: "provided",
@@ -205,6 +218,22 @@ export const SPECS: Record<Preset, Spec> = {
     eventType: null,
     eventTypeSource: "none",
     keep: ["i-twilio-idempotency-token"],
+    notice: "twiml",
+  },
+  // Meta (WhatsApp Cloud API, Messenger, Instagram): `X-Hub-Signature-256` is HMAC-SHA256 of the
+  // raw body under the app secret. No timestamp and no delivery id, so the body hash is the mark;
+  // the body's `object` (`whatsapp_business_account`, `page`, `instagram`) is the signed type.
+  meta: {
+    secret: "provided",
+    mac: "hmac-sha256",
+    key: "utf8",
+    sig: { header: "x-hub-signature-256", format: { kind: "single", prefix: "sha256=" }, encoding: "hex" },
+    signed: [{ body: true }],
+    dedupe: [{ bodyHash: true }],
+    eventType: { bodyFields: ["object"] },
+    eventTypeSource: "signed",
+    keep: [],
+    getHandshake: "meta-subscribe",
   },
   hmac: {
     secret: "generated",
@@ -260,7 +289,7 @@ function field(name: string, message: string): never {
  * Validates a `Verify` object from a create request. Returns the stored config and, when the
  * caller supplied one, its secret (otherwise the relay generates it, when the preset allows).
  */
-export function parseVerify(raw: unknown): { config: VerifyConfig; secret: string | null } {
+export function parseVerify(raw: unknown): { config: VerifyConfig; secret: string | null; verifyToken: string | null } {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) field("verify", "verify must be an object.");
   const v = raw as Record<string, unknown>;
   const preset = v.preset;
@@ -324,9 +353,21 @@ export function parseVerify(raw: unknown): { config: VerifyConfig; secret: strin
     if (typeof header !== "string" || !HEADER_NAME.test(header)) field("verify.header", "verify.header must be a header name.");
     config.header = header.toLowerCase();
   }
+  // Meta's verify token: the string the provider's GET handshake must carry. Generated when absent;
+  // either way it is kept only as a keyed hash and never returned after creation.
+  let verifyToken: string | null = null;
+  if (v.verifyToken !== undefined) {
+    if (!spec.getHandshake) field("verify.verifyToken", "Only the meta preset takes verifyToken.");
+    if (typeof v.verifyToken !== "string" || !VERIFY_TOKEN.test(v.verifyToken)) {
+      field("verify.verifyToken", "verify.verifyToken must be 8 to 200 printable characters, without spaces.");
+    }
+    verifyToken = v.verifyToken;
+  }
   if (strict) config.strict = true;
-  return { config, secret };
+  return { config, secret, verifyToken };
 }
+
+const VERIFY_TOKEN = /^[\x21-\x7e]{8,200}$/;
 
 /** Whether the relay holds a secret for a hook with this config (never for a strict hook). */
 export function presetTakesSecret(p: Preset, strict = false): boolean {
@@ -771,4 +812,125 @@ export function strictHeaders(config: VerifyConfig, headers: Headers): Record<st
     if (v !== null) out[n] = v.slice(0, 4096);
   }
   return out;
+}
+
+// ── Meta's GET handshake (PROTOCOL §4) ───────────────────────────────────────
+
+/** A challenge echoed back: short, and only characters that can't make the answer anything else. */
+const CHALLENGE = /^[A-Za-z0-9._~-]{1,200}$/;
+
+/**
+ * What a GET handshake asks: `hub.mode=subscribe`, the verify token it presents and the challenge to
+ * echo. Null when the request isn't one (wrong mode, a missing or unsafe challenge).
+ */
+export function metaSubscribe(url: URL): { token: string; challenge: string } | null {
+  const q = url.searchParams;
+  if (q.get("hub.mode") !== "subscribe") return null;
+  const token = q.get("hub.verify_token");
+  const challenge = q.get("hub.challenge");
+  if (token === null || challenge === null || !CHALLENGE.test(challenge)) return null;
+  return { token, challenge };
+}
+
+export function challengeAnswer(challenge: string): Response {
+  return new Response(challenge, {
+    status: 200,
+    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
+  });
+}
+
+/** A fresh verify token: 24 random bytes, base64url (32 characters). */
+export function generateVerifyToken(): string {
+  return toBase64Url(randomBytes(24));
+}
+
+// ── Offline notices (PROTOCOL §4a) ───────────────────────────────────────────
+
+/** A hook's offline notice: the text, and how long no device may have been connected first. */
+export interface OfflineNotice {
+  text: string;
+  afterMinutes: number;
+}
+
+export const NOTICE_MAX_CHARS = 320;
+export const NOTICE_MAX_MINUTES = 7 * 24 * 60;
+/** One notice per sender per hook in this long. */
+export const NOTICE_PER_SENDER_MS = 24 * 3600_000;
+
+/** Whether a preset's provider takes a reply in the HTTP response, so a notice can be sent. */
+export function presetTakesNotice(p: Preset): boolean {
+  return SPECS[p].notice !== undefined;
+}
+
+/** Validates `offlineNotice` from a create or update: null clears it. */
+export function parseOfflineNotice(raw: unknown, preset: Preset): OfflineNotice | null {
+  if (raw === null) return null;
+  if (!presetTakesNotice(preset)) {
+    field(
+      "offlineNotice",
+      `${preset} answers through an API call, not in the webhook's response, so the relay can't send a notice for it.`,
+    );
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) field("offlineNotice", "offlineNotice must be an object or null.");
+  const v = raw as Record<string, unknown>;
+  const text = typeof v.text === "string" ? v.text.trim() : "";
+  // Printable text and line breaks only: it goes back to the sender as it is.
+  if (text.length < 1 || [...text].length > NOTICE_MAX_CHARS || /[\u0000-\u0009\u000b-\u001f\u007f]/.test(text)) {
+    field("offlineNotice.text", `offlineNotice.text must be 1 to ${NOTICE_MAX_CHARS} characters of text.`);
+  }
+  const m = v.afterMinutes;
+  if (typeof m !== "number" || !Number.isInteger(m) || m < 1 || m > NOTICE_MAX_MINUTES) {
+    field("offlineNotice.afterMinutes", `offlineNotice.afterMinutes must be a whole number from 1 to ${NOTICE_MAX_MINUTES}.`);
+  }
+  return { text, afterMinutes: m as number };
+}
+
+/**
+ * Who a delivery is from, for the once-a-day cap; null when it isn't a message a notice could answer
+ * (a Twilio status callback or call, a Slack event rather than a slash command). Read only after
+ * the delivery verified.
+ */
+export function noticeSender(config: VerifyConfig, body: Uint8Array, headers: Headers): string | null {
+  const how = SPECS[config.preset].notice;
+  if (!how) return null;
+  const ct = (headers.get("content-type") ?? "").toLowerCase();
+  if (!ct.startsWith("application/x-www-form-urlencoded")) return null;
+  const form = new URLSearchParams(new TextDecoder().decode(body));
+  if (how === "twiml") {
+    // An incoming message: it has a MessageSid and a sender, and isn't a status callback.
+    const from = form.get("From");
+    if (!form.get("MessageSid") || form.has("MessageStatus") || !from) return null;
+    return `from:${from.slice(0, 200)}`;
+  }
+  const team = form.get("team_id");
+  const user = form.get("user_id");
+  if (!form.get("command") || !team || !user) return null;
+  return `user:${team.slice(0, 100)}:${user.slice(0, 100)}`;
+}
+
+function xmlEscape(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+/**
+ * The answer to a delivery the provider expects a reply to: TwiML for Twilio (empty, or the notice
+ * as a `<Message>`), an ephemeral message for a Slack slash command. Null for everything else, which
+ * gets the usual JSON.
+ */
+export function providerAnswer(config: VerifyConfig, notice: string | null, received: Record<string, unknown>): Response | null {
+  const how = SPECS[config.preset].notice;
+  if (how === "twiml") {
+    const inner = notice === null ? "" : `<Message>${xmlEscape(notice)}</Message>`;
+    return new Response(`<?xml version="1.0" encoding="UTF-8"?><Response>${inner}</Response>`, {
+      status: 200,
+      headers: { "Content-Type": "text/xml; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+  if (how === "slack-command" && notice !== null) {
+    return new Response(JSON.stringify({ response_type: "ephemeral", text: notice, ...received }), {
+      status: 200,
+      headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+  return null;
 }

@@ -271,7 +271,8 @@ enum HooksCmd {
         #[arg(long)]
         prefix: Option<String>,
         /// Read the sender's existing secret from stdin instead of letting the relay generate one.
-        /// Required for stripe, slack, linear, shopify and twilio, which issue their own.
+        /// Required for stripe, slack, linear, shopify, twilio and meta (the app secret), which issue
+        /// their own.
         #[arg(long)]
         secret_stdin: bool,
         /// standard-webhooks-ed25519: the sender's public key (whpk_…). Not a secret.

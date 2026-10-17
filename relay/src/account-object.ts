@@ -26,6 +26,14 @@ import {
 export const NONCE_TTL_MS = 600_000;
 /** Dedupe marks: providers that sign no timestamp retry for hours, so keep them a week. */
 export const DEDUPE_TTL_MS = 7 * 24 * 3600_000;
+/** One offline notice per sender per hook in this long (PROTOCOL §4a). */
+export const NOTICE_TTL_MS = 24 * 3600_000;
+/**
+ * A device stream counts as connected while its socket is open and has shown life this recently:
+ * it opened, or answered the Worker's ping (every 30 s, auto-answered without waking the object).
+ * A socket the runtime still holds but nobody pings is a stream that went away.
+ */
+export const STREAM_ALIVE_MS = 90_000;
 /** Audit entries and the hourly counts are kept this long. */
 export const AUDIT_TTL_MS = 90 * 24 * 3600_000;
 /** A backlog page: the Worker asks for the next one once it has written this one out. */
@@ -72,12 +80,17 @@ export interface AppendInput {
   content: Omit<SealedContent, "body">;
   body: Uint8Array;
   receivedAt: number;
+  /**
+   * The hook has an offline notice and this delivery names a sender: `mark` is the sender's keyed
+   * hash, `afterMs` how long no device stream may have been connected before a notice is due.
+   */
+  notice?: { mark: string; afterMs: number };
 }
 
 export type AppendResult =
   | { duplicate: true }
   | { duplicate: false; full: true }
-  | { duplicate: false; full: false; seq: number; id: string; sealedFor: number };
+  | { duplicate: false; full: false; seq: number; id: string; sealedFor: number; notice: boolean };
 
 /** The per-socket state, kept in the WebSocket's attachment so it survives hibernation. */
 interface Attachment {
@@ -86,6 +99,8 @@ interface Attachment {
   cursor: number;
   /** True while the backlog is being paged out; live events wait for the pages. */
   catchingUp: boolean;
+  /** When the stream opened (ms): its first sign of life, before any ping. */
+  openedAt?: number;
 }
 
 interface EventRow extends Record<string, SqlStorageValue> {
@@ -349,6 +364,12 @@ export class AccountObject extends DurableObject<Env> {
       const usage = this.usage();
       const quota = this.quota();
       if (usage.events + 1 > quota.events || usage.bytes + estimate > quota.bytes) return { duplicate: false, full: true };
+      // Decided before sealing, so the devices read that the sender was answered.
+      const notice = input.notice ? this.noticeDue(input.hookId, input.notice, input.receivedAt) : false;
+      if (notice) {
+        plaintext.fill(0);
+        plaintext = encodeContent({ ...input.content, notice: true, body: input.body });
+      }
 
       const seq = this.head() + 1;
       const id = newId("evt");
@@ -374,6 +395,14 @@ export class AccountObject extends DurableObject<Env> {
       this.ctx.storage.transactionSync(() => {
         for (const key of new Set(input.dedupeKeys)) {
           this.sql.exec("INSERT INTO seen (hook_id, key, at) VALUES (?, ?, ?)", input.hookId, key, input.receivedAt);
+        }
+        if (notice) {
+          this.sql.exec(
+            "INSERT INTO notices (hook_id, mark, at) VALUES (?, ?, ?) ON CONFLICT(hook_id, mark) DO UPDATE SET at = excluded.at",
+            input.hookId,
+            input.notice!.mark,
+            input.receivedAt,
+          );
         }
         this.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", seq);
         // Routing metadata only: the body and headers columns stay empty (they held plaintext in
@@ -404,13 +433,41 @@ export class AccountObject extends DurableObject<Env> {
         }
         this.setUsage({ events: usage.events + 1, bytes: usage.bytes + bytes });
       });
-      return { duplicate: false, full: false, seq, id, sealedFor: envelopes.length };
+      return { duplicate: false, full: false, seq, id, sealedFor: envelopes.length, notice };
     });
     if (!result.duplicate && !result.full) {
       this.deliverLive(result.seq);
       await this.ensureAlarm();
     }
     return result;
+  }
+
+  /**
+   * Whether an offline notice is due (PROTOCOL §4a): no device stream is connected, none has been
+   * for `afterMs`, and this sender (a keyed hash) hasn't had one from this hook in the last day.
+   */
+  private noticeDue(hookId: string, notice: { mark: string; afterMs: number }, now: number): boolean {
+    let seen = this.sql.exec<{ value: number }>("SELECT value FROM meta WHERE key = 'stream_seen'").toArray()[0]?.value;
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      const pong = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0;
+      const alive = Math.max(att?.openedAt ?? 0, pong);
+      if (ws.readyState === 1 && now - alive < STREAM_ALIVE_MS) return false;
+      seen = Math.max(seen ?? 0, alive);
+    }
+    if (seen !== undefined && now - seen < notice.afterMs) return false;
+    const last = this.sql
+      .exec<{ at: number }>("SELECT at FROM notices WHERE hook_id = ? AND mark = ?", hookId, notice.mark)
+      .toArray()[0]?.at;
+    return last === undefined || now - last >= NOTICE_TTL_MS;
+  }
+
+  /** A device stream was connected until now: the offline clock starts again from here. */
+  private streamSeen(): void {
+    this.sql.exec(
+      "INSERT INTO meta (key, value) VALUES ('stream_seen', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      Date.now(),
+    );
   }
 
   /** Counts a failed verification (counted, never stored: PROTOCOL §4). */
@@ -585,7 +642,8 @@ export class AccountObject extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [deviceId]);
-    const att: Attachment = { deviceId, cursor: after, catchingUp: true };
+    this.streamSeen();
+    const att: Attachment = { deviceId, cursor: after, catchingUp: true, openedAt: Date.now() };
     const ready = { t: "ready", accountId, deviceId, after, head, protocol: STREAM_PROTOCOL, sealKid: device.sealKid };
     if (this.trySend(server, JSON.stringify(ready))) this.sendPage(server, att);
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -598,6 +656,7 @@ export class AccountObject extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    this.streamSeen();
     try {
       ws.close(code === 1005 || code === 1006 ? 1000 : code, reason);
     } catch {
@@ -606,6 +665,7 @@ export class AccountObject extends DurableObject<Env> {
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
+    this.streamSeen();
     try {
       ws.close(1011, "error");
     } catch {
@@ -771,6 +831,7 @@ export class AccountObject extends DurableObject<Env> {
     this.pruneRetention(now);
     this.sql.exec("DELETE FROM nonces WHERE at <= ?", now - NONCE_TTL_MS);
     this.sql.exec("DELETE FROM seen WHERE at <= ?", now - DEDUPE_TTL_MS);
+    this.sql.exec("DELETE FROM notices WHERE at <= ?", now - NOTICE_TTL_MS);
     this.pruneAudit(now);
     await this.ensureAlarm(true);
   }
@@ -785,6 +846,7 @@ export class AccountObject extends DurableObject<Env> {
       [q("SELECT min(at) AS t FROM nonces"), NONCE_TTL_MS],
       [q("SELECT min(received_at) AS t FROM events"), this.retentionMs()],
       [q("SELECT min(at) AS t FROM seen"), DEDUPE_TTL_MS],
+      [q("SELECT min(at) AS t FROM notices"), NOTICE_TTL_MS],
     ];
     let next = Infinity;
     for (const [t, ttl] of due) if (t !== null) next = Math.min(next, t + ttl + 1);
@@ -847,6 +909,10 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS seen (hook_id TEXT NOT NULL, key TEXT NOT NULL, at INTEGER NOT NULL,
      PRIMARY KEY (hook_id, key)) WITHOUT ROWID`,
   "CREATE INDEX IF NOT EXISTS seen_at ON seen(at)",
+  // Offline notices sent (PROTOCOL §4a): the sender only as a keyed hash, never the address.
+  `CREATE TABLE IF NOT EXISTS notices (hook_id TEXT NOT NULL, mark TEXT NOT NULL, at INTEGER NOT NULL,
+     PRIMARY KEY (hook_id, mark)) WITHOUT ROWID`,
+  "CREATE INDEX IF NOT EXISTS notices_at ON notices(at)",
   "CREATE TABLE IF NOT EXISTS pruned (from_seq INTEGER NOT NULL, to_seq INTEGER NOT NULL, reason TEXT NOT NULL)",
   `CREATE TABLE IF NOT EXISTS verify_failures (hook_id TEXT NOT NULL, hour INTEGER NOT NULL, count INTEGER NOT NULL,
      PRIMARY KEY (hook_id, hour)) WITHOUT ROWID`,

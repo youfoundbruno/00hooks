@@ -421,7 +421,20 @@ impl Client {
 
     /// `POST /v1/hooks`. `verify` is `{ "preset": …, …fields }`.
     pub async fn create_hook(&self, name: &str, verify: serde_json::Value) -> Result<CreatedHook> {
-        let body = json!({ "name": name, "verify": verify });
+        self.create_hook_with(name, verify, None).await
+    }
+
+    /// `POST /v1/hooks` with an offline notice (PROTOCOL §4a), for presets that can carry one.
+    pub async fn create_hook_with(
+        &self,
+        name: &str,
+        verify: serde_json::Value,
+        offline_notice: Option<&OfflineNotice>,
+    ) -> Result<CreatedHook> {
+        let mut body = json!({ "name": name, "verify": verify });
+        if let Some(n) = offline_notice {
+            body["offlineNotice"] = serde_json::to_value(n).expect("json");
+        }
         self.call(Method::POST, "/v1/hooks", Some(body), Auth::Signed)
             .await
     }

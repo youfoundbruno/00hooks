@@ -4,10 +4,22 @@
 import { accountStub } from "./auth.ts";
 import { isId } from "./encoding.ts";
 import { error, json, notFound, readLimited, tooLarge, unavailable } from "./http.ts";
-import { currentSecrets, type HookRow } from "./hooks.ts";
+import { constantTimeEqualStrings } from "./encoding.ts";
+import { currentSecrets, offlineNoticeOf, verifyTokenHash, type HookRow } from "./hooks.ts";
 import { clientKey } from "./ip.ts";
 import { pepperedHash } from "./seal.ts";
-import { handshakeAnswer, keptHeaders, strictHeaders, verifyDelivery, type VerifyConfig } from "./presets.ts";
+import {
+  SPECS,
+  challengeAnswer,
+  handshakeAnswer,
+  keptHeaders,
+  metaSubscribe,
+  noticeSender,
+  providerAnswer,
+  strictHeaders,
+  verifyDelivery,
+  type VerifyConfig,
+} from "./presets.ts";
 
 /** The Rate Limiting bindings' period (wrangler.jsonc): what `Retry-After` says. */
 export const RATE_LIMIT_PERIOD_S = 10;
@@ -56,6 +68,15 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   if (handshake) return handshake;
 
   const strict = config.strict === true;
+  // The offline notice (PROTOCOL §4a): only for a delivery the relay verified itself, from a sender
+  // it can name; the DO decides (no device connected for long enough, and not yet today for this
+  // sender) in the same transaction as the append. The sender is kept only as a keyed hash.
+  const offline = offlineNoticeOf(hook);
+  const sender = offline && verdict.verified && !strict ? noticeSender(config, body, request.headers) : null;
+  const notice =
+    offline && sender
+      ? { mark: await pepperedHash(env.HASH_PEPPER, `notice:${hookId}:${sender}`), afterMs: offline.afterMinutes * 60_000 }
+      : undefined;
   // Marks are stored as keyed hashes: a delivery id or an event id read from the body is content
   // too, and storage keeps none in the clear.
   const dedupeKeys = await Promise.all(verdict.dedupeKeys.map((k) => pepperedHash(env.HASH_PEPPER, `dedupe:${hookId}:${k}`)));
@@ -74,8 +95,9 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
     },
     body,
     receivedAt: now,
+    ...(notice ? { notice } : {}),
   });
-  if (result.duplicate) return json({ duplicate: true });
+  if (result.duplicate) return providerAnswer(config, null, { duplicate: true }) ?? json({ duplicate: true });
   if (result.full) {
     return error(
       429,
@@ -87,6 +109,36 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   }
   ctx.waitUntil(env.DB.prepare("UPDATE hooks SET last_event_at = ? WHERE id = ?").bind(now, hookId).run());
   // GitHub's `ping` (sent when a webhook is created) is stored like any event, so a new hook can be
-  // seen working end to end, and answered 200 like any delivery.
-  return json({ received: result.id });
+  // seen working end to end, and answered 200 like any delivery. A provider that takes its answer
+  // in the response (Twilio's TwiML) gets one, with the notice when it was due.
+  const said = result.notice && offline ? offline.text : null;
+  return providerAnswer(config, said, { received: result.id }) ?? json({ received: result.id });
+}
+
+/**
+ * `GET /h/<hookId>`: a provider checking the endpoint before it sends anything (Meta's
+ * `hub.mode=subscribe` with the hook's verify token and a challenge). The same cheap checks as a
+ * delivery come first; then the token must match the hook's (compared as keyed hashes), and the
+ * challenge is echoed as plain text. Nothing is stored; a wrong token is a counted failure.
+ */
+export async function receiveGet(request: Request, env: Env, ctx: ExecutionContext, hookId: string): Promise<Response> {
+  if (!env.HOOK_LIMIT || !env.RECEIVE_IP_LIMIT || !env.RELAY_SIGNING_KEY) return unavailable();
+  if (!isId("hk", hookId)) return notFound();
+  if (!(await env.RECEIVE_IP_LIMIT.limit({ key: clientKey(request) })).success) {
+    return slowDown("Too many deliveries from this address; slow down.");
+  }
+  const hook = await env.DB.prepare("SELECT * FROM hooks WHERE id = ?").bind(hookId).first<HookRow>();
+  if (!hook || hook.enabled !== 1) return notFound();
+  const config = JSON.parse(hook.verify) as VerifyConfig;
+  if (!SPECS[config.preset].getHandshake || !hook.handshake_token_hash) return notFound();
+  if (!(await env.HOOK_LIMIT.limit({ key: hookId })).success) {
+    return slowDown("Too many deliveries to this hook; slow down.");
+  }
+  const ask = metaSubscribe(new URL(request.url));
+  const presented = ask ? await verifyTokenHash(env, hookId, ask.token) : "";
+  if (!ask || !constantTimeEqualStrings(presented, hook.handshake_token_hash)) {
+    ctx.waitUntil(accountStub(env, hook.account_id).recordFailure(hookId).catch(() => {}));
+    return error(401, "signature", "The endpoint check doesn't carry this hook's verify token.");
+  }
+  return challengeAnswer(ask.challenge);
 }

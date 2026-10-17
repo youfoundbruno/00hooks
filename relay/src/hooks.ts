@@ -4,8 +4,18 @@
 import { accountStub, type Principal } from "./auth.ts";
 import { newId } from "./encoding.ts";
 import { HttpError, error, invalid, json, notFound, parseJsonObject } from "./http.ts";
-import { generateSecret, parseVerify, presetTakesSecret, relayGeneratesSecret, type VerifyConfig } from "./presets.ts";
-import { openSecret, sealSecret } from "./seal.ts";
+import {
+  generateSecret,
+  generateVerifyToken,
+  parseOfflineNotice,
+  parseVerify,
+  presetTakesSecret,
+  relayGeneratesSecret,
+  SPECS,
+  type OfflineNotice,
+  type VerifyConfig,
+} from "./presets.ts";
+import { openSecret, pepperedHash, sealSecret } from "./seal.ts";
 
 export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 /** Phase 0 keeps bodies in the object's SQLite rows (2 MB each at most), so stay under that. */
@@ -25,6 +35,24 @@ export interface HookRow {
   max_body_bytes: number;
   created_at: number;
   last_event_at: number | null;
+  /** Meta's verify token, as a keyed hash (HASH_PEPPER): the GET handshake is checked against it. */
+  handshake_token_hash: string | null;
+  /** The offline notice, as JSON (PROTOCOL §4a), or null. */
+  offline_notice: string | null;
+}
+
+/** The keyed hash a hook's verify token is kept as. */
+export function verifyTokenHash(env: Env, hookId: string, token: string): Promise<string> {
+  return pepperedHash(env.HASH_PEPPER, `verify-token:${hookId}:${token}`);
+}
+
+export function offlineNoticeOf(row: HookRow): OfflineNotice | null {
+  if (!row.offline_notice) return null;
+  try {
+    return JSON.parse(row.offline_notice) as OfflineNotice;
+  } catch {
+    return null;
+  }
 }
 
 export function hookUrl(origin: string, id: string): string {
@@ -41,6 +69,7 @@ export function hookJson(row: HookRow, origin: string) {
     maxBodyBytes: row.max_body_bytes,
     createdAt: row.created_at,
     lastEventAt: row.last_event_at,
+    offlineNotice: offlineNoticeOf(row),
   };
 }
 
@@ -70,8 +99,12 @@ async function load(env: Env, caller: Principal, id: string): Promise<HookRow> {
 export async function createHook(env: Env, caller: Principal, origin: string, body: Uint8Array): Promise<Response> {
   const input = parseJsonObject(body);
   const name = hookName(input.name);
-  const { config, secret: supplied } = parseVerify(input.verify);
+  const { config, secret: supplied, verifyToken: suppliedToken } = parseVerify(input.verify);
+  const notice = input.offlineNotice === undefined ? null : parseOfflineNotice(input.offlineNotice, config.preset);
   const id = newId("hk");
+  // Meta's GET handshake needs a verify token: the caller's, or one made here and shown once.
+  const generatedToken = SPECS[config.preset].getHandshake && suppliedToken === null ? generateVerifyToken() : null;
+  const token = suppliedToken ?? generatedToken;
   // A strict hook's secret stays on the devices; a provider-issued one was checked to be supplied.
   const generated =
     supplied === null && presetTakesSecret(config.preset, config.strict) && relayGeneratesSecret(config.preset)
@@ -80,15 +113,34 @@ export async function createHook(env: Env, caller: Principal, origin: string, bo
   const secret = supplied ?? generated;
   const now = Date.now();
   await env.DB.prepare(
-    `INSERT INTO hooks (id, account_id, name, enabled, verify, secret_sealed, max_body_bytes, created_at)
-     VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
+    `INSERT INTO hooks (id, account_id, name, enabled, verify, secret_sealed, max_body_bytes, created_at,
+       handshake_token_hash, offline_notice)
+     VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, caller.accountId, name, JSON.stringify(config), secret ? await sealSecret(env.SECRETS_KEY, id, secret) : null, DEFAULT_MAX_BODY_BYTES, now)
+    .bind(
+      id,
+      caller.accountId,
+      name,
+      JSON.stringify(config),
+      secret ? await sealSecret(env.SECRETS_KEY, id, secret) : null,
+      DEFAULT_MAX_BODY_BYTES,
+      now,
+      token ? await verifyTokenHash(env, id, token) : null,
+      notice ? JSON.stringify(notice) : null,
+    )
     .run();
   await accountStub(env, caller.accountId).audit({ kind: "hook.created", actor: caller.actor, subject: id, name });
   const row = await load(env, caller, id);
   // The secret appears here only when the relay generated it: a caller-supplied one is never echoed.
-  return json({ hook: hookJson(row, origin), url: hookUrl(origin, id), ...(generated ? { secret: generated } : {}) }, 201);
+  return json(
+    {
+      hook: hookJson(row, origin),
+      url: hookUrl(origin, id),
+      ...(generated ? { secret: generated } : {}),
+      ...(generatedToken ? { verifyToken: generatedToken } : {}),
+    },
+    201,
+  );
 }
 
 export async function listHooks(env: Env, caller: Principal, origin: string): Promise<Response> {
@@ -119,8 +171,13 @@ export async function patchHook(env: Env, caller: Principal, origin: string, id:
     }
     maxBodyBytes = v;
   }
-  await env.DB.prepare("UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ? WHERE id = ?")
-    .bind(name, enabled, maxBodyBytes, id)
+  let notice = row.offline_notice;
+  if (input.offlineNotice !== undefined) {
+    const parsed = parseOfflineNotice(input.offlineNotice, (JSON.parse(row.verify) as VerifyConfig).preset);
+    notice = parsed ? JSON.stringify(parsed) : null;
+  }
+  await env.DB.prepare("UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ? WHERE id = ?")
+    .bind(name, enabled, maxBodyBytes, notice, id)
     .run();
   return json(hookJson(await load(env, caller, id), origin));
 }

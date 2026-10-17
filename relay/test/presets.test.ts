@@ -279,6 +279,7 @@ describe("what each preset signs", () => {
       linear: "signed",
       shopify: "claimed",
       twilio: "none",
+      meta: "signed",
       hmac: "none",
       token: "none",
       unverified: "none",
