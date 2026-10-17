@@ -787,8 +787,17 @@ dependencies = [
 name = "hooks-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
  "clap",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
  "hooks-client",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1898,6 +1907,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
