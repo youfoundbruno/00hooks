@@ -5,15 +5,22 @@
 //! dropped connection is retried with jittered backoff; and each `hook` event goes through the
 //! delivery rule: **record** it in the local store, **acknowledge** it to the relay, then **hand it
 //! over**, skipping any id that was handed over before.
+//!
+//! An acknowledgement that fails is kept and retried with backoff while newer events keep flowing
+//! (acks are cumulative, so the next one covers it too). A `hook` message that can't be read is
+//! recorded raw in the store's quarantine and reported, never skipped silently.
 
 use std::collections::{HashSet, VecDeque};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::Client;
 use crate::backoff::{Backoff, Clock, CloseAction, Jitter, TokioClock, close_action};
 use crate::sse::{SseItem, SseParser};
-use crate::store::EventStore;
+use crate::store::{EventStore, Quarantined};
 use crate::types::{Closed, Event, Gap, Ready, Resync};
 use crate::{Error, Result};
 
@@ -60,6 +67,13 @@ pub enum StreamEvent {
         delay: Duration,
         reason: String,
     },
+    /// A `hook` message that couldn't be read. Its raw text was recorded in `path` (the store's
+    /// `quarantine.jsonl`) before anything past it was acknowledged.
+    Quarantined {
+        seq: Option<u64>,
+        path: PathBuf,
+        error: String,
+    },
     /// Something worth telling the person that doesn't stop the stream.
     Warning(String),
 }
@@ -89,8 +103,21 @@ pub struct Subscription {
     ack_through: Option<u64>,
     /// The highest seq the relay has confirmed.
     acked: u64,
+    /// Recorded through this seq, but the relay hasn't confirmed it: retried until it does.
+    unacked: Option<u64>,
+    /// Failed acknowledgements in a row.
+    ack_failures: u32,
+    /// When to retry `unacked`.
+    ack_retry: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     then: Option<Then>,
     finished: bool,
+}
+
+/// What waiting on the connection produced.
+enum Read {
+    Chunk(std::result::Result<Option<bytes::Bytes>, reqwest::Error>),
+    RetryAck,
+    Idle,
 }
 
 /// Start streaming events for the client's device into `store`. Events recorded by an earlier run
@@ -111,6 +138,9 @@ pub fn subscribe(client: Client, store: EventStore, opts: SubscribeOptions) -> S
         awaiting_ack: pending,
         ack_through,
         acked: 0,
+        unacked: None,
+        ack_failures: 0,
+        ack_retry: None,
         then: None,
         finished: false,
     }
@@ -157,6 +187,46 @@ impl Subscription {
         });
     }
 
+    /// Acknowledge everything recorded through `through`. A failure (other than the device being
+    /// refused) keeps it pending and schedules a retry with backoff; the caller goes on handing
+    /// over what is recorded, in order.
+    async fn acknowledge(&mut self, through: u64) -> Result<()> {
+        match self.client.ack(through).await {
+            Ok(acked) => {
+                self.acked = self.acked.max(acked);
+                if self.ack_failures > 0 {
+                    self.out.push_back(StreamEvent::Warning(format!(
+                        "acknowledged events through {through} after {} failed attempts",
+                        self.ack_failures
+                    )));
+                }
+                self.unacked = None;
+                self.ack_failures = 0;
+                self.ack_retry = None;
+                Ok(())
+            }
+            Err(e) if e.is_unauthorized() => Err(e),
+            Err(e) => {
+                self.unacked = Some(through);
+                self.ack_failures += 1;
+                let factor = 1u32 << (self.ack_failures - 1).min(16);
+                let delay = self
+                    .opts
+                    .min_backoff
+                    .saturating_mul(factor)
+                    .min(self.opts.max_backoff);
+                if self.ack_failures == 1 {
+                    self.out.push_back(StreamEvent::Warning(format!(
+                        "couldn't acknowledge events through {through} ({e}); they are recorded \
+                         here, and the acknowledgement is retried until the relay takes it"
+                    )));
+                }
+                self.ack_retry = Some(self.opts.clock.sleep(delay));
+                Ok(())
+            }
+        }
+    }
+
     /// The next event. Cancel-safe at the level of the delivery rule: a recorded event is never
     /// lost, and an event is marked handed-over only as this function returns it.
     pub async fn next(&mut self) -> Option<Result<StreamEvent>> {
@@ -177,17 +247,13 @@ impl Subscription {
                 return None;
             }
 
-            // 2. Acknowledge what was recorded, then release it.
-            if let Some(through) = self.ack_through {
-                match self.client.ack(through).await {
-                    Ok(acked) => self.acked = self.acked.max(acked),
-                    Err(e) if e.is_unauthorized() => return self.fail(e),
-                    Err(e) => self.out.push_back(StreamEvent::Warning(format!(
-                        "couldn't acknowledge events through {through} ({e}); they are recorded \
-                         here and will be acknowledged later"
-                    ))),
+            // 2. Acknowledge what was recorded (with anything still unacknowledged: acks are
+            //    cumulative), then release it, whether or not the relay took the ack.
+            if let Some(through) = self.ack_through.take() {
+                let through = through.max(self.unacked.unwrap_or(0));
+                if let Err(e) = self.acknowledge(through).await {
+                    return self.fail(e);
                 }
-                self.ack_through = None;
                 self.out.extend(self.awaiting_ack.drain(..));
                 continue;
             }
@@ -230,24 +296,39 @@ impl Subscription {
                 }
             }
 
-            // 5. Read, treating a silent connection as dead.
+            // 5. Read, treating a silent connection as dead, and retry a pending ack when due.
             let idle = self.opts.clock.sleep(self.opts.idle_timeout);
             let conn = self.conn.as_mut().expect("connected");
+            let retry = self.ack_retry.as_mut();
             let read = tokio::select! {
                 biased;
-                chunk = conn.chunk() => Some(chunk),
-                _ = idle => None,
+                chunk = conn.chunk() => Read::Chunk(chunk),
+                _ = async move {
+                    match retry {
+                        Some(r) => r.await,
+                        None => std::future::pending().await,
+                    }
+                } => Read::RetryAck,
+                _ = idle => Read::Idle,
             };
             match read {
-                None => {
+                Read::Idle => {
                     let secs = self.opts.idle_timeout.as_secs_f64();
                     self.schedule_reconnect(false, format!("no data for {secs:.0} s"));
                 }
-                Some(Ok(None)) => {
+                Read::RetryAck => {
+                    self.ack_retry = None;
+                    if let Some(through) = self.unacked
+                        && let Err(e) = self.acknowledge(through).await
+                    {
+                        return self.fail(e);
+                    }
+                }
+                Read::Chunk(Ok(None)) => {
                     self.schedule_reconnect(false, "the relay closed the connection".into());
                 }
-                Some(Err(e)) => self.schedule_reconnect(false, Error::from(e).to_string()),
-                Some(Ok(Some(bytes))) => {
+                Read::Chunk(Err(e)) => self.schedule_reconnect(false, Error::from(e).to_string()),
+                Read::Chunk(Ok(Some(bytes))) => {
                     if let Err(e) = self.process(&bytes) {
                         return self.fail(e);
                     }
@@ -268,6 +349,8 @@ impl Subscription {
         let mut batch: Vec<StreamEvent> = Vec::new();
         let mut hooks: Vec<Event> = Vec::new();
         let mut gaps_to = 0u64;
+        // The highest seq among `hook` messages that couldn't be read but were quarantined.
+        let mut quarantined_to = 0u64;
         for item in items {
             let ev = match item {
                 SseItem::Retry(ms) => {
@@ -291,7 +374,25 @@ impl Subscription {
                         hooks.push(e.clone());
                         batch.push(StreamEvent::Hook(e));
                     }
-                    Err(e) => batch.push(warn_unreadable("hook", ev.id.as_deref(), &e)),
+                    Err(e) => {
+                        // Kept raw, durably, before anything past it can be acknowledged.
+                        let seq = ev.id.as_deref().and_then(|i| i.parse::<u64>().ok());
+                        let q = Quarantined {
+                            at: crate::api::system_now_ms(),
+                            seq,
+                            raw_id: if seq.is_none() { ev.id.clone() } else { None },
+                            event: kind.to_string(),
+                            data: ev.data.clone(),
+                            error: e.to_string(),
+                        };
+                        let path = self.store.quarantine(&q)?;
+                        quarantined_to = quarantined_to.max(seq.unwrap_or(0));
+                        batch.push(StreamEvent::Quarantined {
+                            seq,
+                            path,
+                            error: q.error,
+                        });
+                    }
                 },
                 "gap" => match serde_json::from_str::<Gap>(&ev.data) {
                     Ok(g) => {
@@ -336,15 +437,21 @@ impl Subscription {
 
         // Record first (durably), then queue the ack; the handover waits for both.
         let fresh = self.store.record(&hooks)?;
-        if gaps_to > 0 {
-            self.store.advance_cursor(gaps_to)?;
+        if gaps_to.max(quarantined_to) > 0 {
+            self.store.advance_cursor(gaps_to.max(quarantined_to))?;
         }
         let mut fresh_ids: HashSet<String> = fresh.into_iter().map(|e| e.id).collect();
         batch.retain(|ev| match ev {
             StreamEvent::Hook(e) => fresh_ids.remove(&e.id),
             _ => true,
         });
-        let through = hooks.iter().map(|e| e.seq).max().unwrap_or(0);
+        // Everything through `through` is recorded: in the inbox, or in the quarantine.
+        let through = hooks
+            .iter()
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0)
+            .max(quarantined_to);
         if through > self.acked {
             self.ack_through = Some(through);
             self.awaiting_ack.extend(batch);

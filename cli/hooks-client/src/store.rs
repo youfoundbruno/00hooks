@@ -1,5 +1,6 @@
 //! The local state directory: the config, the stream cursor, the events recorded but not yet handed
-//! over (the inbox), and the ids already handed over (the seen set).
+//! over (the inbox), the ids already handed over (the seen set), and the quarantine: `hook` messages
+//! that couldn't be read, kept raw so nothing the relay sent is silently lost.
 //!
 //! Every file is either replaced atomically (config, cursor) or appended and fsynced (inbox, seen).
 //! A crash can leave a torn last line in an append-only file; it is skipped on the next start, when
@@ -24,6 +25,8 @@ const CONFIG: &str = "config.json";
 const CURSOR: &str = "cursor.json";
 const INBOX: &str = "inbox.jsonl";
 const SEEN: &str = "seen.jsonl";
+/// Raw `hook` messages that couldn't be read. Append-only; never compacted or reset.
+pub const QUARANTINE: &str = "quarantine.jsonl";
 const LOCK: &str = "listen.lock";
 const KEYS: &str = "keys";
 
@@ -144,6 +147,25 @@ struct CursorFile {
 #[derive(Serialize, Deserialize)]
 struct SeenLine {
     id: String,
+}
+
+/// One quarantined message: what the relay sent, exactly, and why it couldn't be read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Quarantined {
+    /// When it was quarantined, Unix ms.
+    pub at: i64,
+    /// The SSE `id` (the event's seq) when it was a number.
+    pub seq: Option<u64>,
+    /// The SSE `id` as sent, when it wasn't a number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_id: Option<String>,
+    /// The SSE event type, `hook`.
+    pub event: String,
+    /// The `data:` field, exactly as sent.
+    pub data: String,
+    /// Why it couldn't be read.
+    pub error: String,
 }
 
 /// The cursor, the inbox and the seen set.
@@ -319,6 +341,24 @@ impl EventStore {
         Ok(())
     }
 
+    /// Keep an unreadable message raw in `quarantine.jsonl` (appended and fsynced), so that
+    /// acknowledging past it loses nothing. Returns the file's path.
+    pub fn quarantine(&mut self, q: &Quarantined) -> Result<PathBuf> {
+        let path = self.dir.join(QUARANTINE);
+        let mut line = serde_json::to_vec(q).expect("json");
+        line.push(b'\n');
+        let mut f = fsutil::open_append(&path)?;
+        f.write_all(&line)?;
+        f.sync_data()?;
+        fsutil::sync_dir(&self.dir);
+        Ok(path)
+    }
+
+    /// Everything quarantined so far, oldest first.
+    pub fn quarantined(&self) -> Result<Vec<Quarantined>> {
+        read_lines(&self.dir.join(QUARANTINE))
+    }
+
     /// Recorded events not yet handed over, oldest first.
     pub fn pending(&self) -> Vec<Event> {
         self.inbox.values().cloned().collect()
@@ -467,6 +507,34 @@ mod tests {
             read_lines::<SeenLine>(&dir.join(SEEN)).unwrap().len(),
             SEEN_CAP
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quarantine_keeps_the_raw_message_durably() {
+        let dir = temp_dir("quarantine");
+        let s = StateDir::open(&dir).unwrap();
+        let mut ev = s.open_events().unwrap();
+        let q = Quarantined {
+            at: 1,
+            seq: Some(7),
+            raw_id: None,
+            event: "hook".into(),
+            data: "{\"seq\":7,\"broken".into(),
+            error: "EOF while parsing".into(),
+        };
+        let path = ev.quarantine(&q).unwrap();
+        assert_eq!(path, dir.join(QUARANTINE));
+        drop(ev);
+        // Survives a restart and isn't compacted away.
+        let ev = s.open_events().unwrap();
+        assert_eq!(ev.quarantined().unwrap(), vec![q]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(m & 0o777, 0o600);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

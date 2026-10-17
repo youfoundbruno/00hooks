@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 base64 = "0.22"
+bytes = "1"
 dirs = "7"
 ed25519-dalek = "3"
 getrandom = "0.3"

@@ -286,6 +286,13 @@ are kept 7 days (`RETENTION_DAYS`), then dropped, which shows up as a `gap`.
 
 Clients dedupe by `id` before acting, so at-least-once delivery never runs an automation twice.
 
+Because acks are cumulative, a client keeps an ack that failed and retries it with backoff (any later
+ack covers it too) while it goes on recording and handing over newer events in order; otherwise the
+relay keeps those events, and they hold every other device's deletions back, until retention. A
+`hook` message a client can't read still counts as received: the client records it raw (the
+reference client appends it to `quarantine.jsonl` in its state directory and says so) before
+acknowledging past it, so nothing is skipped silently.
+
 ## 8. Errors
 
 Every error body is `{ "error": "<code>", "message": "<one plain sentence>" }`. Codes: `unauthorized`,

@@ -221,6 +221,15 @@ pub async fn run(as_json: bool, filters: Vec<String>) -> CliResult {
                     sanitize(&reason, false)
                 ))]
             }
+            StreamEvent::Quarantined { seq, path, error } => {
+                let which = seq.map(|n| format!(" {n}")).unwrap_or_default();
+                vec![Line::Err(format!(
+                    "Event{which} arrived but couldn't be read ({}). Its raw message is kept in {}, \
+                     and it was acknowledged, so the relay won't send it again.",
+                    sanitize(&error, false),
+                    path.display()
+                ))]
+            }
             StreamEvent::Warning(w) => vec![Line::Err(sentence(&sanitize(&w, false)))],
         };
         let mut open = true;

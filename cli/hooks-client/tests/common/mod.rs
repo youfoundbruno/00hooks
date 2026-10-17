@@ -67,6 +67,16 @@ pub struct State {
     pub client_home: Option<PathBuf>,
     pub skew_refusals: usize,
     pub hooks: Vec<Value>,
+    /// Answer this many acks with `503` before taking them.
+    pub fail_acks: usize,
+    /// Acks answered with `503`.
+    pub failed_acks: usize,
+    /// Seqs whose `hook` frame is sent garbled (data that isn't an event).
+    pub garbled: HashSet<u64>,
+    /// `DELETE /v1/devices/<id>`: (the signing device, the revoked id), in order.
+    pub revocations: Vec<(String, String)>,
+    /// The enrolment code `POST /v1/enrolments/redeem` accepts.
+    pub enrolment_code: Option<String>,
     next_device: usize,
 }
 
@@ -267,6 +277,30 @@ async fn handle(st: Arc<Mutex<State>>, req: Request<Incoming>) -> Result<Resp, I
                 }
             }
         }
+        ("POST", "/v1/enrolments/redeem") => {
+            let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+            let key = URL_SAFE_NO_PAD
+                .decode(v["publicKey"].as_str().unwrap_or(""))
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .and_then(|b| VerifyingKey::from_bytes(&b).ok());
+            let mut s = st.lock().unwrap();
+            let right =
+                s.enrolment_code.is_some() && v["code"].as_str() == s.enrolment_code.as_deref();
+            match key {
+                Some(key) if right => {
+                    s.enrolment_code = None;
+                    s.next_device += 1;
+                    let id = format!("dev_{}", s.next_device);
+                    s.devices.insert(id.clone(), key);
+                    json_resp(
+                        StatusCode::OK,
+                        json!({ "accountId": "acc_1", "deviceId": id }),
+                    )
+                }
+                _ => unauthorized("unauthorized", None),
+            }
+        }
         _ => match check_signed(&st, &parts, &body) {
             Err(r) => *r,
             Ok(device) => signed_route(&st, &parts, &body, &device),
@@ -307,11 +341,35 @@ fn signed_route(
             let v: Value = serde_json::from_slice(body).unwrap_or_default();
             let through = v["through"].as_u64().unwrap_or(0);
             let mut s = st.lock().unwrap();
+            if s.fail_acks > 0 {
+                s.fail_acks -= 1;
+                s.failed_acks += 1;
+                return json_resp(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error":"internal","message":"Try again."}),
+                );
+            }
             check_recorded(&mut s, through);
             s.acks.push(through);
             s.acked = s.acked.max(through);
             let acked = s.acked;
             json_resp(StatusCode::OK, json!({ "acked": acked }))
+        }
+        ("DELETE", path) if path.starts_with("/v1/devices/") => {
+            let id = path["/v1/devices/".len()..].to_string();
+            let mut s = st.lock().unwrap();
+            if !s.devices.contains_key(&id) {
+                return json_resp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error":"not_found","message":"Nothing is here."}),
+                );
+            }
+            s.revoked.insert(id.clone());
+            s.revocations.push((device.to_string(), id));
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Full::new(Bytes::new()).boxed())
+                .unwrap()
         }
         ("GET", "/v1/stream") => {
             let last: Option<u64> = parts
@@ -339,6 +397,16 @@ fn check_recorded(s: &mut State, through: u64) {
         return;
     };
     let mut ids = HashSet::new();
+    let mut quarantined = HashSet::new();
+    let text = std::fs::read_to_string(home.join("quarantine.jsonl")).unwrap_or_default();
+    for line in text.lines() {
+        if let Some(seq) = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| v["seq"].as_u64())
+        {
+            quarantined.insert(seq);
+        }
+    }
     for name in ["inbox.jsonl", "seen.jsonl"] {
         let text = std::fs::read_to_string(home.join(name)).unwrap_or_default();
         for line in text.lines() {
@@ -353,7 +421,7 @@ fn check_recorded(s: &mut State, through: u64) {
     for e in &s.log {
         let seq = e["seq"].as_u64().unwrap();
         let id = e["id"].as_str().unwrap();
-        if seq <= through && seq > s.acked && !ids.contains(id) {
+        if seq <= through && seq > s.acked && !ids.contains(id) && !quarantined.contains(&seq) {
             s.violations
                 .push(format!("ack through {through} before {id} was recorded"));
         }
@@ -375,6 +443,16 @@ impl Body for ChanBody {
 
 fn frame(e: &Value) -> String {
     format!("id: {}\nevent: hook\ndata: {}\n\n", e["seq"], e)
+}
+
+/// The frame for `e`, garbled when the test asked for its seq to be.
+fn frame_for(st: &Arc<Mutex<State>>, e: &Value) -> String {
+    let seq = e["seq"].as_u64().unwrap();
+    if st.lock().unwrap().garbled.contains(&seq) {
+        format!("id: {seq}\nevent: hook\ndata: {{\"seq\":{seq},\"id\":\"evt_garbled\n\n")
+    } else {
+        frame(e)
+    }
 }
 
 fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn) -> Resp {
@@ -423,7 +501,7 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn) -> Resp
         let mut sent = after;
         for e in backlog.iter().take(limit) {
             // Several frames per write, split mid-frame, so the client sees odd chunk boundaries.
-            let f = frame(e);
+            let f = frame_for(&st, e);
             let (a, b) = f.split_at(f.len() / 3);
             if !send(a.to_string()).await || !send(b.to_string()).await {
                 return;
@@ -462,7 +540,7 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn) -> Resp
                     .collect()
             };
             for e in fresh {
-                if !send(frame(&e)).await {
+                if !send(frame_for(&st, &e)).await {
                     return;
                 }
                 sent = e["seq"].as_u64().unwrap();

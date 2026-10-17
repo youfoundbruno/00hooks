@@ -408,3 +408,110 @@ async fn probe_reads_ready_and_records_nothing() {
     assert_eq!(state.open_events().unwrap().cursor(), 0);
     relay.with(|s| assert!(s.acks.is_empty()));
 }
+
+#[tokio::test]
+async fn a_failed_ack_is_retried_while_newer_events_keep_flowing_in_order() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=3);
+    relay.with(|s| s.fail_acks = 1_000);
+    let (client, state, _home) = device(&relay, "ackretry").await;
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+
+    // Handed over even though the relay refuses every acknowledgement.
+    let evs = read_hooks(&mut sub, 3).await;
+    assert_eq!(hook_seqs(&evs), vec![1, 2, 3]);
+    // Newer events keep arriving, in order, while the ack is refused and retried.
+    relay.push_events(4..=5);
+    let more = read_hooks(&mut sub, 2).await;
+    assert_eq!(hook_seqs(&more), vec![4, 5]);
+    let warnings = evs
+        .iter()
+        .chain(more.iter())
+        .filter(|e| matches!(e, StreamEvent::Warning(w) if w.contains("retried")))
+        .count();
+    assert_eq!(warnings, 1, "one warning per streak, not one per attempt");
+
+    // No new event comes now: only the retry can get the ack through once the relay takes acks.
+    relay.with(|s| s.fail_acks = 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while relay.with(|s| s.acked) < 5 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the ack was never retried"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(100), sub.next()).await;
+    }
+    relay.with(|s| {
+        assert!(s.failed_acks >= 2, "{}", s.failed_acks);
+        assert!(s.violations.is_empty(), "{:?}", s.violations);
+        assert_eq!(
+            s.acks,
+            vec![5],
+            "only the successful ack is recorded, covering everything"
+        );
+    });
+}
+
+#[tokio::test]
+async fn an_unreadable_hook_frame_is_quarantined_not_skipped() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=4);
+    relay.with(|s| {
+        s.garbled.insert(2);
+    });
+    let (client, state, home) = device(&relay, "quarantine").await;
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let evs = read_hooks(&mut sub, 3).await;
+    let kinds: Vec<String> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Hook(h) => Some(format!("hook {}", h.seq)),
+            StreamEvent::Quarantined { seq, .. } => Some(format!("quarantined {seq:?}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["hook 1", "quarantined Some(2)", "hook 3", "hook 4"]
+    );
+    let path = evs
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Quarantined { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(path, home.0.join("quarantine.jsonl"));
+
+    // The raw message is on disk, and the ack past it only came after it was.
+    let q = sub.store().quarantined().unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].seq, Some(2));
+    assert_eq!(q[0].data, "{\"seq\":2,\"id\":\"evt_garbled");
+    assert_eq!(sub.store().cursor(), 4);
+    relay.with(|s| {
+        assert!(s.violations.is_empty(), "{:?}", s.violations);
+        assert_eq!(s.acked, 4);
+    });
+}
+
+#[tokio::test]
+async fn an_unreadable_last_frame_is_recorded_before_it_is_acknowledged() {
+    // Nothing readable after it: the ack still covers it, because the quarantine recorded it.
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=2);
+    relay.with(|s| {
+        s.garbled.insert(2);
+    });
+    let (client, state, _home) = device(&relay, "quarantine-last").await;
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let evs = read_hooks(&mut sub, 1).await;
+    assert_eq!(hook_seqs(&evs), vec![1]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while relay.with(|s| s.acked) < 2 {
+        assert!(std::time::Instant::now() < deadline, "never acknowledged");
+        let _ = tokio::time::timeout(Duration::from_millis(100), sub.next()).await;
+    }
+    relay.with(|s| assert!(s.violations.is_empty(), "{:?}", s.violations));
+    assert_eq!(sub.store().quarantined().unwrap().len(), 1);
+}

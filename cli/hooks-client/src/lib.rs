@@ -23,7 +23,7 @@ pub mod types;
 pub use api::Client;
 pub use error::{Error, Result, Secret, describe_skew};
 pub use keys::{DeviceKey, FileKeyStore, KeyStore, KeychainStore, MemoryKeyStore};
-pub use store::{Config, EventStore, StateDir};
+pub use store::{Config, EventStore, Quarantined, StateDir};
 pub use stream::{StreamEvent, SubscribeOptions, Subscription, subscribe};
 pub use types::*;
 
