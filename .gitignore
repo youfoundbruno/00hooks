@@ -1,0 +1,22 @@
+# build output
+/target
+node_modules/
+dist/
+.wrangler/
+*.tsbuildinfo
+coverage/
+
+# local state and secrets: never commit
+.env
+.env.*
+!.env.example
+.dev.vars
+*.pem
+*.key
+
+# editors and OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
