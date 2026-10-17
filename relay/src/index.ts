@@ -3,6 +3,7 @@
 
 import { createAccount, createEnrolment, listDevices, redeemEnrolment, revokeDevice } from "./accounts.ts";
 import { authenticate, type Caller } from "./auth.ts";
+import { describeError } from "./describe-error.ts";
 import { isId } from "./encoding.ts";
 import { HttpError, json, notFound, readLimited, tooLarge } from "./http.ts";
 import { createHook, deleteHook, getHook, listHooks, patchHook, rotateHook } from "./hooks.ts";
@@ -24,8 +25,9 @@ export default {
       return await route(request, env, ctx);
     } catch (e) {
       if (e instanceof HttpError) return e.response;
-      // Never echo the exception: it could quote a payload or a secret.
-      console.error("relay error", e instanceof Error ? e.name : "unknown");
+      // Never echo the exception to the client, and log only a scrubbed cause: quoted text is
+      // removed (a parse error can quote a payload) and the message is capped.
+      console.error("relay error", describeError(e));
       return json({ error: "internal", message: "The relay failed to handle this request." }, 500);
     }
   },
@@ -91,3 +93,4 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   return notFound();
 }
+
