@@ -1,2 +1,7 @@
 packages:
   - relay
+
+# Native binaries the relay's toolchain needs (the Workers runtime and the bundler).
+allowBuilds:
+  esbuild: true
+  workerd: true

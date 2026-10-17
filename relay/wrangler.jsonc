@@ -1,0 +1,33 @@
+// The 00hooks relay: one Worker and one Durable Object class (one object per account).
+// Self-hosting: create the D1 database and put its id below, then set the secrets listed in
+// `.dev.vars.example` with `wrangler secret put`. See README.md.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "00hooks-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-30",
+  "observability": { "enabled": true },
+
+  "durable_objects": {
+    "bindings": [{ "name": "ACCOUNT", "class_name": "AccountObject" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountObject"] }],
+
+  // Accounts, devices, hooks (with their sealed secrets), enrolments, and the routing from a hook
+  // id to its account. Replace the id with your own database's (`wrangler d1 create 00hooks`).
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "00hooks",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Cheap shedding at the edge: 60 requests per 10 s per hook (PROTOCOL §4).
+  "ratelimits": [
+    { "name": "HOOK_LIMIT", "namespace_id": "1001", "simple": { "limit": 60, "period": 10 } }
+  ],
+
+  "vars": { "RETENTION_DAYS": "7" }
+}
