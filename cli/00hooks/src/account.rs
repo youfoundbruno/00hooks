@@ -1,19 +1,74 @@
 //! `00hooks login` and `00hooks devices`.
 
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal};
 
 use hooks_client::api::{check_id, system_now_ms};
-use hooks_client::{Client, Config, DeviceKey, KeychainStore, PROTOCOL_VERSION};
+use hooks_client::{Client, Config, DeviceKey, Error, KeychainStore, PROTOCOL_VERSION, StateDir};
 
 use crate::ctx::{CliResult, Ctx, Failure, explain, key_store, open_state, preferred_key_store};
 use crate::output::{date_time, sanitize, table};
+
+/// Where an enrolment code comes from: never the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeSource {
+    /// Not joining: create an account.
+    None,
+    /// Ask on the terminal, or read stdin when it isn't one.
+    Ask,
+    /// Read stdin.
+    Stdin,
+}
 
 pub struct Login {
     pub relay: Option<String>,
     pub name: Option<String>,
     pub signup_token: Option<String>,
-    pub code: Option<String>,
+    pub code: CodeSource,
     pub force: bool,
+}
+
+/// Read one line: the enrolment code.
+fn read_code(source: CodeSource) -> CliResult<String> {
+    let stdin = std::io::stdin();
+    if source == CodeSource::Ask && stdin.is_terminal() {
+        eprint!("Enrolment code (from `00hooks devices add` on the other computer): ");
+    }
+    let mut line = String::new();
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| Failure::new(format!("Couldn't read the enrolment code: {e}.")))?;
+    let code = line.trim().to_string();
+    if code.is_empty() {
+        return Err(Failure::new(
+            "No enrolment code given. Run `00hooks devices add` on a computer that's logged in, \
+             then type the code when asked, or pipe it in with --code-stdin.",
+        ));
+    }
+    Ok(code)
+}
+
+/// Revoke the device a previous login on this computer used, signed with its own key. Best effort:
+/// the reason it couldn't, in plain words, otherwise.
+async fn revoke_previous(old: &Config, state: &StateDir) -> Result<(), String> {
+    let store = key_store(&old.key_store, state);
+    let key = match DeviceKey::load(store.as_ref(), &old.key_name) {
+        Ok(Some(k)) => k,
+        Ok(None) => return Err(format!("its key is no longer in {}", store.describe())),
+        Err(e) => return Err(format!("its key couldn't be read ({e})")),
+    };
+    let client = Client::with_device(&old.relay, &old.device_id, key).map_err(|e| e.to_string())?;
+    match client.revoke_device(&old.device_id).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_unauthorized() => {
+            Err("the relay already refuses it (it was revoked, or its key doesn't match)".into())
+        }
+        Err(Error::Network(detail)) => Err(format!(
+            "the relay at {} can't be reached ({detail})",
+            old.relay
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// This computer's name, for the device list.
@@ -76,13 +131,20 @@ pub async fn login(args: Login) -> CliResult {
             info.protocol
         )));
     }
-    if args.code.is_none() && args.signup_token.is_none() && !info.signup_open {
+    let joining = args.code != CodeSource::None;
+    if !joining && args.signup_token.is_none() && !info.signup_open {
         return Err(Failure::new(
             "This relay needs a signup token to create an account. Pass --signup-token (or set \
              HOOKS_SIGNUP_TOKEN), or join an existing account with --code from \
              `00hooks devices add` on a computer that's already logged in.",
         ));
     }
+
+    let code = if joining {
+        Some(read_code(args.code)?)
+    } else {
+        None
+    };
 
     let name = args.name.clone().unwrap_or_else(default_device_name);
     let key = DeviceKey::generate().map_err(|e| Failure::new(e.to_string()))?;
@@ -102,7 +164,7 @@ pub async fn login(args: Login) -> CliResult {
             .map_err(|e| Failure::new(format!("Couldn't save the device key: {e}.")))?;
     }
 
-    let joined = match &args.code {
+    let joined = match &code {
         Some(code) => {
             anon.redeem_enrolment(code.trim(), &name, &key.public_key())
                 .await
@@ -122,7 +184,18 @@ pub async fn login(args: Login) -> CliResult {
     check_id("dev_", &joined.device_id).map_err(|e| Failure::new(e.to_string()))?;
 
     if let Some(old) = &existing {
-        // The old device's key is no longer needed here.
+        // The previous device is abandoned: revoke it (signed with its own key) so it holds no
+        // events back and its key is worth nothing, then forget the key here.
+        match revoke_previous(old, &state).await {
+            Ok(()) => eprintln!("Revoked this computer's previous device {}.", old.device_id),
+            Err(why) => eprintln!(
+                "Couldn't revoke this computer's previous device {}: {}. Revoke it from a \
+                 computer logged in to that account: `00hooks devices revoke {}`.",
+                old.device_id,
+                sanitize(&why, false),
+                old.device_id
+            ),
+        }
         let _ = key_store(&old.key_store, &state).delete(&old.key_name);
     }
     state.reset().map_err(|e| Failure::new(e.to_string()))?;
@@ -138,7 +211,7 @@ pub async fn login(args: Login) -> CliResult {
         .save_config(&config)
         .map_err(|e| Failure::new(e.to_string()))?;
 
-    let how = if args.code.is_some() {
+    let how = if joining {
         "Joined account"
     } else {
         "Created account"
@@ -150,7 +223,7 @@ pub async fn login(args: Login) -> CliResult {
         sanitize(&name, false)
     );
     eprintln!("The device key is kept in {}.", store.describe());
-    if info.signup_open && args.code.is_none() && args.signup_token.is_none() {
+    if info.signup_open && !joining && args.signup_token.is_none() {
         eprintln!("Note: this relay lets anyone sign up; that's meant for development only.");
     }
     Ok(())
@@ -198,7 +271,7 @@ pub async fn devices_add() -> CliResult {
     );
     println!("{code}");
     eprintln!(
-        "On the other computer, run:\n  00hooks login --relay {} --code {code}",
+        "On the other computer, run this and type the code when asked:\n  00hooks login --relay {} --code",
         ctx.config.relay
     );
     Ok(())

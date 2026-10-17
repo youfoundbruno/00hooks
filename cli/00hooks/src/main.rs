@@ -40,15 +40,23 @@ enum Cmd {
             long,
             env = "HOOKS_SIGNUP_TOKEN",
             hide_env_values = true,
-            conflicts_with = "code"
+            conflicts_with_all = ["code", "code_stdin"]
         )]
         signup_token: Option<String>,
-        /// Join an existing account with a code from `00hooks devices add`.
+        /// Join an existing account with a code from `00hooks devices add`. You're asked for the
+        /// code (it's read from stdin when that isn't a terminal); it's never taken from the
+        /// command line, where shell history and the process list would keep it.
+        #[arg(long, conflicts_with = "code_stdin")]
+        code: bool,
+        /// Join an existing account with a code read from stdin.
         #[arg(long)]
-        code: Option<String>,
-        /// Replace an existing login on this computer.
+        code_stdin: bool,
+        /// Replace an existing login on this computer (and revoke its old device when it can).
         #[arg(long)]
         force: bool,
+        /// Anything else: a code typed after --code lands here, and is refused with the reason.
+        #[arg(hide = true)]
+        stray: Vec<String>,
     },
     /// List, add or revoke the devices on this account.
     Devices {
@@ -148,8 +156,24 @@ async fn dispatch(cmd: Cmd) -> CliResult {
             name,
             signup_token,
             code,
+            code_stdin,
             force,
+            stray,
         } => {
+            if !stray.is_empty() {
+                // Never echo it: it may be an enrolment code.
+                return Err(ctx::Failure::new(
+                    "`00hooks login` takes no values without an option, and the enrolment code \
+                     never goes on the command line: shell history and the process list would \
+                     keep it. Run `00hooks login --relay <URL> --code` and type it when asked, or \
+                     pipe it in with --code-stdin.",
+                ));
+            }
+            let code = match (code, code_stdin) {
+                (true, _) => account::CodeSource::Ask,
+                (false, true) => account::CodeSource::Stdin,
+                (false, false) => account::CodeSource::None,
+            };
             account::login(account::Login {
                 relay,
                 name,
@@ -228,8 +252,30 @@ mod tests {
 
     #[test]
     fn signup_token_and_code_are_exclusive() {
-        let r = Cli::try_parse_from(["00hooks", "login", "--signup-token", "t", "--code", "c"]);
+        let r = Cli::try_parse_from(["00hooks", "login", "--signup-token", "t", "--code"]);
         assert!(r.is_err());
+        let r = Cli::try_parse_from(["00hooks", "login", "--signup-token", "t", "--code-stdin"]);
+        assert!(r.is_err());
+        let r = Cli::try_parse_from(["00hooks", "login", "--code", "--code-stdin"]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn code_is_a_flag_and_a_value_is_refused() {
+        let cli = Cli::try_parse_from(["00hooks", "login", "--code"]).unwrap();
+        match cli.cmd {
+            Cmd::Login { code, stray, .. } => assert!(code && stray.is_empty()),
+            _ => panic!(),
+        }
+        // A value still parses, so dispatch can say why it's refused instead of a usage error.
+        let cli = Cli::try_parse_from(["00hooks", "login", "--code", "ABCD-EFGH-JKMN"]).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime.block_on(dispatch(cli.cmd)).unwrap_err();
+        assert!(err.message.contains("--code-stdin"), "{}", err.message);
+        assert!(!err.message.contains("ABCD"), "{}", err.message);
     }
 
     #[test]

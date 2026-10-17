@@ -207,3 +207,117 @@ async fn login_create_a_hook_listen_and_doctor() {
         "{stdout}"
     );
 }
+
+fn run_with_stdin(home: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    let mut child = cmd(home)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_reads_the_code_from_stdin_and_force_revokes_the_previous_device() {
+    let relay = MockRelay::start().await;
+    let home = TempHome::new("cli-relogin");
+    let dir = home.0.clone();
+    let url = relay.url.clone();
+    let blocking = |args: Vec<String>, input: Option<String>| {
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match input {
+                Some(i) => run_with_stdin(&dir, &args, &i),
+                None => run(&dir, &args),
+            }
+        })
+    };
+    let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let out = blocking(argv(&["login", "--relay", &url]), None)
+        .await
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("device dev_1"));
+
+    // A code after --code is refused without being echoed.
+    let out = blocking(
+        argv(&["login", "--force", "--code", "ABCD-EFGH-JKMN"]),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("--code-stdin") && !err.contains("ABCD"),
+        "{err}"
+    );
+
+    // --code-stdin joins with the piped code, and --force revokes the previous device.
+    relay.with(|s| s.enrolment_code = Some("ABCD-EFGH-JKMN".into()));
+    let out = blocking(
+        argv(&["login", "--force", "--code-stdin"]),
+        Some("ABCD-EFGH-JKMN\n".into()),
+    )
+    .await
+    .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("Joined account acc_1"));
+    assert!(text(&out.stdout).contains("device dev_2"));
+    assert!(
+        text(&out.stderr).contains("Revoked this computer's previous device dev_1"),
+        "{}",
+        text(&out.stderr)
+    );
+    relay.with(|s| {
+        assert_eq!(
+            s.revocations,
+            vec![("dev_1".to_string(), "dev_1".to_string())]
+        );
+    });
+    // Only the new device's key is left.
+    assert_eq!(std::fs::read_dir(dir.join("keys")).unwrap().count(), 1);
+
+    // --code reads stdin too when it isn't a terminal. When the previous device can't be revoked,
+    // the login still goes through and says so plainly.
+    relay.with(|s| {
+        s.enrolment_code = Some("MNPQ-RSTV-WXYZ".into());
+        s.revoked.insert("dev_2".into());
+    });
+    let out = blocking(
+        argv(&["login", "--force", "--code"]),
+        Some("mnpq-rstv-wxyz\n".to_uppercase()),
+    )
+    .await
+    .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("Couldn't revoke this computer's previous device dev_2")
+            && err.contains("already refuses it")
+            && err.contains("00hooks devices revoke dev_2"),
+        "{err}"
+    );
+    relay.with(|s| assert_eq!(s.revocations.len(), 1));
+
+    // No code at all is refused.
+    let out = blocking(
+        argv(&["login", "--force", "--code-stdin"]),
+        Some(String::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("No enrolment code"));
+}
