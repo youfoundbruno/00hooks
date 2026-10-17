@@ -1,0 +1,12 @@
+{
+  "name": "00hooks",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.9.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  }
+}

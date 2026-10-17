@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+// `pnpm check`: what a change must pass before it lands. The relay's type check and tests, then the
+// CLI's formatting, lint and tests.
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const steps = [];
+if (existsSync(join(root, "relay/package.json"))) {
+  steps.push(["Relay types", "pnpm", ["--filter", "./relay", "typecheck"]]);
+  steps.push(["Relay tests", "pnpm", ["--filter", "./relay", "test"]]);
+}
+if (existsSync(join(root, "cli/00hooks/Cargo.toml"))) {
+  steps.push(["CLI formatting", "cargo", ["fmt", "--all", "--check"]]);
+  steps.push(["CLI lint", "cargo", ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]]);
+  steps.push(["CLI tests", "cargo", ["test", "--workspace", "-q"]]);
+}
+for (const [label, cmd, args] of steps) {
+  console.log(`\n▸ ${label}`);
+  const r = spawnSync(cmd, args, { cwd: root, stdio: "inherit" });
+  if (r.status !== 0) {
+    console.error(`\n✗ ${label} failed.`);
+    process.exit(r.status ?? 1);
+  }
+}
+console.log("\n✓ Everything passes.");

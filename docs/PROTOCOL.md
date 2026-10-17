@@ -1,0 +1,188 @@
+# 00hooks protocol (v1)
+
+The contract between the relay (`relay/`) and its clients (the `00hooks` CLI and the `hooks-client`
+crate). Both sides test against this document; a change here is a version bump. Phase 0 implements
+everything below except where marked *(phase 1)*.
+
+All JSON is UTF-8 with camelCase keys. Times are Unix milliseconds. Ids are lowercase base32
+(Crockford, no padding) with a prefix: `acc_`, `dev_`, `hk_`, `evt_`, `enr_`.
+
+## 1. Signed requests
+
+Every `/v1/*` request except account creation and enrolment is signed by a **device**. A device has an
+Ed25519 key pair; the private key never leaves the machine (OS keychain, or a 0600 file fallback).
+
+Headers:
+
+```
+X-00h-Device:    dev_…               the device id
+X-00h-Time:      1792233600000       now, ms
+X-00h-Nonce:     22 random base64url chars (128 bits)
+X-00h-Signature: base64url(ed25519_sign(canonical))
+```
+
+The canonical string is these lines joined with `\n`:
+
+```
+00hooks-v1
+<host, lowercase, with :port when not default>
+<METHOD>
+<path and query, exactly as sent>
+<X-00h-Time>
+<X-00h-Nonce>
+<hex sha256 of the raw body; of the empty string when there is none>
+```
+
+The relay refuses (`401`, body `{"error":"…"}`, never saying which check failed in detail):
+- a time more than 300 s from its clock;
+- a nonce already seen for that device in the last 600 s (nonces are stored in the account's Durable
+  Object, so the check is strongly consistent; GET requests spend nonces too, because a replayed
+  stream request would be a live copy of the account's events);
+- an unknown or revoked device, or a bad signature.
+
+A client whose clock is off sees `401` with `{"error":"clock_skew","serverTime":…}` and may retry
+once with the server time offset; `00hooks doctor` reports the skew.
+
+## 2. Accounts and devices
+
+- `POST /v1/accounts` `{ "deviceName": "…", "publicKey": "<base64url ed25519 public key>" }` → `201`
+  `{ "accountId", "deviceId" }`. When the relay has a `SIGNUP_TOKEN` secret, the request must carry
+  `Authorization: Bearer <SIGNUP_TOKEN>`; without the secret, signups are open (development only;
+  `/v1/info` says so).
+- `POST /v1/enrolments` (signed) → `{ "code": "ABCD-EFGH", "expiresAt" }`: a one-time code, valid
+  10 minutes, for adding another device to the same account.
+- `POST /v1/enrolments/redeem` `{ "code", "deviceName", "publicKey" }` → `{ "accountId", "deviceId" }`.
+  Five wrong codes from one IP in 10 minutes block that IP for 10 minutes.
+- `GET /v1/devices` (signed) → `{ "devices": [{ "id", "name", "createdAt", "lastSeenAt", "current" }] }`
+- `DELETE /v1/devices/<id>` (signed): revokes it; its open stream closes at once with `4401`.
+- `GET /v1/info` (unsigned) → `{ "version", "protocol": 1, "signupOpen": bool, "serverTime" }`.
+
+## 3. Hooks
+
+- `POST /v1/hooks` (signed) `{ "name", "verify": <Verify> }` → `201`
+  `{ "hook": <Hook>, "url", "secret"? }`. `secret` appears **only here** and only for presets where the
+  relay generates it.
+- `GET /v1/hooks` → `{ "hooks": [<Hook>] }`; `GET /v1/hooks/<id>` → `<Hook>`.
+- `PATCH /v1/hooks/<id>` `{ "name"?, "enabled"?, "maxBodyBytes"? }` → `<Hook>`.
+- `POST /v1/hooks/<id>/rotate` → `{ "secret" }`; the previous secret keeps working for 24 h.
+- `DELETE /v1/hooks/<id>` → `204`. Events already in the log stay until acknowledged.
+
+`Hook`: `{ "id", "name", "url", "enabled", "verify": { "preset", …non-secret fields }, "maxBodyBytes",
+"createdAt", "lastEventAt" }`.
+
+`Verify` (phase 0 presets):
+
+| `preset` | fields | check |
+|---|---|---|
+| `github` | `secret`? (generated when absent) | `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(body)>`; dedupe on `X-GitHub-Delivery`; answers `ping` events with `200` |
+| `standard-webhooks` | `secret`? (`whsec_` + base64, generated when absent) | Standard Webhooks v1 HMAC over `id.timestamp.body`, timestamp within 300 s, dedupe on `webhook-id` |
+| `hmac` | `header`, `algorithm` (`sha256`/`sha1`), `encoding` (`hex`/`base64`), `prefix`? (e.g. `sha256=`), `secret`? | HMAC of the raw body; dedupe on a body hash |
+| `token` | `header` (default `Authorization`), `secret`? | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength |
+| `unverified` | — | accepts anything; events carry `verified: false` |
+
+Stripe, Slack, Linear, Shopify, Twilio and Ed25519 Standard Webhooks follow in phase 1. Secrets are
+stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM), never returned after creation.
+
+## 4. Receiving
+
+`POST /h/<hookId>` (also PUT and PATCH). In order:
+
+1. Unknown or disabled hook → `404`. Body larger than the hook's `maxBodyBytes` (default 1 MiB) →
+   `413` (checked from `Content-Length` first, then while reading).
+2. Rate limit per hook (60 requests per 10 s by default) → `429` with `Retry-After`.
+3. Verify with the preset → `401` `{"error":"signature"}` on failure (counted, not stored).
+4. Dedupe → a duplicate answers `200` `{"duplicate":true}` and is not stored again.
+5. Append to the account log, in one Durable Object transaction with the dedupe mark → `200`
+   `{"received": "<evt_…>"}`.
+
+## 5. Events
+
+```json
+{
+  "seq": 42,
+  "id": "evt_…",
+  "hookId": "hk_…",
+  "receivedAt": 1792233600000,
+  "verified": true,
+  "preset": "github",
+  "eventType": "pull_request",
+  "contentType": "application/json",
+  "headers": { "x-github-event": "pull_request", "x-github-delivery": "…" },
+  "body": "<base64 of the raw bytes>"
+}
+```
+
+- `seq` is per account, strictly increasing, never reused.
+- `eventType` comes from the preset (`X-GitHub-Event`, the Standard Webhooks payload's `type`) or is
+  `null`.
+- `headers` keeps only an allowlist per preset (the provider's event, delivery and signature headers,
+  `content-type`, `user-agent`), lowercased. Never `cookie` or `authorization`.
+- *(phase 1)* `sealed`: the body and headers become an HPKE envelope; see PLAN §4.4.
+
+## 6. Streaming
+
+`GET /v1/stream` (signed), `Accept: text/event-stream`, optional `Last-Event-ID: <seq>`.
+
+Response headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache, no-transform`,
+`X-Accel-Buffering: no`.
+
+The stream sends, in order:
+
+```
+retry: 5000
+
+event: ready
+data: {"accountId":"…","deviceId":"…","after":40,"head":42}
+
+id: 41
+event: hook
+data: {…event…}
+
+id: 42
+event: hook
+data: {…event…}
+
+: hb
+```
+
+- **Where it starts**: after `max(Last-Event-ID, this device's acknowledged seq)`. `ready.after` says
+  which; `ready.head` is the newest seq in the log.
+- **Gaps**: when events after that point were already dropped by retention, a `gap` event comes before
+  the next `hook`: `event: gap` `data: {"from": 12, "to": 30, "reason": "retention"}` (inclusive range
+  of lost seqs).
+- **Heartbeat**: a comment line `: hb` every 15 s.
+- **Backpressure**: when more than 256 KiB is waiting to be written, the relay stops queueing and, once
+  the client drains, sends `event: resync` `data: {"after": <last seq written>}`; the client reconnects
+  with that `Last-Event-ID`. A client that reads nothing for 60 s is closed with `4408`.
+- **Closing**: before closing, the relay sends `event: closed` `data: {"code": <code>, "reason": "…"}`:
+
+| code | meaning | client should |
+|---|---|---|
+| `4401` | the device was revoked or the signature no longer holds | stop; ask the person to log in again |
+| `4408` | too slow to read | reconnect at once |
+| `4409` | a newer stream for this device replaced this one | stop (another process is listening) |
+| `1012` | the relay is restarting (deploy) | reconnect with jitter |
+
+- **Reconnecting**: on any drop without a terminal code, reconnect after `retry` plus jitter, backing
+  off to 30 s; 70 s without a byte (heartbeats included) counts as a drop. Re-sign every attempt (fresh
+  time and nonce).
+- **One stream per device**: a second stream for the same device replaces the first (`4409`).
+
+How the relay serves it (informative): the Worker holds the SSE response and connects to the
+account's Durable Object over a WebSocket that the object accepts with the hibernation API, so the
+object costs nothing while idle. Clients see only SSE.
+
+## 7. Acknowledging
+
+`POST /v1/ack` (signed) `{ "through": 42 }` → `{ "acked": 42 }`. Acknowledge only after the event is
+recorded locally (not after acting on it). Acks are per device and monotonic: a lower value is
+ignored. An event acknowledged by every device that receives its hook is deleted; unacknowledged events
+are kept 7 days (`RETENTION_DAYS`), then dropped, which shows up as a `gap`.
+
+Clients dedupe by `id` before acting, so at-least-once delivery never runs an automation twice.
+
+## 8. Errors
+
+Every error body is `{ "error": "<code>", "message": "<one plain sentence>" }`. Codes: `unauthorized`,
+`clock_skew`, `not_found`, `too_large`, `rate_limited`, `signature`, `invalid` (with `field`),
+`conflict`. Messages never contain secrets, signatures or payload content.
