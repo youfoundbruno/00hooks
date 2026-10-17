@@ -356,7 +356,29 @@ unless they keep matching (default 90 days).
    same verdict, with the reason "similar to an item you dropped on 12 October". Fingerprints can be
    synced to the edge *(optional)*, so repeats are dropped before they're even delivered; a MinHash
    signature reveals almost nothing about the text it came from.
-4. **The AI evaluator** *(optional)*, only for items the rules and similarity didn't settle, through a
+4. **Field rules: blocking on content.** Sometimes the value is the point: a sender's address, a
+   repository, a product id, a phrase. When you drop or quarantine an item, the item opens with its
+   fields listed, and you tick the ones to block on. For each, choose how it matches:
+
+   | Match | Example | Notes |
+   |---|---|---|
+   | is | `sender.email` is `promo@deals.example` | case-folded and trimmed first |
+   | domain is | `sender.email` domain is `deals.example` | for addresses and URLs |
+   | contains | `message.text` contains `free crypto` | words, case-insensitive |
+   | pattern | `order.note` matches `/bit\.ly\/\w+/` | a regular expression, with a time limit |
+   | similar text | `message.text` is like this one | MinHash on that one field, so a long template with a changed name still matches |
+   | one of | `repository.full_name` is one of a list you keep | for allow lists too |
+
+   Field rules keep the values you chose, because that is what they match on. Only the ticked
+   fields' values are kept, never the rest of the item, and they stay **in the harness** (your
+   machine), shown in plain text in the rule so you can see exactly what's blocked. A rule can also
+   be pushed to the edge *(optional)*: `is`, `domain is` and `one of` go as keyed hashes (the relay
+   compares a hash of the incoming field and never stores the value), while `contains`, `pattern` and
+   `similar text` need the relay to see the words, so pushing one of those says so and asks first.
+   Rules can combine conditions (`sender.domain is X` **and** `message.text contains Y`) and say
+   *pass*, *quarantine* or *drop*, so the same tool builds allow rules ("always pass `repository`
+   one of my repos").
+5. **The AI evaluator** *(optional)*, only for items the rules and similarity didn't settle, through a
    **Decisions API** (bounded questions with typed answers and probabilities):
    - `verdict`: *choice* of `pass`, `quarantine`, `drop`;
    - `injection`: *yes/no*, whether it tries to instruct an AI;
