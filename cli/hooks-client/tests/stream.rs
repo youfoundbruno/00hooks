@@ -395,3 +395,16 @@ async fn the_mock_notices_an_ack_of_events_that_were_never_recorded() {
     client.ack(3).await.unwrap();
     relay.with(|s| assert_eq!(s.violations.len(), 3, "{:?}", s.violations));
 }
+
+#[tokio::test]
+async fn probe_reads_ready_and_records_nothing() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=4);
+    let (client, state, _home) = device(&relay, "probe").await;
+    let ready = hooks_client::stream::probe(&client, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!((ready.after, ready.head), (0, 4));
+    assert_eq!(state.open_events().unwrap().cursor(), 0);
+    relay.with(|s| assert!(s.acks.is_empty()));
+}

@@ -103,8 +103,8 @@ pub fn describe_skew(skew_ms: i64) -> String {
 
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
-        // reqwest's Display includes the URL, which never carries secrets in this protocol.
-        Error::Network(flatten(&e))
+        // Callers already say which relay; drop the URL so messages stay short.
+        Error::Network(flatten(&e.without_url()))
     }
 }
 

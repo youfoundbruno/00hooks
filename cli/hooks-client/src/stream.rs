@@ -374,3 +374,46 @@ fn describe_close(c: &Closed) -> String {
         format!("{what} ({}: {})", c.code, c.reason)
     }
 }
+
+/// Open the stream, wait for `ready`, and close it, recording nothing (for `00hooks doctor`).
+///
+/// Opening a stream replaces any other stream of the same device (PROTOCOL §6, `4409`), so callers
+/// should not probe while a listener for this device is running.
+pub async fn probe(client: &Client, timeout: Duration) -> Result<Ready> {
+    let attempt = async {
+        let mut resp = client.open_stream(None).await?;
+        let mut parser = SseParser::default();
+        while let Some(chunk) = resp.chunk().await? {
+            let items = parser
+                .push(&chunk)
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            for item in items {
+                if let SseItem::Event(ev) = item {
+                    match ev.event.as_deref() {
+                        Some("ready") => {
+                            return serde_json::from_str::<Ready>(&ev.data)
+                                .map_err(|e| Error::Protocol(format!("unreadable ready: {e}")));
+                        }
+                        Some("closed") => {
+                            let c: Closed = serde_json::from_str(&ev.data).unwrap_or(Closed {
+                                code: 1000,
+                                reason: String::new(),
+                            });
+                            return Err(Error::Closed {
+                                code: c.code,
+                                reason: c.reason,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Err(Error::Protocol(
+            "the stream ended before saying ready".into(),
+        ))
+    };
+    tokio::time::timeout(timeout, attempt)
+        .await
+        .map_err(|_| Error::Network(format!("no ready event within {} s", timeout.as_secs())))?
+}

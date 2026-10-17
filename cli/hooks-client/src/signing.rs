@@ -171,7 +171,14 @@ mod tests {
     #[test]
     fn the_protocol_document_carries_the_same_vector() {
         let doc = include_str!("../../../docs/PROTOCOL.md");
-        for value in [PUBLIC_KEY, BODY_HASH, SIGNATURE, NONCE, BODY, "1792233600000"] {
+        for value in [
+            PUBLIC_KEY,
+            BODY_HASH,
+            SIGNATURE,
+            NONCE,
+            BODY,
+            "1792233600000",
+        ] {
             assert!(doc.contains(value), "PROTOCOL.md §1 lacks {value}");
         }
         let seed_hex: String = SEED.iter().map(|b| format!("{b:02x}")).collect();

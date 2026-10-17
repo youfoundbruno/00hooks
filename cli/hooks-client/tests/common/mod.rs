@@ -66,6 +66,7 @@ pub struct State {
     /// The client's state directory, read on every ack.
     pub client_home: Option<PathBuf>,
     pub skew_refusals: usize,
+    pub hooks: Vec<Value>,
     next_device: usize,
 }
 
@@ -283,11 +284,16 @@ fn signed_route(
             let hook = json!({ "id": "hk_1", "name": v["name"], "url": "https://relay.example/h/hk_1",
                                "enabled": true, "verify": { "preset": v["verify"]["preset"] },
                                "maxBodyBytes": 1048576, "createdAt": 1, "lastEventAt": null });
+            st.lock().unwrap().hooks.push(hook.clone());
             json_resp(
                 StatusCode::CREATED,
                 json!({ "hook": hook, "url": "https://relay.example/h/hk_1",
                         "secret": "s3cret" }),
             )
+        }
+        ("GET", "/v1/hooks") => {
+            let hooks = st.lock().unwrap().hooks.clone();
+            json_resp(StatusCode::OK, json!({ "hooks": hooks }))
         }
         ("POST", "/v1/ack") => {
             let v: Value = serde_json::from_slice(body).unwrap_or_default();
