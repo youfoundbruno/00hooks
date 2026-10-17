@@ -1,0 +1,18 @@
+[package]
+name = "hooks-cli"
+description = "The 00hooks command: webhooks from anywhere, delivered to your own computer in real time."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "00hooks"
+path = "src/main.rs"
+
+[dependencies]
+hooks-client = { path = "../hooks-client" }
+clap = { version = "4", features = ["derive"] }

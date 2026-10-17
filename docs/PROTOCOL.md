@@ -43,6 +43,42 @@ The relay refuses (`401`, body `{"error":"…"}`, never saying which check faile
 A client whose clock is off sees `401` with `{"error":"clock_skew","serverTime":…}` and may retry
 once with the server time offset; `00hooks doctor` reports the skew.
 
+All base64url values in this section (`publicKey`, the nonce, the signature) are **unpadded**
+(RFC 4648 §5 without `=`): a public key is 43 characters, a signature 86.
+
+### Example
+
+Both sides test against this vector (`cli/hooks-client/src/signing.rs`, and the relay's tests).
+Ed25519 is deterministic, so the signature is fixed.
+
+| | |
+|---|---|
+| private key seed (hex) | `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f` |
+| public key | `A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg` |
+| request | `POST https://relay.example.com/v1/hooks?limit=10` |
+| `X-00h-Time` | `1792233600000` |
+| `X-00h-Nonce` | `AAECAwQFBgcICQoLDA0ODw` (the bytes `00`…`0f`) |
+| body (exact bytes) | `{"name":"ci","verify":{"preset":"github"}}` |
+| body sha256 | `871ec9aaacf62bacee0fb97ada9c29fed342cd0d7a3a07731570385a03c17a4c` |
+
+The canonical string (seven lines, `\n` between them, no trailing newline):
+
+```
+00hooks-v1
+relay.example.com
+POST
+/v1/hooks?limit=10
+1792233600000
+AAECAwQFBgcICQoLDA0ODw
+871ec9aaacf62bacee0fb97ada9c29fed342cd0d7a3a07731570385a03c17a4c
+```
+
+`X-00h-Signature`:
+`OlQhu7X6asl-UprVxIhRjftd-Hl-KN6hOcQdDgiJlLacZL6pbTwK3-E-TOtNaqW7wOTr2QkRirJfp0O8hDOaAQ`
+
+With no body, the last line is the hash of the empty string,
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+
 ## 2. Accounts and devices
 
 - `POST /v1/accounts` `{ "deviceName": "…", "publicKey": "<base64url ed25519 public key>" }` → `201`

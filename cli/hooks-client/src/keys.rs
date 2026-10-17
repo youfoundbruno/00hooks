@@ -1,0 +1,365 @@
+//! Device keys: an Ed25519 key pair per device, whose private half never leaves the machine.
+//!
+//! The 32-byte seed is kept in a [`KeyStore`]: the OS keychain ([`KeychainStore`]), a 0600 file
+//! ([`FileKeyStore`]) when there is no keychain, or memory ([`MemoryKeyStore`]) in tests.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ed25519_dalek::{Signer, SigningKey};
+
+use crate::{Error, Result, fsutil};
+
+/// The keychain service name entries are filed under.
+pub const KEYCHAIN_SERVICE: &str = "00hooks";
+
+/// A device's Ed25519 signing key.
+pub struct DeviceKey {
+    signing: SigningKey,
+}
+
+impl DeviceKey {
+    /// A new random key.
+    pub fn generate() -> Result<Self> {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| Error::KeyStore(format!("no randomness: {e}")))?;
+        let key = Self::from_seed(&seed);
+        seed.fill(0);
+        Ok(key)
+    }
+
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        DeviceKey {
+            signing: SigningKey::from_bytes(seed),
+        }
+    }
+
+    /// The public key, base64url without padding (43 characters), as `publicKey` in PROTOCOL §2.
+    pub fn public_key(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.signing.verifying_key().as_bytes())
+    }
+
+    /// The 64-byte Ed25519 signature of `message`.
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.signing.sign(message).to_bytes()
+    }
+
+    fn seed(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
+    /// Load the key named `name` from `store`; `None` when there is none.
+    pub fn load(store: &dyn KeyStore, name: &str) -> Result<Option<Self>> {
+        Ok(store.load(name)?.map(|mut seed| {
+            let key = Self::from_seed(&seed);
+            seed.fill(0);
+            key
+        }))
+    }
+
+    /// Save this key in `store` as `name`.
+    pub fn save(&self, store: &dyn KeyStore, name: &str) -> Result<()> {
+        let mut seed = self.seed();
+        let r = store.save(name, &seed);
+        seed.fill(0);
+        r
+    }
+}
+
+impl std::fmt::Debug for DeviceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DeviceKey({})", self.public_key())
+    }
+}
+
+/// Where device key seeds are kept.
+pub trait KeyStore: Send + Sync {
+    /// A short name for messages: "the keychain", "a file".
+    fn describe(&self) -> String;
+    fn load(&self, name: &str) -> Result<Option<[u8; 32]>>;
+    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()>;
+    fn delete(&self, name: &str) -> Result<()>;
+}
+
+/// Key names become keychain accounts and file names, so they are kept to a safe alphabet.
+pub fn check_key_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!("invalid key name {name:?}")))
+    }
+}
+
+fn encode_seed(seed: &[u8; 32]) -> String {
+    URL_SAFE_NO_PAD.encode(seed)
+}
+
+fn decode_seed(text: &str, where_: &str) -> Result<[u8; 32]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(text.trim())
+        .map_err(|_| Error::KeyStore(format!("the device key in {where_} is damaged")))?;
+    bytes
+        .try_into()
+        .map_err(|_| Error::KeyStore(format!("the device key in {where_} is damaged")))
+}
+
+/// The OS keychain: macOS Keychain, the Secret Service on Linux, Credential Manager on Windows.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeychainStore;
+
+impl KeychainStore {
+    /// Whether this platform's keychain can be opened at all.
+    pub fn available() -> bool {
+        keyring::Entry::store_status().is_ok()
+    }
+
+    fn entry(name: &str) -> Result<keyring::Entry> {
+        check_key_name(name)?;
+        keyring::Entry::new(KEYCHAIN_SERVICE, name).map_err(keychain_error)
+    }
+}
+
+fn keychain_error(e: keyring::Error) -> Error {
+    Error::KeyStore(format!("the keychain refused: {e}"))
+}
+
+impl KeyStore for KeychainStore {
+    fn describe(&self) -> String {
+        "the keychain".into()
+    }
+
+    fn load(&self, name: &str) -> Result<Option<[u8; 32]>> {
+        match Self::entry(name)?.get_password() {
+            Ok(text) => decode_seed(&text, "the keychain").map(Some),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(keychain_error(e)),
+        }
+    }
+
+    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()> {
+        Self::entry(name)?
+            .set_password(&encode_seed(seed))
+            .map_err(keychain_error)
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        match Self::entry(name)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(keychain_error(e)),
+        }
+    }
+}
+
+/// A file per key in a directory, mode 0600 inside a 0700 directory. Reading refuses a file whose
+/// permissions let anyone else read or write it.
+#[derive(Debug, Clone)]
+pub struct FileKeyStore {
+    dir: PathBuf,
+}
+
+impl FileKeyStore {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        FileKeyStore { dir: dir.into() }
+    }
+
+    pub fn path(&self, name: &str) -> Result<PathBuf> {
+        check_key_name(name)?;
+        Ok(self.dir.join(format!("{name}.key")))
+    }
+}
+
+/// Refuse a key file that group or others can read or write, or that isn't a regular file.
+#[cfg(unix)]
+fn check_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(Error::KeyStore(format!(
+            "refusing to read {}: it isn't a regular file",
+            path.display()
+        )));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::KeyStore(format!(
+            "refusing to read {}: its permissions are {mode:o}, so other users may have read it. \
+             If only you can log in to this computer, run `chmod 600 {}`; otherwise log in again \
+             and revoke this device from another one",
+            path.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private(path: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(Error::KeyStore(format!(
+            "refusing to read {}: it isn't a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+impl KeyStore for FileKeyStore {
+    fn describe(&self) -> String {
+        format!("a private file in {}", self.dir.display())
+    }
+
+    fn load(&self, name: &str) -> Result<Option<[u8; 32]>> {
+        let path = self.path(name)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {}
+        }
+        check_private(&path)?;
+        let text = std::fs::read_to_string(&path)?;
+        decode_seed(&text, &path.display().to_string()).map(Some)
+    }
+
+    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()> {
+        let path = self.path(name)?;
+        fsutil::create_private_dir(&self.dir)?;
+        fsutil::write_atomic(&path, encode_seed(seed).as_bytes(), true)
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        match std::fs::remove_file(self.path(name)?) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Keys in memory only, for tests.
+#[derive(Debug, Default)]
+pub struct MemoryKeyStore {
+    keys: Mutex<HashMap<String, [u8; 32]>>,
+}
+
+impl MemoryKeyStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl KeyStore for MemoryKeyStore {
+    fn describe(&self) -> String {
+        "memory".into()
+    }
+
+    fn load(&self, name: &str) -> Result<Option<[u8; 32]>> {
+        check_key_name(name)?;
+        Ok(self.keys.lock().expect("key map").get(name).copied())
+    }
+
+    fn save(&self, name: &str, seed: &[u8; 32]) -> Result<()> {
+        check_key_name(name)?;
+        self.keys
+            .lock()
+            .expect("key map")
+            .insert(name.to_string(), *seed);
+        Ok(())
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.keys.lock().expect("key map").remove(name);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fsutil::temp_dir;
+
+    #[test]
+    fn memory_store_round_trips() {
+        let store = MemoryKeyStore::new();
+        let key = DeviceKey::generate().unwrap();
+        key.save(&store, "dev").unwrap();
+        let back = DeviceKey::load(&store, "dev").unwrap().unwrap();
+        assert_eq!(back.public_key(), key.public_key());
+        assert_eq!(key.public_key().len(), 43);
+        store.delete("dev").unwrap();
+        assert!(DeviceKey::load(&store, "dev").unwrap().is_none());
+    }
+
+    #[test]
+    fn key_names_cannot_escape_the_directory() {
+        let store = FileKeyStore::new(std::env::temp_dir());
+        assert!(store.path("../etc/passwd").is_err());
+        assert!(store.path("").is_err());
+        assert!(store.path("key_ok-1").is_ok());
+    }
+
+    #[test]
+    fn file_store_round_trips_with_0600() {
+        let dir = temp_dir("rt");
+        let store = FileKeyStore::new(dir.join("keys"));
+        assert!(DeviceKey::load(&store, "k").unwrap().is_none());
+        let key = DeviceKey::generate().unwrap();
+        key.save(&store, "k").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store.path("k").unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let dmode = std::fs::metadata(dir.join("keys"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(dmode & 0o777, 0o700);
+        }
+        let back = DeviceKey::load(&store, "k").unwrap().unwrap();
+        assert_eq!(back.public_key(), key.public_key());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_refuses_a_key_others_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("perm");
+        let store = FileKeyStore::new(dir.join("keys"));
+        DeviceKey::generate().unwrap().save(&store, "k").unwrap();
+        let path = store.path("k").unwrap();
+        for mode in [0o644, 0o640, 0o604, 0o660, 0o606] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = DeviceKey::load(&store, "k").unwrap_err().to_string();
+            assert!(err.contains("refusing to read"), "{mode:o}: {err}");
+            assert!(err.contains("chmod 600"), "{err}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(DeviceKey::load(&store, "k").unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_refuses_a_symlink() {
+        let dir = temp_dir("link");
+        let store = FileKeyStore::new(dir.join("keys"));
+        DeviceKey::generate().unwrap().save(&store, "real").unwrap();
+        std::os::unix::fs::symlink(store.path("real").unwrap(), store.path("link").unwrap())
+            .unwrap();
+        let err = DeviceKey::load(&store, "link").unwrap_err().to_string();
+        assert!(err.contains("isn't a regular file"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
