@@ -41,10 +41,18 @@ fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
+/// Create a missing folder (0700); an existing one is left exactly as it is.
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    hooks_client::fsutil::create_private_dir(dir).map_err(|e| std::io::Error::other(e.to_string()))
+}
+
 /// Append one JSON line to `path` (creating it, and its folder, privately).
 pub fn append(path: &Path, line: &Value) -> Outcome {
     if let Some(dir) = path.parent() {
-        hooks_client::fsutil::create_private_dir(dir)
+        ensure_dir(dir)
             .map_err(|e| Failure::fatal(format!("couldn't create {}: {e}", dir.display())))?;
     }
     let mut bytes = serde_json::to_vec(line).expect("json");
@@ -65,7 +73,7 @@ pub fn write_file(folder: &Path, name: &str, content: &Value) -> Outcome {
             crate::text::cut(&crate::text::sanitize(name), 60)
         )));
     };
-    hooks_client::fsutil::create_private_dir(folder)
+    ensure_dir(folder)
         .map_err(|e| Failure::fatal(format!("couldn't create {}: {e}", folder.display())))?;
     let bytes = match content {
         Value::String(s) => s.clone().into_bytes(),
@@ -120,6 +128,28 @@ mod tests {
             "plain text"
         );
         assert!(write_file(&folder, "///", &json!(1)).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_folders_keep_their_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("perms");
+        let shared = dir.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_file(&shared, "a.json", &json!(1)).unwrap();
+        append(&shared.join("log.jsonl"), &json!(1)).unwrap();
+        let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        write_file(&dir.join("new"), "a.json", &json!(1)).unwrap();
+        let mode = std::fs::metadata(dir.join("new"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "a folder we create is private");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
