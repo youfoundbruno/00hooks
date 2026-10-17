@@ -206,7 +206,8 @@ stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM), never returned af
   table in §3 says, per preset, what is signed). `contentType` is likewise the sender's header, at
   most 200 characters.
 - `headers` keeps only an allowlist per preset (the provider's event and delivery headers,
-  `content-type`, `user-agent`), lowercased, each value at most 1,024 characters. None of them is
+  `content-type`, `user-agent`, and the runner's loop-prevention headers `00hooks-origin` and
+  `00hooks-hop`), lowercased, each value at most 1,024 characters. None of them is
   covered by a signature. Never `cookie`, `authorization`, or any signature or token header
   (`x-hub-signature-256`, `webhook-signature`, the `hmac` or `token` preset's own header): once
   verified they're no use to a reader, and a stored signature beside its body is a ready-made replay.
