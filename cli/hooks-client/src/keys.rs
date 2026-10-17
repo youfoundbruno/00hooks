@@ -176,15 +176,29 @@ impl FileKeyStore {
     }
 }
 
-/// Refuse a key file that group or others can read or write, or that isn't a regular file.
+/// Refuse a key file that isn't a regular file, that another user owns, or that group or others can
+/// read or write.
 #[cfg(unix)]
 fn check_private(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    check_private_for(path, rustix::process::getuid().as_raw())
+}
+
+#[cfg(unix)]
+fn check_private_for(path: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.file_type().is_file() {
         return Err(Error::KeyStore(format!(
             "refusing to read {}: it isn't a regular file",
             path.display()
+        )));
+    }
+    if meta.uid() != uid {
+        return Err(Error::KeyStore(format!(
+            "refusing to read {}: it belongs to another user (uid {}), so it may not be the key \
+             this computer saved. Log in again and revoke this device from another one",
+            path.display(),
+            meta.uid()
         )));
     }
     let mode = meta.permissions().mode() & 0o777;
@@ -347,6 +361,25 @@ mod tests {
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(DeviceKey::load(&store, "k").unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_refuses_a_key_another_user_owns() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = temp_dir("owner");
+        let store = FileKeyStore::new(dir.join("keys"));
+        DeviceKey::generate().unwrap().save(&store, "k").unwrap();
+        let path = store.path("k").unwrap();
+        let mine = std::fs::metadata(&path).unwrap().uid();
+        assert_eq!(mine, rustix::process::getuid().as_raw());
+        check_private_for(&path, mine).unwrap();
+        // The same file, checked as if this process ran as someone else.
+        let err = check_private_for(&path, mine.wrapping_add(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("belongs to another user"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

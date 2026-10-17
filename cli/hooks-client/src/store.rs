@@ -184,8 +184,26 @@ fn to_lines<T: Serialize>(items: impl IntoIterator<Item = T>) -> Vec<u8> {
     out
 }
 
+/// Remove temporary files an atomic write left behind when the process died mid-write (their names
+/// are random, so nothing else would ever reuse them). Only the store's own files, best effort.
+fn sweep_temp_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = [CURSOR, INBOX, SEEN]
+            .iter()
+            .any(|f| name.starts_with(&format!(".{f}.")) && name.ends_with(".tmp"));
+        if ours && entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 impl EventStore {
     fn open(dir: &Path) -> Result<Self> {
+        sweep_temp_files(dir);
         // Seen set: keep the newest SEEN_CAP distinct ids, in order.
         let mut order: VecDeque<String> = VecDeque::new();
         let mut seen = HashSet::new();
@@ -384,9 +402,14 @@ mod tests {
             f.write_all(b"{\"seq\":4,\"id\":\"evt_").unwrap();
         }
         std::fs::write(dir.join(".cursor.json.tmp"), b"{\"seq\":99").unwrap();
+        std::fs::write(dir.join(".cursor.json.0123456789abcdef.tmp"), b"{\"seq\":9").unwrap();
 
         let mut ev = s.open_events().unwrap();
         assert_eq!(ev.cursor(), 3);
+        assert!(
+            !dir.join(".cursor.json.0123456789abcdef.tmp").exists(),
+            "leftover temporary files are swept"
+        );
         assert!(ev.is_seen("evt_1") && ev.is_seen("evt_2"));
         assert!(!ev.is_seen("evt_3"));
         assert_eq!(ev.pending(), vec![event(3)], "recorded, not delivered");

@@ -815,6 +815,7 @@ dependencies = [
  "hyper-util",
  "keyring",
  "reqwest",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

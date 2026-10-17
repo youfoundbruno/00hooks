@@ -24,6 +24,10 @@ thiserror = "2"
 tokio = { version = "1", features = ["time", "macros"] }
 url = "2"
 
+[target.'cfg(unix)'.dependencies]
+# Safe wrappers for O_NOFOLLOW and the current user id (the workspace denies unsafe code).
+rustix = { version = "1", features = ["fs", "process"] }
+
 [dev-dependencies]
 bytes = "1"
 http-body-util = "0.1"
