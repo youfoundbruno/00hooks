@@ -88,7 +88,6 @@ async function hold(relay: string, i: number, key: DeviceKey, signal: AbortSigna
         return;
       }
       if (res.status !== 200 || !res.body) throw new Error(`status ${res.status}`);
-      attempt = 0;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -117,6 +116,7 @@ async function hold(relay: string, i: number, key: DeviceKey, signal: AbortSigna
             if (id) lastEventId = id;
             const event = /^event: (.*)$/m.exec(block)?.[1];
             const data = /^data: (.*)$/m.exec(block)?.[1];
+            if (event === "ready") attempt = 0;
             if (event === "hook") c.events++;
             if (event === "resync" && data) lastEventId = String((JSON.parse(data) as { after: number }).after);
             if (event === "closed" && data) {
@@ -140,9 +140,9 @@ async function hold(relay: string, i: number, key: DeviceKey, signal: AbortSigna
       signal.removeEventListener("abort", onAbort);
     }
     if (signal.aborted) return;
-    attempt++;
     c.reconnects++;
     const wait = backoffMs(attempt);
+    attempt++;
     log(`conn ${i}: ${reason}; reconnecting in ${wait} ms (Last-Event-ID ${lastEventId ?? "none"})`);
     await new Promise((r) => setTimeout(r, wait));
   }

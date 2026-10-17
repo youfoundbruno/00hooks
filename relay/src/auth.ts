@@ -10,6 +10,7 @@ import {
   bodyHash,
   canonicalString,
   importPublicKey,
+  isUnpaddedBase64Url,
 } from "./canonical.ts";
 import { fromBase64, isId, utf8 } from "./encoding.ts";
 import { HttpError, error, unauthorized } from "./http.ts";
@@ -56,11 +57,14 @@ export async function authenticate(
     .first<{ account_id: string; public_key: string; last_seen_at: number | null; revoked_at: number | null }>();
   if (!device || device.revoked_at !== null) throw new HttpError(unauthorized());
 
-  const sig = fromBase64(signature);
+  // The signature is 64 bytes, unpadded base64url: 86 characters.
+  const sig = isUnpaddedBase64Url(signature, 86) ? fromBase64(signature) : null;
   const key = await importPublicKey(device.public_key);
   if (!sig || sig.byteLength !== 64 || !key) throw new HttpError(unauthorized());
+  // Built from the URL the relay received: Workers don't rewrite the path or query (PROTOCOL §1).
   const url = new URL(request.url);
   const canonical = canonicalString({
+    deviceId,
     host: url.host,
     method: request.method,
     pathAndQuery: url.pathname + url.search,

@@ -11,7 +11,12 @@ export const HEADER_NONCE = "X-00h-Nonce";
 export const HEADER_SIGNATURE = "X-00h-Signature";
 
 export interface CanonicalParts {
-  /** Lowercase, with `:port` only when the port isn't the scheme's default (what `URL.host` gives). */
+  /** The `X-00h-Device` value: signed, so a signature can't be presented as another device's. */
+  deviceId: string;
+  /**
+   * Exactly the Host header: lowercase, IPv6 in brackets, `:port` only when it isn't the scheme's
+   * default. `new URL(…).host` gives exactly that.
+   */
   host: string;
   method: string;
   /** The path and query exactly as sent. */
@@ -25,6 +30,7 @@ export interface CanonicalParts {
 export function canonicalString(p: CanonicalParts): string {
   return [
     SIGNATURE_VERSION,
+    p.deviceId,
     p.host.toLowerCase(),
     p.method.toUpperCase(),
     p.pathAndQuery,
@@ -70,6 +76,7 @@ export async function signRequest(
   const time = String(opts.time ?? Date.now());
   const nonce = opts.nonce ?? newNonce();
   const canonical = canonicalString({
+    deviceId: key.deviceId,
     host: u.host,
     method,
     pathAndQuery: u.pathname + u.search,
@@ -86,10 +93,18 @@ export async function signRequest(
   };
 }
 
-/** Imports a raw Ed25519 public key given as base64url; null when it isn't one. */
+/** Unpadded base64url (RFC 4648 §5 without `=`), as PROTOCOL §1 requires, of exactly `chars` chars. */
+export function isUnpaddedBase64Url(s: string, chars: number): boolean {
+  return s.length === chars && /^[A-Za-z0-9_-]+$/.test(s);
+}
+
+/** Imports a raw Ed25519 public key given as unpadded base64url (43 chars); null otherwise. */
 export async function importPublicKey(publicKey: string): Promise<CryptoKey | null> {
+  // Strict, so one key has one spelling (the uniqueness of keys is checked on the string).
+  if (!isUnpaddedBase64Url(publicKey, 43)) return null;
   const raw = fromBase64(publicKey);
-  if (!raw || raw.byteLength !== 32) return null;
+  // …and canonical: the last character's unused bits are zero.
+  if (!raw || raw.byteLength !== 32 || toBase64Url(raw) !== publicKey) return null;
   try {
     return await crypto.subtle.importKey("raw", raw, { name: "Ed25519" }, false, ["verify"]);
   } catch {

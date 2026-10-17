@@ -13,7 +13,8 @@ depends on it. `scripts/idle-cost.ts` does the measuring.
 
 1. Creates one account per connection (each always-on user has their own Durable Object).
 2. Opens one signed SSE stream per account and holds it for the whole window, reconnecting the way a
-   client does (retry plus jitter, backing off to 30 s; 70 s without a byte counts as a drop). It
+   client does (PROTOCOL §6: a random wait between half and all of `min(30 s, retry × 2^attempt)`,
+   reset by `ready`; 70 s without a byte counts as a drop). It
    logs reconnects and closes, a summary every 10 minutes, and at the end the heartbeat count against
    the expected one (one per connection every 15 s).
 3. When `CF_ACCOUNT_ID` and `CF_API_TOKEN` are in the environment, queries Cloudflare's GraphQL

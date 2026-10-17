@@ -251,8 +251,12 @@ export function formatReport(r: CostReport): string {
   ].join("\n");
 }
 
-/** Next reconnect delay: `retry` plus jitter, doubling to 30 s (PROTOCOL §6). */
-export function backoffMs(attempt: number, random: () => number = Math.random): number {
-  const base = Math.min(5000 * 2 ** Math.max(0, attempt - 1), 30_000);
-  return Math.round(Math.min(base + random() * 1000, 30_000));
+/**
+ * The wait before reconnect number `attempt` (0 for the first after a drop; reset by `ready`):
+ * a random time between half and all of `min(30 s, retry × 2^attempt)`, never under 1 s
+ * (PROTOCOL §6).
+ */
+export function backoffMs(attempt: number, random: () => number = Math.random, retryMs = 5000): number {
+  const d = Math.min(30_000, retryMs * 2 ** Math.max(0, attempt));
+  return Math.round(Math.max(1000, d / 2 + random() * (d / 2)));
 }

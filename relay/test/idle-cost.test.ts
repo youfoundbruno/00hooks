@@ -109,10 +109,13 @@ describe("idle-cost arithmetic", () => {
     expect(PRICING).toEqual({ requestUsdPerMillion: 0.15, durationUsdPerMillionGbS: 12.5, gbPerObject: 0.128, incomingWebSocketMessagesPerRequest: 20 });
   });
 
-  it("backs off from retry plus jitter to 30 s", () => {
+  it("backs off between half and all of min(30 s, retry × 2^attempt), never under 1 s", () => {
+    expect(backoffMs(0, () => 0)).toBe(2500);
+    expect(backoffMs(0, () => 1)).toBe(5000);
     expect(backoffMs(1, () => 0)).toBe(5000);
-    expect(backoffMs(1, () => 0.5)).toBe(5500);
-    expect(backoffMs(2, () => 0)).toBe(10_000);
-    expect(backoffMs(10, () => 0.99)).toBe(30_000);
+    expect(backoffMs(2, () => 0.5)).toBe(15_000);
+    expect(backoffMs(10, () => 0)).toBe(15_000);
+    expect(backoffMs(10, () => 1)).toBe(30_000);
+    expect(backoffMs(0, () => 0, 1000)).toBe(1000);
   });
 });

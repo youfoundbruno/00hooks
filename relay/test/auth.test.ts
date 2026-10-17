@@ -4,29 +4,86 @@ import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test"
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import worker from "../src/index.ts";
-import { canonicalString, generateDeviceKey, newNonce, signRequest } from "../src/canonical.ts";
-import { utf8 } from "../src/encoding.ts";
-import { BASE, fetchRelay, newAccount, signed } from "./helpers.ts";
+import { bodyHash, canonicalString, generateDeviceKey, importPublicKey, newNonce, signRequest } from "../src/canonical.ts";
+import { fromBase64, fromHex, toBase64, utf8 } from "../src/encoding.ts";
+import { BASE, enrolDevice, fetchRelay, newAccount, signed } from "./helpers.ts";
 
 describe("canonical string", () => {
-  it("is the seven lines of PROTOCOL §1, joined with \\n", () => {
+  // PROTOCOL §1's example: both the relay and the CLI test against it.
+  const vector = {
+    seedHex: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    publicKey: "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+    deviceId: "dev_0123456789abcdefghjkmnpq",
+    url: "https://relay.example.com/v1/hooks?limit=10",
+    time: "1792233600000",
+    nonce: "AAECAwQFBgcICQoLDA0ODw",
+    body: '{"name":"ci","verify":{"preset":"github"}}',
+    bodySha256: "871ec9aaacf62bacee0fb97ada9c29fed342cd0d7a3a07731570385a03c17a4c",
+    canonical:
+      "00hooks-v1\ndev_0123456789abcdefghjkmnpq\nrelay.example.com\nPOST\n/v1/hooks?limit=10\n1792233600000\n" +
+      "AAECAwQFBgcICQoLDA0ODw\n871ec9aaacf62bacee0fb97ada9c29fed342cd0d7a3a07731570385a03c17a4c",
+    signature: "_nBVrNWhRGN_JWnxbDBmQjNFDXz5APg0zqD6eCXe7EeJptiP0-Xb1czIn-r0p9faavla1rF7dhbtotQ3OTR1DA",
+  };
+
+  async function vectorKey(): Promise<CryptoKey> {
+    // PKCS#8 wrapping of a raw Ed25519 seed (RFC 8410).
+    const pkcs8 = fromHex(`302e020100300506032b657004220420${vector.seedHex}`)!;
+    return crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, true, ["sign"]);
+  }
+
+  it("matches the protocol's test vector exactly", async () => {
+    const body = utf8(vector.body);
+    expect(await bodyHash(body)).toBe(vector.bodySha256);
+    const u = new URL(vector.url);
     expect(
       canonicalString({
-        host: "Relay.Example:8443",
-        method: "post",
-        pathAndQuery: "/v1/hooks?x=1",
-        time: "1792233600000",
-        nonce: "AAAAAAAAAAAAAAAAAAAAAA",
-        bodySha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        deviceId: vector.deviceId,
+        host: u.host,
+        method: "POST",
+        pathAndQuery: u.pathname + u.search,
+        time: vector.time,
+        nonce: vector.nonce,
+        bodySha256: vector.bodySha256,
       }),
-    ).toBe(
-      "00hooks-v1\nrelay.example:8443\nPOST\n/v1/hooks?x=1\n1792233600000\nAAAAAAAAAAAAAAAAAAAAAA\n" +
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    );
+    ).toBe(vector.canonical);
+    const privateKey = await vectorKey();
+    const jwk = (await crypto.subtle.exportKey("jwk", privateKey)) as JsonWebKey;
+    expect(jwk.x).toBe(vector.publicKey);
+    const headers = await signRequest({ deviceId: vector.deviceId, privateKey }, "POST", vector.url, body, {
+      time: Number(vector.time),
+      nonce: vector.nonce,
+    });
+    expect(headers).toEqual({
+      "X-00h-Device": vector.deviceId,
+      "X-00h-Time": vector.time,
+      "X-00h-Nonce": vector.nonce,
+      "X-00h-Signature": vector.signature,
+    });
+    // And the relay's verification accepts it.
+    const pub = (await importPublicKey(vector.publicKey))!;
+    expect(await crypto.subtle.verify("Ed25519", pub, fromBase64(vector.signature)!, utf8(vector.canonical))).toBe(true);
+  });
+
+  it("hashes the empty string when there's no body", async () => {
+    expect(await bodyHash(undefined)).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  });
+
+  it("uses the URL's host: lowercase, IPv6 in brackets, no default port", () => {
+    expect(new URL("https://Relay.Example.COM:443/x").host).toBe("relay.example.com");
+    expect(new URL("https://relay.example.com:8443/x").host).toBe("relay.example.com:8443");
+    expect(new URL("http://[::1]:8787/x").host).toBe("[::1]:8787");
   });
 
   it("makes 22-character base64url nonces", () => {
     expect(newNonce()).toMatch(/^[A-Za-z0-9_-]{22}$/);
+  });
+
+  it("accepts public keys only as canonical unpadded base64url", async () => {
+    expect(await importPublicKey(vector.publicKey)).not.toBeNull();
+    expect(await importPublicKey(`${vector.publicKey}=`)).toBeNull();
+    // Same bytes, but the last character's unused bits set: another spelling of the same key.
+    expect(await importPublicKey(`${vector.publicKey.slice(0, 42)}h`)).toBeNull();
+    expect(await importPublicKey(toBase64(fromBase64(vector.publicKey)!))).toBeNull();
   });
 });
 
@@ -49,6 +106,14 @@ describe("signed requests", () => {
     expect(await call(url, url)).toBe(200);
     expect(await call("https://relay.test/v1/hooks?page=1", url)).toBe(401);
     expect(await call("https://relay.test:8443/v1/hooks?page=2", url)).toBe(401);
+  });
+
+  it("signs the device id: a signature can't be presented under another device's id", async () => {
+    const dev = await newAccount();
+    const other = await enrolDevice(dev);
+    const headers = await signRequest(dev, "GET", `${BASE}/v1/devices`);
+    expect((await fetchRelay("/v1/devices", { headers: { ...headers, "X-00h-Device": other.deviceId } })).status).toBe(401);
+    expect((await fetchRelay("/v1/devices", { headers })).status).toBe(200);
   });
 
   it("refuses a signature from another key, without saying which check failed", async () => {
@@ -116,6 +181,8 @@ describe("signed requests", () => {
       expect((await fetchRelay("/v1/devices", { headers: h })).status).toBe(401);
     }
     expect((await fetchRelay("/v1/devices", { headers: { ...headers, "X-00h-Nonce": "short" } })).status).toBe(401);
+    // Padded base64url isn't the protocol's encoding.
+    expect((await fetchRelay("/v1/devices", { headers: { ...headers, "X-00h-Signature": `${headers["X-00h-Signature"]}==` } })).status).toBe(401);
     expect((await fetchRelay("/v1/devices", { headers: { ...headers, "X-00h-Device": "dev_nope" } })).status).toBe(401);
   });
 });

@@ -63,8 +63,8 @@ Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](do
 
 ## Security notes
 
-- **Requests are signed by device keys** (Ed25519 over host, method, path and query, time, nonce and
-  body hash). The private key never leaves the device. Requests more than 300 s off the relay's
+- **Requests are signed by device keys** (Ed25519 over the device id, host, method, path and query,
+  time, nonce and body hash; PROTOCOL §1 has a test vector the relay's tests check). The private key never leaves the device. Requests more than 300 s off the relay's
   clock are refused (`clock_skew`, with the server's time), and every nonce is spent in the
   account's Durable Object, strongly consistent, GET requests included, so a captured stream request
   can't be replayed into a live copy of the account's events.
