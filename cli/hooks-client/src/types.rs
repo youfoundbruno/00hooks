@@ -326,6 +326,72 @@ pub struct Closed {
     pub reason: String,
 }
 
+/// `event: hook-change` (PROTOCOL §6): a hook of the account was created, had its secret rotated,
+/// was renamed or deleted. Sent without an `id:`, at most once per device; it is not an event of
+/// the log, so it is never recorded or acknowledged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookChange {
+    /// `hook.created`, `hook.rotated`, `hook.renamed` or `hook.deleted`; see [`HookChange::change`].
+    pub kind: String,
+    pub hook_id: String,
+    /// The hook's name (its new one for a rename, its last one for a deletion).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The name before a rename; only for `hook.renamed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_name: Option<String>,
+    /// Who did it: a device id (`dev_…`), an API key id (`key_…`), or `None`.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// When, in Unix milliseconds.
+    #[serde(default)]
+    pub at: i64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// What a [`HookChange`] says happened. A kind this client doesn't know is [`Other`], never an
+/// error.
+///
+/// [`Other`]: HookChangeKind::Other
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookChangeKind {
+    Created,
+    Rotated,
+    Renamed,
+    Deleted,
+    Other,
+}
+
+impl HookChange {
+    pub fn change(&self) -> HookChangeKind {
+        match self.kind.as_str() {
+            "hook.created" => HookChangeKind::Created,
+            "hook.rotated" => HookChangeKind::Rotated,
+            "hook.renamed" => HookChangeKind::Renamed,
+            "hook.deleted" => HookChangeKind::Deleted,
+            _ => HookChangeKind::Other,
+        }
+    }
+
+    /// The actor in words: "device dev_…", "API key key_…", or "someone unknown". Not sanitised:
+    /// the caller does that for its output.
+    pub fn actor_words(&self) -> String {
+        match self.actor.as_deref() {
+            Some(a) if a.starts_with("dev_") => format!("device {a}"),
+            Some(a) if a.starts_with("key_") => format!("API key {a}"),
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => "someone unknown".to_string(),
+        }
+    }
+
+    /// Whether `device_id` made the change itself.
+    pub fn by_device(&self, device_id: &str) -> bool {
+        self.actor.as_deref() == Some(device_id)
+    }
+}
+
 /// An API key (PROTOCOL §9). Its token is shown only in [`CreatedKey`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -412,6 +478,38 @@ mod tests {
     fn secret_debug_is_redacted() {
         let s = Secret::new("whsec_abc");
         assert_eq!(format!("{s:?}"), "Secret(…)");
+    }
+
+    #[test]
+    fn hook_changes_read_every_kind_and_tolerate_new_ones() {
+        let raw = r#"{"kind":"hook.renamed","hookId":"hk_1","name":"billing",
+            "previousName":"payments","actor":"key_9","at":1760000000000,"future":1}"#;
+        let c: HookChange = serde_json::from_str(raw).unwrap();
+        assert_eq!(c.change(), HookChangeKind::Renamed);
+        assert_eq!(c.previous_name.as_deref(), Some("payments"));
+        assert_eq!(c.actor_words(), "API key key_9");
+        assert!(!c.by_device("dev_1"));
+        assert_eq!(serde_json::to_value(&c).unwrap()["future"], 1);
+        for (kind, want) in [
+            ("hook.created", HookChangeKind::Created),
+            ("hook.rotated", HookChangeKind::Rotated),
+            ("hook.deleted", HookChangeKind::Deleted),
+            ("hook.screen", HookChangeKind::Other),
+        ] {
+            let c: HookChange =
+                serde_json::from_value(serde_json::json!({"kind": kind, "hookId": "hk_1"}))
+                    .unwrap();
+            assert_eq!(c.change(), want);
+            assert_eq!(c.actor_words(), "someone unknown");
+            assert_eq!(c.name, None);
+        }
+        let c: HookChange = serde_json::from_str(
+            r#"{"kind":"hook.rotated","hookId":"hk_1","name":"x","actor":"dev_1","at":1}"#,
+        )
+        .unwrap();
+        assert!(c.by_device("dev_1"));
+        assert_eq!(c.actor_words(), "device dev_1");
+        assert!(serde_json::from_str::<HookChange>(r#"{"kind":"hook.created"}"#).is_err());
     }
 
     #[test]

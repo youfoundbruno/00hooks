@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use hooks_client::{Event, StreamEvent, SubscribeOptions, describe_skew, subscribe};
+use hooks_client::{
+    Event, HookChange, HookChangeKind, StreamEvent, SubscribeOptions, describe_skew, subscribe,
+};
 
 use crate::ctx::{CliResult, Ctx, Failure, sentence};
 use crate::output::{Line, Output, clock, duration, json_line, sanitize, size};
@@ -24,6 +26,41 @@ pub fn summary(e: &Event, hook_name: Option<&str>) -> String {
         size(e.body_len()),
         sanitize(&e.id, false),
     )
+}
+
+/// One human line about a hook change (`event: hook-change`): what happened to which hook, and who
+/// did it. `known` is the name this computer knew the hook by, if any.
+pub fn describe_change(c: &HookChange, known: Option<&str>) -> String {
+    let id = sanitize(&c.hook_id, false);
+    let name = c
+        .name
+        .as_deref()
+        .or(known)
+        .map(|n| format!("{} ({id})", sanitize(n, false)))
+        .unwrap_or_else(|| id.clone());
+    let who = sanitize(&c.actor_words(), false);
+    let what = match c.change() {
+        HookChangeKind::Created => format!("Hook {name} was created by {who}."),
+        HookChangeKind::Rotated => format!("Hook {name} had its secret rotated by {who}."),
+        HookChangeKind::Renamed => match c.previous_name.as_deref().or(known) {
+            Some(prev) => format!(
+                "Hook {id} was renamed from {} to {} by {who}.",
+                sanitize(prev, false),
+                sanitize(c.name.as_deref().unwrap_or("?"), false)
+            ),
+            None => format!("Hook {name} was renamed by {who}."),
+        },
+        HookChangeKind::Deleted => format!("Hook {name} was deleted by {who}."),
+        HookChangeKind::Other => format!(
+            "Hook {name} changed ({}) by {who}.",
+            sanitize(&c.kind, false)
+        ),
+    };
+    if c.at > 0 {
+        format!("{}  {what}", clock(c.at))
+    } else {
+        what
+    }
 }
 
 /// The body for a person to read: pretty JSON, or text, with control characters removed.
@@ -69,6 +106,21 @@ impl Names {
         self.map = hooks.into_iter().map(|h| (h.id, h.name)).collect();
         self.fetched = Some(Instant::now());
         Ok(())
+    }
+
+    /// Keep the map current from a hook change, so the next event shows the hook's new name.
+    fn apply(&mut self, c: &HookChange) {
+        match c.change() {
+            HookChangeKind::Created | HookChangeKind::Renamed | HookChangeKind::Rotated => {
+                if let Some(n) = &c.name {
+                    self.map.insert(c.hook_id.clone(), n.clone());
+                }
+            }
+            HookChangeKind::Deleted => {
+                self.map.remove(&c.hook_id);
+            }
+            HookChangeKind::Other => {}
+        }
     }
 
     async fn get(&mut self, ctx: &Ctx, id: &str) -> Option<String> {
@@ -231,6 +283,13 @@ pub async fn run(as_json: bool, filters: Vec<String>) -> CliResult {
                 ))]
             }
             StreamEvent::Warning(w) => vec![Line::Err(sentence(&sanitize(&w, false)))],
+            StreamEvent::HookChange(c) => {
+                let line = describe_change(&c, names.map.get(&c.hook_id).map(String::as_str));
+                names.apply(&c);
+                vec![Line::Err(line)]
+            }
+            // A kind of message this version doesn't know (the stream grows additively).
+            _ => continue,
         };
         let mut open = true;
         for line in lines {
@@ -299,6 +358,67 @@ mod tests {
         );
         let back: Event = serde_json::from_str(&line).unwrap();
         assert_eq!(back.event_type, e.event_type);
+    }
+
+    fn change(v: serde_json::Value) -> HookChange {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn hook_changes_say_what_happened_and_who_did_it() {
+        let at = 1792233600000i64;
+        let c = change(serde_json::json!({"kind": "hook.rotated", "hookId": "hk_1",
+            "name": "payments", "actor": "key_7", "at": at}));
+        assert_eq!(
+            describe_change(&c, None),
+            "10:40:00  Hook payments (hk_1) had its secret rotated by API key key_7."
+        );
+        let c = change(serde_json::json!({"kind": "hook.renamed", "hookId": "hk_1",
+            "name": "billing", "previousName": "payments", "actor": "dev_2"}));
+        assert_eq!(
+            describe_change(&c, Some("old")),
+            "Hook hk_1 was renamed from payments to billing by device dev_2."
+        );
+        let c = change(serde_json::json!({"kind": "hook.created", "hookId": "hk_3",
+            "name": "pay\u{1b}]0;x\u{7}ments", "actor": null}));
+        let line = describe_change(&c, None);
+        assert_eq!(
+            line,
+            "Hook pay]0;xments (hk_3) was created by someone unknown."
+        );
+        let c = change(serde_json::json!({"kind": "hook.deleted", "hookId": "hk_3"}));
+        assert_eq!(
+            describe_change(&c, Some("ci")),
+            "Hook ci (hk_3) was deleted by someone unknown."
+        );
+        let c = change(serde_json::json!({"kind": "hook.paused", "hookId": "hk_3"}));
+        assert_eq!(
+            describe_change(&c, None),
+            "Hook hk_3 changed (hook.paused) by someone unknown."
+        );
+    }
+
+    #[test]
+    fn hook_changes_keep_the_names_current() {
+        let mut names = Names {
+            map: HashMap::from([("hk_1".to_string(), "payments".to_string())]),
+            fetched: None,
+        };
+        names.apply(&change(
+            serde_json::json!({"kind": "hook.renamed", "hookId": "hk_1",
+            "name": "billing", "previousName": "payments"}),
+        ));
+        names.apply(&change(
+            serde_json::json!({"kind": "hook.created", "hookId": "hk_2",
+            "name": "payments"}),
+        ));
+        assert_eq!(names.map["hk_1"], "billing");
+        assert_eq!(names.map["hk_2"], "payments");
+        names.apply(&change(
+            serde_json::json!({"kind": "hook.deleted", "hookId": "hk_1",
+            "name": "billing"}),
+        ));
+        assert!(!names.map.contains_key("hk_1"));
     }
 
     #[test]

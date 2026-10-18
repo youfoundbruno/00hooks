@@ -324,6 +324,12 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
                 path.display()
             )),
             StreamEvent::Warning(w) => err(sentence(&sanitize(&w, false))),
+            StreamEvent::HookChange(c) => err(crate::listen::describe_change(
+                &c,
+                runner.hook_names().get(&c.hook_id).map(String::as_str),
+            )),
+            // A kind of message this version doesn't know (the stream grows additively).
+            _ => {}
         }
     };
     watcher.abort();

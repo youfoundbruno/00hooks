@@ -16,6 +16,9 @@
 //! [`Subscription::confirm`] after recording it itself; until then it stays in the store's inbox and
 //! a restart hands it over again, with the same id (at least once; the consumer dedupes by id).
 //!
+//! A `hook-change` message (a hook created, rotated, renamed or deleted) is handed over in stream
+//! order as [`StreamEvent::HookChange`]; it has no seq, so it is neither recorded nor acknowledged.
+//!
 //! An acknowledgement that fails is kept and retried with backoff while newer events keep flowing
 //! (acks are cumulative, so the next one covers it too). A `hook` message that can't be read is
 //! recorded raw in the store's quarantine and reported, never skipped silently.
@@ -31,7 +34,7 @@ use crate::api::Client;
 use crate::backoff::{Backoff, Clock, CloseAction, Jitter, TokioClock, close_action};
 use crate::sse::{SseItem, SseParser};
 use crate::store::{EventStore, Quarantined};
-use crate::types::{Closed, Event, Gap, Ready, Resync};
+use crate::types::{Closed, Event, Gap, HookChange, Ready, Resync};
 use crate::{Error, Result};
 
 /// Tuning for [`subscribe`]. The defaults are the protocol's.
@@ -68,8 +71,12 @@ impl Default for SubscribeOptions {
 /// What the stream yields.
 // `Hook` is the big variant and the common one: boxing it would change the API the runner matches
 // on for one move per event.
+//
+// Non-exhaustive since `HookChange` was added: the stream protocol grows additively (new SSE event
+// names), so a consumer keeps a catch-all arm and a new kind of message never breaks its build.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum StreamEvent {
     /// Connected: the relay resumes after `after`; `head` is its newest seq.
     Ready(Ready),
@@ -94,6 +101,10 @@ pub enum StreamEvent {
     },
     /// Something worth telling the person that doesn't stop the stream.
     Warning(String),
+    /// A hook of the account was created, rotated, renamed or deleted (`event: hook-change`). Not
+    /// an event of the log: never recorded, acknowledged or counted in the cursor, and sent at
+    /// most once per device, so a consumer that wants to remember it keeps it itself.
+    HookChange(HookChange),
 }
 
 /// What to do once the current batch has been handed over.
@@ -462,6 +473,11 @@ impl Subscription {
                             error: q.error,
                         });
                     }
+                },
+                // No `id:`: it doesn't move the cursor, and isn't recorded or acknowledged.
+                "hook-change" => match serde_json::from_str::<HookChange>(&ev.data) {
+                    Ok(c) => batch.push(StreamEvent::HookChange(c)),
+                    Err(e) => batch.push(warn_unreadable("hook-change", ev.id.as_deref(), &e)),
                 },
                 "gap" => match serde_json::from_str::<Gap>(&ev.data) {
                     Ok(g) => {
