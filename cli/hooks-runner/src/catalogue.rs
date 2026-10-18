@@ -1,7 +1,8 @@
 //! The event catalogue (PLAN §5.0): for each kind of event seen (a hook plus the provider's event
 //! type, or the payload's shape hash when there is none), its field tree with types and presence
 //! counts, one sample (the first), up to 20 values of short repeating fields, first and last seen,
-//! and a count. It notices new kinds and shape changes.
+//! and a count. It notices new kinds and shape changes. A hook keeps at most
+//! [`MAX_KINDS_PER_HOOK`] kinds, and at most [`NEW_KINDS_PER_WINDOW`] new kinds an hour count as new.
 //!
 //! Kept on this machine only, one private file per kind in `<runner>/catalogue/`. Samples and seen
 //! values are content: they can be cleared per kind or all at once, and a hook can be set to keep
@@ -28,6 +29,14 @@ const MAX_DEPTH: usize = 32;
 const MAX_ITEMS: usize = 50;
 /// Shape changes remembered per kind.
 const MAX_CHANGES: usize = 20;
+/// The most kinds kept per hook. A hook without event types names its kinds by the payload's
+/// shape, so whoever can post to it could mint kinds at will; past this, new kinds aren't recorded
+/// (and aren't new).
+pub const MAX_KINDS_PER_HOOK: usize = 200;
+/// At most this many new kinds per hook within [`NEW_KIND_WINDOW_MS`] count as new (fire
+/// `new_kind`); the rest are recorded quietly.
+pub const NEW_KINDS_PER_WINDOW: usize = 10;
+pub const NEW_KIND_WINDOW_MS: i64 = 3_600_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,6 +247,8 @@ pub struct Observation {
     pub key: String,
     pub new_kind: bool,
     pub change: Option<ShapeChange>,
+    /// The hook already has [`MAX_KINDS_PER_HOOK`] kinds: this one wasn't recorded.
+    pub capped: bool,
 }
 
 /// The catalogue: every kind seen, loaded from and saved to its directory.
@@ -245,6 +256,8 @@ pub struct Observation {
 pub struct Catalogue {
     dir: PathBuf,
     kinds: BTreeMap<String, KindRecord>,
+    /// [`MAX_KINDS_PER_HOOK`]; smaller in tests.
+    max_kinds: usize,
 }
 
 fn file_name(key: &str) -> String {
@@ -268,7 +281,11 @@ impl Catalogue {
                 kinds.insert(k.key(), k);
             }
         }
-        Ok(Catalogue { dir, kinds })
+        Ok(Catalogue {
+            dir,
+            kinds,
+            max_kinds: MAX_KINDS_PER_HOOK,
+        })
     }
 
     pub fn dir(&self) -> &Path {
@@ -334,6 +351,21 @@ impl Catalogue {
             headers: headers.clone(),
         };
         let Some(rec) = self.kinds.get_mut(&key) else {
+            let (mut kinds, mut recent) = (0, 0);
+            for k in self.kinds.values().filter(|k| k.hook_id == hook_id) {
+                kinds += 1;
+                if k.first_seen > at - NEW_KIND_WINDOW_MS && k.first_seen <= at {
+                    recent += 1;
+                }
+            }
+            if kinds >= self.max_kinds {
+                return Ok(Observation {
+                    key,
+                    new_kind: false,
+                    change: None,
+                    capped: true,
+                });
+            }
             let mut fields = w.fields;
             for f in fields.values_mut() {
                 if structure_only {
@@ -361,8 +393,9 @@ impl Catalogue {
             self.kinds.insert(key.clone(), rec);
             return Ok(Observation {
                 key,
-                new_kind: true,
+                new_kind: recent < NEW_KINDS_PER_WINDOW,
                 change: None,
+                capped: false,
             });
         };
 
@@ -443,6 +476,7 @@ impl Catalogue {
             key,
             new_kind: false,
             change,
+            capped: false,
         })
     }
 
@@ -507,6 +541,90 @@ mod tests {
     fn obs(c: &mut Catalogue, kind: &str, id: &str, p: Value, so: bool) -> Observation {
         let headers = BTreeMap::from([("x-github-event".to_string(), kind.to_string())]);
         c.observe("hk_1", kind, id, &p, &headers, 1000, so).unwrap()
+    }
+
+    #[test]
+    fn kinds_per_hook_are_capped() {
+        let dir = temp_dir("cat-cap");
+        let mut c = Catalogue::open(&dir).unwrap();
+        assert_eq!(c.max_kinds, MAX_KINDS_PER_HOOK);
+        // The same with a smaller cap, so the test doesn't write 200 files.
+        let max = 12;
+        c.max_kinds = max;
+        let h = BTreeMap::new();
+        // Kinds a day apart, so the hourly limit on new kinds doesn't come into it.
+        let day = 86_400_000;
+        for i in 0..max {
+            let o = c
+                .observe(
+                    "hk_1",
+                    &format!("k{i}"),
+                    "e",
+                    &json!({}),
+                    &h,
+                    i as i64 * day,
+                    false,
+                )
+                .unwrap();
+            assert!(o.new_kind && !o.capped, "{i}");
+        }
+        let at = max as i64 * day;
+        let o = c
+            .observe("hk_1", "one-too-many", "e", &json!({}), &h, at, false)
+            .unwrap();
+        assert!(!o.new_kind && o.capped);
+        assert!(c.get("hk_1", "one-too-many").is_none(), "not recorded");
+        // Known kinds still count; other hooks have their own room.
+        let o = c
+            .observe("hk_1", "k0", "e", &json!({}), &h, at, false)
+            .unwrap();
+        assert!(!o.capped && c.get("hk_1", "k0").unwrap().count == 2);
+        let o = c
+            .observe("hk_2", "k0", "e", &json!({}), &h, at, false)
+            .unwrap();
+        assert!(o.new_kind && !o.capped);
+        // Reopened from disk, the cap holds.
+        let mut c = Catalogue::open(&dir).unwrap();
+        c.max_kinds = max;
+        let o = c
+            .observe("hk_1", "again", "e", &json!({}), &h, at, false)
+            .unwrap();
+        assert!(o.capped);
+    }
+
+    #[test]
+    fn only_a_few_new_kinds_an_hour_count_as_new() {
+        let dir = temp_dir("cat-rate");
+        let mut c = Catalogue::open(&dir).unwrap();
+        let h = BTreeMap::new();
+        let new: Vec<bool> = (0..15)
+            .map(|i| {
+                c.observe(
+                    "hk_1",
+                    &format!("k{i}"),
+                    "e",
+                    &json!({}),
+                    &h,
+                    1000 + i,
+                    false,
+                )
+                .unwrap()
+                .new_kind
+            })
+            .collect();
+        assert_eq!(new.iter().filter(|n| **n).count(), NEW_KINDS_PER_WINDOW);
+        assert!(new[..NEW_KINDS_PER_WINDOW].iter().all(|n| *n));
+        assert!(c.get("hk_1", "k14").is_some(), "recorded all the same");
+        // Another hook isn't held back, and an hour later new kinds count again.
+        let o = c
+            .observe("hk_2", "x", "e", &json!({}), &h, 1000, false)
+            .unwrap();
+        assert!(o.new_kind);
+        let later = 1000 + NEW_KIND_WINDOW_MS + 20;
+        let o = c
+            .observe("hk_1", "later", "e", &json!({}), &h, later, false)
+            .unwrap();
+        assert!(o.new_kind);
     }
 
     #[test]

@@ -35,8 +35,16 @@ pub const MAX_PATTERN: usize = 200;
 /// What a pattern reads of a value: its first 64 KiB.
 pub const MAX_PATTERN_INPUT: usize = 64 * 1024;
 const REGEX_SIZE: usize = 256 * 1024;
+/// The most values a path gives (a `[]` path over a huge list, or lists in lists): the rest
+/// aren't read, so one item can't multiply a rule's work.
+pub const MAX_PATH_VALUES: usize = 1000;
+/// The longest domain name (RFC 1035): a longer one never matches *domain is*.
+pub const MAX_DOMAIN: usize = 253;
+/// The most labels a domain of [`MAX_DOMAIN`] characters can have.
+pub const MAX_LABELS: usize = 127;
 
-/// The values at a catalogue path, as text. `item` is `{payload, headers}` as the screen builds it.
+/// The values at a catalogue path, as text, at most [`MAX_PATH_VALUES`] (the first ones, in
+/// order). `item` is `{payload, headers}` as the screen builds it.
 pub fn values_at(payload: &Value, headers: &BTreeMap<String, String>, path: &str) -> Vec<String> {
     if let Some(h) = path.strip_prefix("headers.") {
         let h = h.to_ascii_lowercase();
@@ -44,6 +52,7 @@ pub fn values_at(payload: &Value, headers: &BTreeMap<String, String>, path: &str
             .iter()
             .filter(|(k, _)| k.to_ascii_lowercase() == h)
             .map(|(_, v)| v.clone())
+            .take(MAX_PATH_VALUES)
             .collect();
     }
     let Some(rest) = path.strip_prefix("payload") else {
@@ -53,14 +62,18 @@ pub fn values_at(payload: &Value, headers: &BTreeMap<String, String>, path: &str
     for part in split_path(rest) {
         let mut next = Vec::new();
         for v in cur {
+            let room = MAX_PATH_VALUES - next.len();
             match (part, v) {
-                ("[]", Value::Array(items)) => next.extend(items.iter()),
+                ("[]", Value::Array(items)) => next.extend(items.iter().take(room)),
                 (k, Value::Object(m)) if k != "[]" => {
                     if let Some(c) = m.get(k) {
                         next.push(c);
                     }
                 }
                 _ => {}
+            }
+            if next.len() >= MAX_PATH_VALUES {
+                break;
             }
         }
         cur = next;
@@ -146,15 +159,16 @@ pub fn domain_of(v: &str) -> String {
     host.trim_end_matches('.').to_string()
 }
 
-/// The longest domain read, in bytes, and its most labels (as DNS has them).
-pub const MAX_DOMAIN_BYTES: usize = 253;
-pub const MAX_DOMAIN_LABELS: usize = 127;
+/// Whether a domain is short enough to be one: at most [`MAX_DOMAIN`] characters and
+/// [`MAX_LABELS`] labels.
+fn domain_fits(d: &str) -> bool {
+    d.len() <= MAX_DOMAIN && d.bytes().filter(|b| *b == b'.').count() < MAX_LABELS
+}
 
-/// The domain and every parent of it: `a.b.example` → `a.b.example`, `b.example`, `example`. None
-/// for a domain longer than [`MAX_DOMAIN_BYTES`] or with more than [`MAX_DOMAIN_LABELS`] labels: it
-/// never matches (the relay reads the same).
+/// The domain and every parent of it: `a.b.example` → `a.b.example`, `b.example`, `example`.
+/// Nothing for a name longer than a domain can be.
 pub fn domain_suffixes(domain: &str) -> Vec<String> {
-    if domain.len() > MAX_DOMAIN_BYTES || domain.split('.').count() > MAX_DOMAIN_LABELS {
+    if !domain_fits(domain) {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -170,10 +184,18 @@ pub fn domain_suffixes(domain: &str) -> Vec<String> {
     }
 }
 
-/// Whether `value`'s domain is `domain` or under it.
+/// Whether `value`'s domain is `domain` or under it (the same as `domain` being one of
+/// [`domain_suffixes`], without making them). A name longer than a domain can be never matches.
 pub fn domain_is(value: &str, domain: &str) -> bool {
     let want = domain_of(domain);
-    !want.is_empty() && domain_suffixes(&domain_of(value)).contains(&want)
+    let d = domain_of(value);
+    if want.is_empty() || !domain_fits(&want) || !domain_fits(&d) {
+        return false;
+    }
+    d == want
+        || (d.len() > want.len()
+            && d.ends_with(want.as_str())
+            && d.as_bytes()[d.len() - want.len() - 1] == b'.')
 }
 
 /// Whether the words of `phrase` appear in order and adjacent among the words of `value`.
@@ -628,6 +650,64 @@ mod tests {
         assert!(domain_is("deals.example", "Deals.Example"));
         assert!(!domain_is("x@nodeals.example", "deals.example"));
         assert!(!domain_is("x@deals.example.com", "deals.example"));
+    }
+
+    #[test]
+    fn domains_longer_than_a_domain_never_match() {
+        let label = |n: usize| "a.".repeat(n);
+        // 253 characters in 127 labels is the most a domain can be.
+        let longest = format!("{}b", label(126));
+        assert_eq!(longest.len(), MAX_DOMAIN);
+        assert!(domain_is(&format!("u@{longest}"), "b"));
+        assert!(domain_is(&format!("u@{longest}"), &longest));
+        assert_eq!(domain_suffixes(&longest).len(), MAX_LABELS);
+        let one_more = format!("a.{longest}");
+        assert!(!domain_is(&one_more, "b"));
+        assert!(domain_suffixes(&one_more).is_empty());
+        let too_long = format!("{}.example", "x".repeat(250));
+        assert!(!domain_is(&too_long, "example"));
+        assert!(domain_suffixes(&too_long).is_empty());
+        // A flood of labels costs a scan, not a list of suffixes.
+        let flood = format!("{}example", label(200_000));
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            assert!(!domain_is(&flood, "a.example"));
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        // The same answers as the suffix list where both apply.
+        for (v, d) in [
+            ("x@mail.deals.example", "deals.example"),
+            ("x@deals.example", "deals.example"),
+            ("x@nodeals.example", "deals.example"),
+            ("x@a..b", ".b"),
+            ("x@a..b", "b"),
+            ("x@b", "a.b"),
+        ] {
+            let want = domain_of(d);
+            assert_eq!(
+                domain_is(v, d),
+                domain_suffixes(&domain_of(v)).contains(&want),
+                "{v} {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_gives_at_most_so_many_values() {
+        let big = json!({"items": (0..5000).map(|i| json!({"sku": i})).collect::<Vec<_>>()});
+        let h = BTreeMap::new();
+        let v = values_at(&big, &h, "payload.items[].sku");
+        assert_eq!(v.len(), MAX_PATH_VALUES);
+        assert_eq!((v[0].as_str(), v[999].as_str()), ("0", "999"));
+        // Lists in lists can't multiply either.
+        let row: Vec<Value> = (0..100).map(|i| json!(i)).collect();
+        let grid = json!({"rows": (0..100).map(|_| json!(row)).collect::<Vec<_>>()});
+        assert_eq!(
+            values_at(&grid, &h, "payload.rows[][]").len(),
+            MAX_PATH_VALUES
+        );
+        let small = json!({"items": [{"sku": "a"}, {"sku": "b"}]});
+        assert_eq!(values_at(&small, &h, "payload.items[].sku"), ["a", "b"]);
     }
 
     #[test]

@@ -390,3 +390,80 @@ async fn service_files_and_secrets() {
     let out = run(&dir, &["secrets", "set", "bad name"]).await;
     assert_eq!(out.status.code(), Some(1));
 }
+
+/// Whether a process is still there (a zombie waiting for its parent counts as gone).
+#[cfg(unix)]
+fn alive(pid: &str) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let stat = text(&out.stdout).trim().to_string();
+    out.status.success() && !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_stops_a_run_half_way_and_kills_its_command() {
+    let relay = MockRelay::start().await;
+    let home = TempHome::new("cli-sigterm");
+    let dir: PathBuf = home.0.clone();
+    relay.with(|s| s.client_home = Some(dir.clone()));
+    let out = run(&dir, &["login", "--relay", &relay.url]).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let pidfile = dir.join("bg.pid");
+    std::fs::write(
+        dir.join("automations.yaml"),
+        format!(
+            r#"version: 1
+notify: none
+automations:
+  - name: Slow
+    when: {{ hook: hk_1, kinds: [push] }}
+    allow_commands: [/bin/sh]
+    then:
+      - run: {{ command: sh, args: [-c, "sleep 60 & echo $! > {}; wait"], event: none, timeout: 5m }}
+"#,
+            pidfile.display()
+        ),
+    )
+    .unwrap();
+    relay.push_events(1..=1);
+    let child = spawn_runner(&dir);
+    wait_for("the command to start", || {
+        std::fs::read_to_string(&pidfile).is_ok_and(|p| !p.trim().is_empty())
+    })
+    .await;
+    let pid = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .to_string();
+    // Before, the run was awaited outside the signal handling: SIGTERM waited for the command.
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let started = Instant::now();
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("Stopped."),
+        "{}",
+        text(&out.stderr)
+    );
+    wait_for("the command to be killed", || !alive(&pid)).await;
+    // The next start says the run was interrupted.
+    std::fs::write(dir.join("automations.yaml"), "version: 1\nnotify: none\n").unwrap();
+    let child = spawn_runner(&dir);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let stderr = stop(child);
+    assert!(stderr.contains("was interrupted"), "{stderr}");
+}

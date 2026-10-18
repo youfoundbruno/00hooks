@@ -9,6 +9,7 @@ mod doctor;
 mod hooks;
 mod listen;
 mod output;
+mod quarantine;
 mod screen;
 mod service;
 
@@ -152,6 +153,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<ScreenCmd>,
     },
+    /// Events that arrived but couldn't be read or opened.
+    Quarantine {
+        #[command(subcommand)]
+        cmd: Option<QuarantineCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuarantineCmd {
+    /// What is in the quarantine, and why (the default).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open again the events that waited for something this computer lacked (a strict hook's
+    /// secret, a sealing key, a locked keychain); those that open now run on the next start.
+    Retry,
 }
 
 #[derive(Subcommand)]
@@ -337,6 +355,8 @@ enum HooksCmd {
         json: bool,
     },
     /// Keep a strict hook's secret on this computer (from stdin), so it can verify its events.
+    /// Say how it's signed with --preset (and its options), as at create; without it, the relay's
+    /// description is shown and has to be confirmed.
     Secret {
         hook: String,
         #[arg(long, conflicts_with = "public_key")]
@@ -344,6 +364,24 @@ enum HooksCmd {
         /// standard-webhooks-ed25519: the sender's public key.
         #[arg(long)]
         public_key: Option<String>,
+        /// How the sender signs: the preset the hook was created with.
+        #[arg(long, value_enum)]
+        preset: Option<Preset>,
+        /// hmac: the signature header.
+        #[arg(long, requires = "preset")]
+        header: Option<String>,
+        /// hmac: the HMAC hash (default sha256).
+        #[arg(long, value_enum, requires = "preset")]
+        algorithm: Option<Algorithm>,
+        /// hmac: how the signature is written (default hex).
+        #[arg(long, value_enum, requires = "preset")]
+        encoding: Option<Encoding>,
+        /// hmac: text before the signature, such as `sha256=`.
+        #[arg(long, requires = "preset")]
+        prefix: Option<String>,
+        /// Without --preset: accept the relay's description of the hook without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// List hooks.
     List {
@@ -455,13 +493,27 @@ async fn dispatch(cmd: Cmd) -> CliResult {
                 hook,
                 secret_stdin,
                 public_key,
+                preset,
+                header,
+                algorithm,
+                encoding,
+                prefix,
+                yes,
             } => {
                 let secret = if secret_stdin {
                     Some(hooks::read_secret_stdin()?)
                 } else {
                     None
                 };
-                hooks::secret(hook, secret, public_key).await
+                let args = hooks::SecretArgs {
+                    preset,
+                    header,
+                    algorithm,
+                    encoding,
+                    prefix,
+                    yes,
+                };
+                hooks::secret(hook, secret, public_key, args).await
             }
             HooksCmd::List { json } => hooks::list(json).await,
             HooksCmd::Show { hook, json } => hooks::show(hook, json).await,
@@ -501,6 +553,10 @@ async fn dispatch(cmd: Cmd) -> CliResult {
             ScreenCmd::Drop { id, always } => screen::drop(id, always).await,
             ScreenCmd::Rules { json } => screen::rules(json),
             ScreenCmd::Sync => screen::sync().await,
+        },
+        Cmd::Quarantine { cmd } => match cmd.unwrap_or(QuarantineCmd::List { json: false }) {
+            QuarantineCmd::List { json } => quarantine::list(json),
+            QuarantineCmd::Retry => quarantine::retry(),
         },
         Cmd::Secrets { cmd } => match cmd {
             SecretsCmd::Set { name } => automate::secrets_set(name),

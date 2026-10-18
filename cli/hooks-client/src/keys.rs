@@ -240,6 +240,21 @@ fn check_private(path: &Path) -> Result<()> {
             path.display()
         )));
     }
+    // The folder's access list is owner-only (narrowed now if it was made before that, or
+    // widened since), and the key file grants no one else anything of its own.
+    #[cfg(windows)]
+    {
+        if let Some(dir) = path.parent() {
+            fsutil::ensure_private_dir(dir)?;
+        }
+        if !fsutil::owner_only(path)? {
+            return Err(Error::KeyStore(format!(
+                "refusing to read {}: its access list lets other users read it. Log in again and \
+                 revoke this device from another one",
+                path.display()
+            )));
+        }
+    }
     Ok(())
 }
 

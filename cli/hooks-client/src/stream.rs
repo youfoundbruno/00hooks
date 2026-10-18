@@ -6,10 +6,16 @@
 //! delivery rule: **record** it in the local store, **acknowledge** it to the relay, then **hand it
 //! over**, skipping any id that was handed over before.
 //!
-//! Events arrive sealed (PROTOCOL §5). When the client has an [`crate::Opener`]
-//! ([`Client::set_opener`]), each one is checked and opened before it is recorded, so the store and
-//! the consumer only ever see opened events; one that doesn't open, or arrives unsealed, is
-//! quarantined.
+//! Events arrive sealed (PROTOCOL §5). The client must have an [`crate::Opener`]
+//! ([`Client::set_opener`]) before the first [`Subscription::next`]: without one the subscription
+//! fails rather than accept events it can't check. Each event is checked and opened before it is
+//! recorded, so the store and the consumer only ever see opened events. One that will never open
+//! (forged, unsealed, a strict delivery that doesn't verify, a stale seq) is quarantined and
+//! acknowledged; one that lacks something this device can get back (a strict hook's secret, a
+//! locked key store) is **held**: neither recorded nor acknowledged, the connection is dropped and
+//! the relay sends it again, for [`SubscribeOptions::hold_attempts`] tries, and only then kept
+//! whole in the quarantine, from which every reconnect (and `00hooks quarantine retry`) opens it
+//! again.
 //!
 //! By default an event is marked handed-over as [`Subscription::next`] returns it (at most once to
 //! the consumer). With [`SubscribeOptions::confirm`], it is marked only when the consumer calls
@@ -30,15 +36,27 @@ use std::time::Duration;
 use crate::api::Client;
 use crate::backoff::{Backoff, Clock, CloseAction, Jitter, TokioClock, close_action};
 use crate::sse::{SseItem, SseParser};
-use crate::store::{EventStore, Quarantined};
+use crate::store::{EventStore, QuarantineKind, Quarantined};
 use crate::types::{Closed, Event, Gap, Ready, Resync};
 use crate::{Error, Result};
 
 /// Tuning for [`subscribe`]. The defaults are the protocol's.
 #[derive(Clone)]
 pub struct SubscribeOptions {
-    /// No byte (heartbeats included) for this long means the connection is dead. 70 s.
+    /// No byte (heartbeats included) for this long means the connection is dead. 70 s. One
+    /// deadline per connection, moved only by bytes received.
     pub idle_timeout: Duration,
+    /// Opening the stream (the request and its response headers) takes at most this long. 30 s.
+    pub open_timeout: Duration,
+    /// How many times an event that lacks something this device can get back (a strict hook's
+    /// secret, a locked key store) is held, the relay sending it again after a growing wait (up to
+    /// `max_backoff`), before it is kept whole in the quarantine instead. 20.
+    pub hold_attempts: u32,
+    /// How many times in a row the same event may be larger than the stream allows before it is
+    /// skipped by its seq (and noted in the quarantine). 3.
+    pub oversize_attempts: u32,
+    /// The largest line or event the stream accepts. 16 MiB ([`crate::sse::DEFAULT_MAX`]).
+    pub max_event_bytes: usize,
     /// The shortest wait before reconnecting. 1 s.
     pub min_backoff: Duration,
     /// The longest wait before reconnecting. 30 s.
@@ -56,6 +74,10 @@ impl Default for SubscribeOptions {
     fn default() -> Self {
         SubscribeOptions {
             idle_timeout: Duration::from_secs(70),
+            open_timeout: Duration::from_secs(30),
+            hold_attempts: 20,
+            oversize_attempts: 3,
+            max_event_bytes: crate::sse::DEFAULT_MAX,
             min_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             clock: Arc::new(TokioClock),
@@ -85,8 +107,9 @@ pub enum StreamEvent {
         delay: Duration,
         reason: String,
     },
-    /// A `hook` message that couldn't be read. Its raw text was recorded in `path` (the store's
-    /// `quarantine.jsonl`) before anything past it was acknowledged.
+    /// A `hook` message that couldn't be read or opened. It was recorded in `path` (the store's
+    /// `quarantine.jsonl`; raw, or only its hash, by [`QuarantineKind`]) before anything past it
+    /// was acknowledged.
     Quarantined {
         seq: Option<u64>,
         path: PathBuf,
@@ -99,7 +122,16 @@ pub enum StreamEvent {
 /// What to do once the current batch has been handed over.
 #[derive(Debug)]
 enum Then {
-    Reconnect { immediate: bool, reason: String },
+    Reconnect {
+        immediate: bool,
+        reason: String,
+    },
+    /// An event is held: drop the connection, and come back for it after `delay`.
+    Hold {
+        attempt: u32,
+        delay: Duration,
+        reason: String,
+    },
     Stop(Closed),
 }
 
@@ -131,6 +163,15 @@ pub struct Subscription {
     retry_due: bool,
     then: Option<Then>,
     finished: bool,
+    /// When the connection counts as dead: set on connect, moved only by bytes received.
+    idle: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    /// The highest seq the relay has shown to exist (its `ready` head, signed events since): a
+    /// `gap` is clamped to it.
+    head: u64,
+    /// The event being held, and how many times.
+    hold: Option<(String, u32)>,
+    /// The seq that was too large, and how many times in a row.
+    oversize: Option<(u64, u32)>,
 }
 
 /// What waiting on the connection produced.
@@ -146,12 +187,13 @@ pub fn subscribe(client: Client, store: EventStore, opts: SubscribeOptions) -> S
     let backoff = Backoff::new(opts.min_backoff, opts.max_backoff, opts.jitter.clone());
     let pending: Vec<StreamEvent> = store.pending().into_iter().map(StreamEvent::Hook).collect();
     let ack_through = store.pending_through();
+    let parser = SseParser::new(opts.max_event_bytes);
     Subscription {
         client,
         store,
         opts,
         backoff,
-        parser: SseParser::default(),
+        parser,
         conn: None,
         delay: None,
         out: VecDeque::new(),
@@ -164,6 +206,10 @@ pub fn subscribe(client: Client, store: EventStore, opts: SubscribeOptions) -> S
         retry_due: false,
         then: None,
         finished: false,
+        idle: None,
+        head: 0,
+        hold: None,
+        oversize: None,
     }
 }
 
@@ -191,14 +237,13 @@ impl Subscription {
         self.store.mark_delivered(id)
     }
 
-    /// Opens a `hook` event with the client's opener; without one, sealed events can't be read.
-    fn open(&self, e: Event) -> std::result::Result<Event, String> {
+    /// Opens a `hook` event with the client's opener (checked before connecting).
+    fn open(&self, e: Event) -> std::result::Result<Event, crate::OpenError> {
         match self.client.opener() {
             Some(op) => op.open(e),
-            None if e.sealed.is_some() => {
-                Err("the event is sealed and this client has no sealing key configured".to_string())
-            }
-            None => Ok(e),
+            None => Err(crate::OpenError::refused(
+                "this client has no opener, so events can't be checked",
+            )),
         }
     }
 
@@ -210,6 +255,7 @@ impl Subscription {
 
     fn schedule_reconnect(&mut self, immediate: bool, reason: String) {
         self.conn = None;
+        self.idle = None;
         let first = self.backoff.attempt() == 0;
         let wait = self.backoff.next_delay();
         let delay = if immediate && first {
@@ -323,11 +369,33 @@ impl Subscription {
                     self.schedule_reconnect(immediate, reason);
                     continue;
                 }
+                Some(Then::Hold {
+                    attempt,
+                    delay,
+                    reason,
+                }) => {
+                    self.conn = None;
+                    self.idle = None;
+                    self.delay = Some(delay);
+                    self.out.push_back(StreamEvent::Reconnecting {
+                        attempt,
+                        delay,
+                        reason,
+                    });
+                    continue;
+                }
                 None => {}
             }
 
             // 4. Connect: signed afresh, resuming from the durable cursor.
             if self.conn.is_none() {
+                // Fail closed: events that can't be checked are never accepted.
+                if self.client.opener().is_none() {
+                    return self.fail(Error::Invalid(
+                        "the stream needs an Opener (Client::set_opener) to check and open events"
+                            .into(),
+                    ));
+                }
                 if let Some(d) = self.delay {
                     if !d.is_zero() {
                         self.opts.clock.sleep(d).await;
@@ -336,21 +404,39 @@ impl Subscription {
                 }
                 let cursor = self.store.cursor();
                 let last = (cursor > 0).then_some(cursor);
-                match self.client.open_stream(last, false).await {
-                    Ok(resp) => {
+                let opened = tokio::time::timeout(
+                    self.opts.open_timeout,
+                    self.client.open_stream(last, false),
+                )
+                .await;
+                match opened {
+                    Ok(Ok(resp)) => {
                         self.conn = Some(resp);
-                        self.parser = SseParser::default();
+                        self.parser = SseParser::new(self.opts.max_event_bytes);
+                        self.idle = Some(self.opts.clock.sleep(self.opts.idle_timeout));
                     }
-                    Err(e) if is_retryable(&e) => {
+                    Ok(Err(e)) if is_retryable(&e) => {
                         self.schedule_reconnect(false, e.to_string());
                         continue;
                     }
-                    Err(e) => return self.fail(e),
+                    Ok(Err(e)) => return self.fail(e),
+                    Err(_) => {
+                        let secs = self.opts.open_timeout.as_secs_f64();
+                        self.schedule_reconnect(
+                            false,
+                            format!("the relay didn't open the stream within {secs:.0} s"),
+                        );
+                        continue;
+                    }
                 }
             }
 
-            // 5. Read, treating a silent connection as dead, and retry a pending ack when due.
-            let idle = self.opts.clock.sleep(self.opts.idle_timeout);
+            // 5. Read, treating a silent connection as dead, and retry a pending ack when due. The
+            //    idle deadline is the connection's own: an ack retry firing doesn't move it.
+            if self.idle.is_none() {
+                self.idle = Some(self.opts.clock.sleep(self.opts.idle_timeout));
+            }
+            let idle = self.idle.as_mut().expect("deadline");
             let conn = self.conn.as_mut().expect("connected");
             let retry = self.ack_retry.as_mut();
             let read = tokio::select! {
@@ -378,6 +464,7 @@ impl Subscription {
                 }
                 Read::Chunk(Err(e)) => self.schedule_reconnect(false, Error::from(e).to_string()),
                 Read::Chunk(Ok(Some(bytes))) => {
+                    self.idle = Some(self.opts.clock.sleep(self.opts.idle_timeout));
                     if let Err(e) = self.process(&bytes) {
                         return self.fail(e);
                     }
@@ -386,17 +473,61 @@ impl Subscription {
         }
     }
 
+    /// The parser met an event larger than it allows. The relay will send it again on reconnect;
+    /// after [`SubscribeOptions::oversize_attempts`] times in a row for the same seq, it is noted
+    /// in the quarantine and skipped (acknowledged), so one event can't stall the stream forever.
+    fn too_large(&mut self, e: crate::sse::TooLarge) -> Result<()> {
+        let seq = self
+            .parser
+            .take_oversize_id()
+            .and_then(|i| i.parse::<u64>().ok())
+            .filter(|s| *s > self.store.cursor());
+        if let Some(seq) = seq {
+            let n = match &mut self.oversize {
+                Some((s, n)) if *s == seq => {
+                    *n += 1;
+                    *n
+                }
+                _ => {
+                    self.oversize = Some((seq, 1));
+                    1
+                }
+            };
+            if n >= self.opts.oversize_attempts.max(1) {
+                self.oversize = None;
+                let q = Quarantined::new(
+                    QuarantineKind::Oversize,
+                    crate::api::system_now_ms(),
+                    Some(&seq.to_string()),
+                    "",
+                    format!("{e}, {n} times; skipped"),
+                );
+                let path = self.store.quarantine(&q)?;
+                self.store.advance_cursor(seq)?;
+                if seq > self.acked {
+                    self.ack_through = Some(self.ack_through.unwrap_or(0).max(seq));
+                }
+                self.awaiting_ack.push(StreamEvent::Quarantined {
+                    seq: Some(seq),
+                    path,
+                    error: q.error,
+                });
+            }
+        }
+        self.schedule_reconnect(false, e.to_string());
+        Ok(())
+    }
+
     /// Parse a chunk, record its `hook` events, and queue everything for the ack and the handover.
     fn process(&mut self, bytes: &[u8]) -> Result<()> {
         let items = match self.parser.push(bytes) {
             Ok(items) => items,
-            Err(e) => {
-                self.schedule_reconnect(false, e.to_string());
-                return Ok(());
-            }
+            Err(e) => return self.too_large(e),
         };
         let mut batch: Vec<StreamEvent> = Vec::new();
         let mut hooks: Vec<Event> = Vec::new();
+        // Opened from the quarantine on `ready`: already recorded and acknowledged.
+        let mut retried: Vec<StreamEvent> = Vec::new();
         let mut gaps_to = 0u64;
         // The highest seq among `hook` messages that couldn't be read but were quarantined.
         let mut quarantined_to = 0u64;
@@ -414,6 +545,7 @@ impl Subscription {
                 "ready" => match serde_json::from_str::<Ready>(&ev.data) {
                     Ok(r) => {
                         self.backoff.reset();
+                        self.head = r.head;
                         if let Some(op) = self.client.opener() {
                             match &r.seal_kid {
                                 None => batch.push(StreamEvent::Warning(
@@ -430,41 +562,144 @@ impl Subscription {
                                 }
                                 _ => {}
                             }
+                            // What waited in the quarantine for a secret or a key may open now.
+                            match self.store.retry_quarantined(&op) {
+                                Ok(r) => {
+                                    if !r.opened.is_empty() {
+                                        batch.push(StreamEvent::Warning(format!(
+                                            "{} quarantined event(s) opened now and are handed over",
+                                            r.opened.len()
+                                        )));
+                                    }
+                                    retried.extend(r.opened.into_iter().map(StreamEvent::Hook));
+                                }
+                                Err(e) => batch.push(StreamEvent::Warning(format!(
+                                    "couldn't retry the quarantined events ({e})"
+                                ))),
+                            }
                         }
                         batch.push(StreamEvent::Ready(r));
                     }
                     Err(e) => batch.push(warn_unreadable("ready", ev.id.as_deref(), &e)),
                 },
-                "hook" => match serde_json::from_str::<Event>(&ev.data)
-                    .map_err(|e| e.to_string())
-                    .and_then(|e| self.open(e))
-                {
-                    Ok(e) => {
-                        hooks.push(e.clone());
-                        batch.push(StreamEvent::Hook(e));
-                    }
-                    Err(e) => {
-                        // Kept raw, durably, before anything past it can be acknowledged.
-                        let seq = ev.id.as_deref().and_then(|i| i.parse::<u64>().ok());
-                        let q = Quarantined {
-                            at: crate::api::system_now_ms(),
-                            seq,
-                            raw_id: if seq.is_none() { ev.id.clone() } else { None },
-                            event: kind.to_string(),
-                            data: ev.data.clone(),
-                            error: e,
-                        };
+                "hook" => {
+                    let parsed = serde_json::from_str::<Event>(&ev.data);
+                    let failed = match parsed {
+                        Err(e) => Some((QuarantineKind::Refused, e.to_string())),
+                        // Seqs only grow, and a release takes a new one: an event at or below the
+                        // cursor that was never recorded is an old one sent again.
+                        Ok(e)
+                            if e.seq <= self.store.cursor()
+                                && !self.store.is_recorded(&e.id)
+                                && !self.store.is_seen(&e.id) =>
+                        {
+                            Some((
+                                QuarantineKind::Stale,
+                                format!(
+                                    "seq {} is at or below this device's cursor ({}) and was never \
+                                     recorded here: an old event sent again, so it isn't run",
+                                    e.seq,
+                                    self.store.cursor()
+                                ),
+                            ))
+                        }
+                        Ok(e) => {
+                            let (id, seq) = (e.id.clone(), e.seq);
+                            match self.open(e) {
+                                Ok(e) => {
+                                    if self.hold.as_ref().is_some_and(|(h, _)| *h == id) {
+                                        self.hold = None;
+                                    }
+                                    self.head = self.head.max(e.seq);
+                                    hooks.push(e.clone());
+                                    batch.push(StreamEvent::Hook(e));
+                                    None
+                                }
+                                Err(err) if err.recoverable() => {
+                                    let n = match &mut self.hold {
+                                        Some((h, n)) if *h == id => {
+                                            *n += 1;
+                                            *n
+                                        }
+                                        _ => {
+                                            self.hold = Some((id.clone(), 1));
+                                            1
+                                        }
+                                    };
+                                    if n <= self.opts.hold_attempts {
+                                        // Neither recorded nor acknowledged: the relay keeps it
+                                        // and sends it (and what follows) again.
+                                        if n == 1 {
+                                            batch.push(StreamEvent::Warning(format!(
+                                                "event {seq} is held: {}. The relay keeps it \
+                                                 until this is fixed",
+                                                err.message
+                                            )));
+                                        }
+                                        let factor = 1u32 << (n - 1).min(16);
+                                        let delay = self
+                                            .opts
+                                            .min_backoff
+                                            .saturating_mul(factor)
+                                            .min(self.opts.max_backoff);
+                                        self.then = Some(Then::Hold {
+                                            attempt: n,
+                                            delay,
+                                            reason: format!(
+                                                "event {seq} is held ({})",
+                                                err.message
+                                            ),
+                                        });
+                                        break;
+                                    }
+                                    self.hold = None;
+                                    Some((
+                                        QuarantineKind::Recoverable,
+                                        format!(
+                                            "{}; kept whole, and opened again on every reconnect \
+                                             and by `00hooks quarantine retry`",
+                                            err.message
+                                        ),
+                                    ))
+                                }
+                                Err(err) => Some((
+                                    if err.strict {
+                                        QuarantineKind::StrictRefused
+                                    } else {
+                                        QuarantineKind::Refused
+                                    },
+                                    err.message,
+                                )),
+                            }
+                        }
+                    };
+                    if let Some((qkind, error)) = failed {
+                        // Kept, durably, before anything past it can be acknowledged.
+                        let q = Quarantined::new(
+                            qkind,
+                            crate::api::system_now_ms(),
+                            ev.id.as_deref(),
+                            &ev.data,
+                            error,
+                        );
                         let path = self.store.quarantine(&q)?;
-                        quarantined_to = quarantined_to.max(seq.unwrap_or(0));
+                        quarantined_to = quarantined_to.max(q.seq.unwrap_or(0));
                         batch.push(StreamEvent::Quarantined {
-                            seq,
+                            seq: q.seq,
                             path,
                             error: q.error,
                         });
                     }
-                },
+                }
                 "gap" => match serde_json::from_str::<Gap>(&ev.data) {
-                    Ok(g) => {
+                    // Gaps are unsigned: one past what the relay has shown to exist would move the
+                    // durable cursor past events still to come.
+                    Ok(g) if g.from > self.head => batch.push(StreamEvent::Warning(format!(
+                        "ignored a gap ({} to {}) beyond the relay's newest event ({})",
+                        g.from, g.to, self.head
+                    ))),
+                    Ok(mut g) => {
+                        g.to = g.to.min(self.head);
                         gaps_to = gaps_to.max(g.to);
                         batch.push(StreamEvent::Gap(g));
                     }
@@ -514,6 +749,7 @@ impl Subscription {
             StreamEvent::Hook(e) => fresh_ids.remove(&e.id),
             _ => true,
         });
+        batch.extend(retried);
         // Everything through `through` is recorded: in the inbox, or in the quarantine.
         let through = hooks
             .iter()
@@ -522,7 +758,7 @@ impl Subscription {
             .unwrap_or(0)
             .max(quarantined_to);
         if through > self.acked {
-            self.ack_through = Some(through);
+            self.ack_through = Some(self.ack_through.unwrap_or(0).max(through));
             self.awaiting_ack.extend(batch);
         } else {
             self.out.extend(batch);

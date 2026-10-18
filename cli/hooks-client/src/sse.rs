@@ -41,6 +41,8 @@ pub struct SseParser {
     has_data: bool,
     id: Option<String>,
     last_event_id: Option<String>,
+    /// The `id:` of the block that grew past the limit, when it had one before it did.
+    oversize_id: Option<String>,
     max: usize,
 }
 
@@ -65,8 +67,15 @@ impl SseParser {
             has_data: false,
             id: None,
             last_event_id: None,
+            oversize_id: None,
             max,
         }
+    }
+
+    /// After a [`TooLarge`]: the `id:` of the event that was too large, when its `id:` line came
+    /// before the overflow (the relay writes it first), so a client can skip it by seq.
+    pub fn take_oversize_id(&mut self) -> Option<String> {
+        self.oversize_id.take()
     }
 
     /// The last `id:` seen, as the spec's "last event ID buffer".
@@ -130,6 +139,7 @@ impl SseParser {
         self.line.extend_from_slice(&bytes[start..]);
         if self.line.len() > self.max {
             self.line.clear();
+            self.oversize_id = self.id.clone();
             return Err(TooLarge(self.max));
         }
         Ok(())
@@ -158,6 +168,7 @@ impl SseParser {
             "event" => self.event = Some(value.to_string()),
             "data" => {
                 if self.data.len() + value.len() + 1 > self.max {
+                    self.oversize_id = self.id.clone();
                     self.reset_block();
                     return Err(TooLarge(self.max));
                 }
@@ -363,5 +374,22 @@ mod tests {
             p.push(b"data: 0123456789\ndata: 0123456789\n"),
             Err(TooLarge(16))
         );
+    }
+
+    #[test]
+    fn an_oversize_event_says_which_id_it_had() {
+        let mut p = SseParser::new(64);
+        let big = "x".repeat(100);
+        let err = p
+            .push(format!("id: 41\nevent: hook\ndata: {big}\n\n").as_bytes())
+            .unwrap_err();
+        assert_eq!(err, TooLarge(64));
+        assert_eq!(p.take_oversize_id().as_deref(), Some("41"));
+        assert_eq!(p.take_oversize_id(), None);
+        // Split across chunks, the data line overflows the line buffer instead.
+        let mut p = SseParser::new(64);
+        p.push(b"id: 42\nevent: hook\ndata: ").unwrap();
+        assert!(p.push(big.as_bytes()).is_err());
+        assert_eq!(p.take_oversize_id().as_deref(), Some("42"));
     }
 }
