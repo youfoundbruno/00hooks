@@ -217,7 +217,7 @@ scheme with Node's own crypto where they don't).
 |---|---|---|---|
 | `github` | `secret`? | generated when absent | `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(body)>`; answers GitHub's `ping` like any event |
 | `standard-webhooks` | `secret`? (`whsec_` + base64) | generated when absent | `webhook-signature: v1,<base64 HMAC-SHA256(id.timestamp.body)>` (any of several, space-separated), `webhook-timestamp` within 300 s |
-| `standard-webhooks-ed25519` | `publicKey` (`whpk_` + base64, 32 bytes) | none: the relay holds only the sender's **public** key, returned in `Hook.verify` | `webhook-signature: v1a,<base64 Ed25519(id.timestamp.body)>`, timestamp within 300 s. A relay breach can't forge these |
+| `standard-webhooks-ed25519` | `publicKey` (`whpk_` + base64, 32 bytes) | none: the relay holds only the sender's **public** key, returned in `Hook.verify` | `webhook-signature: v1a,<base64 Ed25519(id.timestamp.body)>`, timestamp within 300 s. A leak of the relay's stored secrets can't forge these; a relay whose code is compromised can still mark anything verified, unless the hook is strict |
 | `stripe` | `secret` (required: Stripe issues it) | provider's | `Stripe-Signature: t=<s>,v1=<hex>[,v1=…]`: HMAC-SHA256 of `t.body` with the secret's UTF-8 bytes; any `v1` may match (Stripe sends two while you roll the secret); `t` within 300 s |
 | `slack` | `secret` (required) | provider's | `X-Slack-Signature: v0=<hex HMAC-SHA256("v0:" ts ":" body)>`, `X-Slack-Request-Timestamp` within 300 s; answers `url_verification` (below) |
 | `linear` | `secret` (required) | provider's | `Linear-Signature: <hex HMAC-SHA256(body)>`; the body's `webhookTimestamp` (ms, signed) within **60 s** |
@@ -228,7 +228,9 @@ scheme with Node's own crypto where they don't).
 | `token` | `header` (default `Authorization`), `secret`? | generated when absent | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength; **no dedupe** |
 | `unverified` | — | — | accepts anything; events carry `verified: false`; **no dedupe** |
 
-Every preset except `unverified` also takes `"strict": true` (below). A `secret` is 8 to 512
+Every preset except `unverified` also takes `"strict": true` (below); a `token` hook can be made
+strict, but proves nothing on the device (the token reaches the relay in the clear), so the
+reference client refuses to create one and a device refuses to verify one. A `secret` is 8 to 512
 characters; the relay refuses to create a hook of a provider-issued preset without one (`400`,
 `field: "verify.secret"`), since it can't make one the provider would use.
 
@@ -293,18 +295,35 @@ signature itself:
 - **Sealed for the device**: the kept headers plus the signature header and every header the signed
   content or timestamp uses (`webhook-id`, `x-slack-request-timestamp`…), and `url`, the public URL
   the relay was reached at (Twilio signs it).
-- **On the device**: the same table and vectors as the relay; timestamps are checked against the
-  event's `receivedAt` (signed by the relay, §5), not the device's clock, so an event read days later
-  still verifies; a body timestamp (Linear's) is checked there too. A verified event is handed over
-  with `verified: true` and the type read from the signed body; one that doesn't verify, or for
-  which the device has no secret, is quarantined (recorded raw, §7), never handed over.
+- **On the device**: the same table and vectors as the relay. What the device verifies with is its
+  own, never the relay's word:
+  - it verifies **every** event of a hook it keeps a strict secret for, whatever the relay's
+    `strict` flag says (the reference client keeps an index of those hooks beside its state), so a
+    relay can't switch strict mode off;
+  - with the `verify` object it built when the secret was kept (the person's preset and fields, and
+    for Ed25519 the person's public key), never one fetched from the relay; the event's signed
+    `preset` must equal it, and `unverified` and `token` verify nothing in strict mode;
+  - timestamps are checked against the event's `receivedAt` (signed by the relay, §5), so an event
+    read days later still verifies, and `receivedAt` itself must be plausible by the device's clock:
+    at most 10 minutes ahead and at most 8 days old (retention, and a margin);
+  - the device keeps its own **replay marks**: per hook, the hash of each verified body, with the
+    event id it came as, for 8 days. The same body under another event id is refused as a replay
+    (the same id again, a redelivery, is not), whoever sends it;
+  - once verified, the signature headers are dropped from the event, so what is stored or forwarded
+    is never a ready-made replay.
+
+  A verified event is handed over with `verified: true`, `strict: true` and the type read from the
+  signed body. One that doesn't verify is quarantined (its ids, size and hash only, §7), never
+  handed over. One for which the device has no secret yet is **held**: not acknowledged, so the
+  relay sends it again, and after a number of tries kept whole in the quarantine and opened again
+  once the secret is there (§7).
 
 Trade-offs, for choosing it:
 
 | | relay verifies (default) | strict |
 |---|---|---|
 | who holds the provider's secret | the relay (encrypted under `SECRETS_KEY`) and the provider | your devices and the provider |
-| a relay breach can | forge events (with the secret) | not forge events |
+| a relay breach can | forge events (with the secret) | not forge, downgrade, relabel or replay events for a hook whose secret a device keeps (above). It can still read routing metadata, see each payload in memory as it seals it, withhold, delay or drop events (they show as gaps), and hold back events for a device that hasn't been given the secret yet |
 | junk at the edge | refused `401` before it's stored | stored until a device refuses it (well-formed header, fresh header timestamp, new body); it costs quota and is visible as quarantined events |
 | replay marks | provider ids and body hashes | body hashes at the edge; timestamps checked on the device |
 | `eventType` for routing | from the signed body | header-borne types only (the relay never reads the body) |
@@ -508,7 +527,7 @@ reads both only from the sealed content.
   covered by a signature. Never `cookie`, `authorization`, or any signature or token header: once
   verified they're no use to a reader, and a stored signature beside its body is a ready-made replay.
   A strict hook's envelope is the exception: it carries the signature headers its device needs
-  (§3), sealed.
+  (§3), sealed, and the device drops them once it has verified them.
 - `contentType` is the sender's `Content-Type`, at most 200 characters; `url` (strict hooks only) is
   the public URL the relay was reached at.
 
@@ -548,12 +567,18 @@ signature says it was this relay, for this device, with this metadata. A client:
 
 1. verifies `sig` with the `relayKey` it pinned at login (§2);
 2. opens `sealed` with the private key named by `kid`, with the `info` and `aad` above;
-3. for a strict event, verifies the provider's signature (§3);
+3. for a strict event, and for **any** event of a hook it keeps a strict secret for, verifies the
+   provider's signature with its own settings (§3);
 
 and hands over the event with `headers`, `contentType` and `body` (standard base64) restored, as in
 version 1, so what runs automations never sees an envelope. An event that fails any step is
-quarantined (§7), never handed over. A version 2 client also refuses an event that arrives
-**unsealed**.
+quarantined (§7), never handed over, except one that fails only for want of something the device
+can get back (the sealing key it names, a strict hook's secret, a key store that is locked just now),
+which is held first (§7). A version 2 client also refuses an event that arrives **unsealed**, and
+the reference client won't stream at all without the keys to check and open events (an `Opener`):
+it fails closed rather than accept what it can't check. An event whose seq is at or below what the
+client already recorded, and which it never recorded, is an old one sent again: quarantined, never
+run.
 
 `fixtures/seal-interop.v1.json` holds events sealed by the relay's own code under Node, with the
 fixed device key that opens them; `fixtures/hpke-rfc9180-a2.json` is RFC 9180's vector for this suite.
@@ -590,7 +615,9 @@ data: {…event…}
   which; `ready.head` is the newest seq in the log. `ready.sealKid` is the kid of the sealing key the
   relay holds for this device (null when it has none): a client that doesn't hold that key, or sees
   null, should say so, since new events will be sealed to a key it can't use (or not at all).
-- **Gaps**: when events after that point were already dropped by retention, a `gap` event comes before
+- **Gaps** (unsigned, so a client bounds them: it clamps `to` to the newest seq the relay has shown,
+  `ready.head` or a later event, and ignores a gap that starts past it): when events after that
+  point were already dropped by retention, a `gap` event comes before
   the next `hook`: `id: 30` `event: gap` `data: {"from": 12, "to": 30, "reason": "retention"}`
   (inclusive range of lost seqs; the `id` is `to`, so a resume starts after the gap). `reason` is
   `retention`; `no_key` for a single event with no envelope for this device (it had no sealing key
@@ -616,8 +643,9 @@ data: {…event…}
 
 - **Reconnecting**: on any drop without a terminal code, wait a random time between half and all of
   `min(30 s, retry × 2^attempt)`, never under 1 s, then reconnect; `attempt` resets after `ready`.
-  70 s without a byte (heartbeats included) counts as a drop. Re-sign every attempt (fresh time and
-  nonce).
+  70 s without a byte (heartbeats included) counts as a drop: one deadline per connection, moved only
+  by bytes received. Opening the stream (the response headers) is given 30 s. Re-sign every attempt
+  (fresh time and nonce).
 - **One stream per device**: a second stream for the same device replaces the first (`4409`).
 - **Probe**: `GET /v1/stream?probe=1` (signed, `X-00h-Protocol: 2`) answers `retry`, `ready` and
   `closed {"code":1000,"reason":"probe"}`, then ends, without replacing the device's live stream and
@@ -649,10 +677,22 @@ after a restart, with the same `id`, so nothing is lost between the two records.
 Because acks are cumulative, a client keeps an ack that failed and retries it with backoff (any later
 ack covers it too) while it goes on recording and handing over newer events in order; otherwise the
 relay keeps those events, and they hold every other device's deletions back, until retention. A
-`hook` message a client can't read, open or verify (a bad relay signature, an unknown kid, a strict
-event whose provider signature fails, an unsealed event) still counts as received: the client
-records it raw (the reference client appends it to `quarantine.jsonl` in its state directory, with
-the reason, and says so) before acknowledging past it, so nothing is skipped silently.
+`hook` message a client can't read, open or verify (a bad relay signature, a strict event whose
+provider signature fails, an unsealed event, a stale seq) still counts as received: the client
+records it before acknowledging past it, so nothing is skipped silently. The reference client
+appends it to `quarantine.jsonl` in its state directory with the reason and a kind, keeping the raw
+message when it is small enough to look at, and only the ids, size and SHA-256 for a strict hook's
+delivery that doesn't verify (anyone who knows a strict hook's URL can send those). The file is
+rotated at 8 MiB, one old file kept, so a flood can't fill the disk. `00hooks quarantine list`
+shows it.
+
+**Held, not lost.** A message that fails only for want of something the device can get back (a
+strict hook's secret not added yet, a sealing key the device doesn't hold, a key store that is locked
+just now) is **not** acknowledged: the client drops the connection and the relay sends it again, with
+a growing wait, 20 times by default. Only then is it quarantined, **whole**, and acknowledged; the
+client opens it again on every reconnect and with `00hooks quarantine retry`, and hands it over once
+it opens. A message larger than the client's limit (16 MiB) three times in a row is skipped by its
+seq and noted.
 
 ## 8. Errors
 
