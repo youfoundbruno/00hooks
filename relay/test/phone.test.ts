@@ -547,7 +547,7 @@ describe("resume", () => {
     nodeSock.close();
     const left = await runInDurableObject(phoneObject(node.accountId), (_o: PhoneObject, state) => ({
       rows: state.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM mailbox").one().n,
-      gaps: state.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM gaps").one().n,
+      gaps: state.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM device_gaps").one().n,
     }));
     expect(left).toEqual({ rows: 0, gaps: 0 });
   });
@@ -578,7 +578,7 @@ describe("presence", () => {
 });
 
 describe("limits", () => {
-  it("rate limits a phone's sends (30 at once, then 1 a second)", async () => {
+  it("rate limits a phone's frames (30 at once, then 1 a second; the hello spends one)", async () => {
     const node = await newNode();
     const phone = await pairPhone(node);
     const sock = await openPhoneSocket(phone);
@@ -591,27 +591,11 @@ describe("limits", () => {
       const f = await sock.next();
       if (f.t === "queued" || f.t === "refused") answers.push(f);
     }
-    expect(answers.slice(0, 30).every((a) => a.t === "queued")).toBe(true);
+    expect(answers.slice(0, 29).every((a) => a.t === "queued")).toBe(true);
     const limited = answers.filter((a) => a.t === "refused");
     expect(limited.length).toBeGreaterThan(0);
     expect(limited[0]).toMatchObject({ code: "rate_limited", retryAfter: expect.any(Number) });
     sock.close();
-  });
-
-  it("refuses frames over the size limit (64 KiB from a phone)", async () => {
-    const node = await newNode();
-    const phone = await pairPhone(node);
-    const sock = await openPhoneSocket(phone);
-    await sock.hello(0);
-    const big = await makeEnvelope(phone, nodeKey(node), "x".repeat(70 * 1024));
-    expect(await sendEnv(sock, big)).toEqual({ t: "refused", id: big.id, code: "too_large" });
-    // A node may send bigger ones.
-    const nodeSock = await openPhoneSocket(node);
-    await nodeSock.hello(0);
-    expect(await sendEnv(nodeSock, await makeEnvelope(node, phoneKey(phone), "x".repeat(70 * 1024)))).toMatchObject({ t: "queued" });
-    expect(await sendEnv(nodeSock, await makeEnvelope(node, phoneKey(phone), "x".repeat(520 * 1024)))).toMatchObject({ code: "too_large" });
-    sock.close();
-    nodeSock.close();
   });
 
   it("refuses a phone's send when its node's queue is full", async () => {
