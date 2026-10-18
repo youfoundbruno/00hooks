@@ -1,9 +1,11 @@
 # 00hooks relay
 
-The relay half of 00hooks: a Cloudflare Worker and one Durable Object class. Webhooks arrive at
+The relay half of 00hooks: a Cloudflare Worker and two Durable Object classes. Webhooks arrive at
 `/h/<hook id>`; the relay verifies them over the raw bytes, dedupes them, seals them to each of the
 account's devices (HPKE, signed by the relay), appends them to the account's ordered log, and streams
-them to the devices over SSE, resumably. The contract
+them to the devices over SSE, resumably. It also carries phone links (PROTOCOL §10): a phone pairs
+with a node device, and the relay routes the sealed envelopes between them over one WebSocket per
+device, never seeing their content. The contract
 with clients is [`docs/PROTOCOL.md`](../docs/PROTOCOL.md); the design and the security model are in
 [`docs/PLAN.md`](../docs/PLAN.md).
 
@@ -19,7 +21,8 @@ CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hiber
   `src/presets.ts`: the preset table and its interpreter. `src/envelope.ts`: sealing and the relay's
   envelope signature. `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE
   bridge. `src/audit.ts`: the audit log and events list. `src/account-object.ts`: the Durable
-  Object. `migrations/`: the D1 schema.
+  Object. `src/phone.ts`: the phone routes; `src/phone-object.ts`: their Durable Object (mailbox,
+  cursors, sockets); `src/phone-push.ts`: the push hook (not built). `migrations/`: the D1 schema.
 - `scripts/seal-interop.ts` seals events with `src/envelope.ts` under Node, for the CLI's interop
   tests (`fixtures/seal-interop.v1.json`).
 
@@ -59,14 +62,24 @@ Rate Limiting binding). In `relay/`:
 4. `wrangler deploy`.
 
 Bindings (all in `wrangler.jsonc`): `ACCOUNT` (the `AccountObject` Durable Object, SQLite-backed),
+`PHONE` (the `PhoneObject` Durable Object, SQLite-backed, added by the migration tag `v2`: the phone
+links' queue and sockets, one per account),
 `DB` (D1: accounts, devices, hooks with their sealed secrets, enrolments, and the routing from a
 hook id to its account), and four Rate Limiting bindings: `HOOK_LIMIT` (60 deliveries per 10 s per
 hook), `RECEIVE_IP_LIMIT` (600 deliveries per 10 s per client address, checked before the hook
 lookup), `REDEEM_IP_LIMIT` and `REDEEM_GLOBAL_LIMIT` (enrolment redemptions: 10 a minute per address,
-300 a minute in all). The relay answers `503` rather than run without them. Variables:
+300 a minute in all), and `PAIR_IP_LIMIT` (phone pairing attempts: 10 a minute per address). The
+relay answers `503` rather than run without them. Variables:
 `RETENTION_DAYS` (default 7), how long unacknowledged events are kept; `ACCOUNT_MAX_EVENTS` (10,000)
 and `ACCOUNT_MAX_BYTES` (256 MiB), how much one account's log may hold before deliveries get `429`
-`quota`.
+`quota`; `PHONE_NODE_QUEUE_MAX` (1,000), `PHONE_PHONE_QUEUE_MAX` (500) and `PHONE_QUEUE_MAX_BYTES`
+(16 MiB), optional, how much a phone link's queue may hold (PROTOCOL §10.5).
+
+**Upgrading a relay deployed before phone links**: apply the D1 migration `0005_phone.sql`
+(`wrangler d1 migrations apply 00hooks --remote`) before deploying, and copy into your own deploy
+config the `PHONE` Durable Object binding, the `v2` migration (`new_sqlite_classes: ["PhoneObject"]`)
+and the `PAIR_IP_LIMIT` rate limit from `wrangler.jsonc`. Without the binding, pairing answers
+`503`.
 
 Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
 
@@ -112,5 +125,9 @@ Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](do
 - **API keys** (`hk_…`) are scoped, expire, are shown once, and can never stream, acknowledge,
   enrol a device, set a sealing key or create keys. The audit log records hooks, devices and keys,
   and counts key uses and verification failures per hour.
+- **Phone links** (PROTOCOL §10): the relay routes sealed envelopes between a node and its phones
+  and never opens them; it keeps a pairing only as a verifier of its proof (spent once, atomically),
+  checks only routing (`from` is the signed-in device, `to` its peer), sizes, rates and queues, and
+  stores envelopes as received until acknowledged. A phone may use only the phone routes.
 - **Errors** are fixed sentences: they never quote a secret, a signature or payload content.
 - **Webhook content is data**: the relay never acts on it.

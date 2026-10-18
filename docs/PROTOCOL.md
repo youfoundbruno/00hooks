@@ -38,6 +38,13 @@ carry `held: true` and a last signed line `held` (§5). A client that predates t
 for every event except a released one, which it can't verify and so quarantines (§7), never
 handing it over unverified.
 
+Additive within version 2 (phone links, §10): a kind of device, `phone`, that pairs with one node
+device and may use only the phone routes (`/v1/phone/*`); its own versioned socket protocol
+(`/v1/info`'s `phone.protocol`, 1); `kind` and `peer` in `GET /v1/devices`; and the audit kinds
+`phone.pairing` and `phone.confirmed`. The relay routes the sealed envelopes between a node and its
+phones and never sees their content. A client that ignores them keeps working; a phone is refused
+everywhere else with `403` `forbidden`.
+
 ## 1. Signed requests
 
 Every `/v1/*` request except account creation and enrolment is signed by a **device**. A device has an
@@ -148,14 +155,17 @@ characters); both sides compute it.
     refunded; the attempt after five wrong codes in 10 minutes blocks the address for 10 minutes,
     so parallel guesses each count.
 - `GET /v1/devices` (signed, or an API key with `devices:write`) → `{ "devices": [{ "id", "name",
-  "createdAt", "lastSeenAt", "current", "sealKid" }] }` (`sealKid` is null for a device without a
-  sealing key; `current` is false for an API key).
+  "createdAt", "lastSeenAt", "current", "sealKid", "kind", "peer" }] }` (`sealKid` is null for a
+  device without a sealing key; `current` is false for an API key; `kind` is `device` or `phone` and
+  `peer` a phone's node, null for a device, §10).
 - `PUT /v1/devices/<id>/seal-key` (signed, by that device only) `{ "sealKey" }` → `{ "kid" }`: sets or
   replaces the device's sealing key; events appended from then on are sealed to it, and events
   already in the log keep the key they were sealed to (each envelope names its kid). This is how a
   device created before version 2 gets one. Another device (or an API key) gets `403` `forbidden`:
   whoever sets a device's sealing key chooses who can read what is sealed to it.
 - `DELETE /v1/devices/<id>` (signed, or an API key with `devices:write`) → `204`: revokes it; its open stream closes at once with `4401`.
+  Revoking a device also revokes every phone paired with it, and revoking a phone tells its node
+  (§10.5).
   Idempotent: revoking a device of this account that is already revoked answers `204` again and
   closes any stream it still has (so a retry after a failure part-way finishes the job); a device of
   another account, or none, is `404`.
@@ -163,7 +173,9 @@ characters); both sides compute it.
   `unauthorized`. A newly enrolled device **starts at the head** of the log: it doesn't receive the
   older backlog and doesn't hold it back from deletion.
 - `GET /v1/info` (unsigned) → `{ "version", "protocol": 2, "protocols": [2], "signupOpen": bool,
-  "relayKey", "serverTime", "screen": { "edge": true, "maxRules": 200, "heldDays" }, "extras": [] }`.
+  "relayKey", "serverTime", "screen": { "edge": true, "maxRules": 200, "heldDays" }, "extras": [],
+  "phone": { "protocol": 1 } }`. `phone` says the relay carries phone links (§10) and the version of
+  their socket protocol.
   `screen` says what the edge screen takes (§4b). `extras` lists the optional hosted extras this
   relay offers (fingerprint sync across devices, reputation lists shared as hashes, a longer hold,
   evaluator credits…), each `{ "id", "title", "description"?, "url"? }`, as the operator sets them
@@ -680,7 +692,7 @@ scope, or on a route only a device may use, is `403` `forbidden`.
 | `hooks:read` (screen) | `GET /v1/hooks/<id>/screen` |
 | `hooks:write` (screen) | `PUT /v1/hooks/<id>/screen`, `POST /v1/held/<id>/release`, `DELETE /v1/held/<id>` |
 | `events:read` (screen) | `GET /v1/held` |
-| *(device only)* | `/v1/stream`, `/v1/ack`, `/v1/enrolments`, `PUT /v1/devices/<id>/seal-key`, `/v1/keys`, `/v1/screen/key` |
+| *(device only)* | `/v1/stream`, `/v1/ack`, `/v1/enrolments`, `PUT /v1/devices/<id>/seal-key`, `/v1/keys`, `/v1/screen/key`, `/v1/phone/*` (§10) |
 
 The device-only routes are what would turn a stolen key into a reader of the account's events (a
 stream, a new device, a sealing key) or into more keys.
@@ -701,8 +713,217 @@ Names and ids only: never a secret, a token, a header value or a payload.
 | `hook.screen` | the hook | the device or key | the hook's name |
 | `screen.held`, `screen.dropped` | the hook | null | the hook's name; `count` in the hour starting at `at` |
 | `held.released`, `held.dropped` | the event | the device or key | null |
+| `phone.pairing` | the pairing id | the node device | null |
+| `phone.confirmed` | the phone | its node | the phone's name |
+
+A phone added by a pairing is a `device.added` whose actor is its node; a phone revoked by itself is
+a `device.revoked` whose actor is the phone.
 
 **The events list**: `GET /v1/events?limit=<1–500, default 50>` (device, or `events:read`) →
 `{ "events": [{ "seq", "id", "hookId", "receivedAt", "verified", "strict", "preset", "eventType",
 "size", "deliveredTo": [dev…], "pendingFor": [dev…] }] }`: the events still in the log, newest first,
 metadata only. `size` is the bytes held for it (its envelopes).
+
+## 10. Phone links
+
+The relay also carries the link between a **node** (a device of kind `device` that runs an agent
+harness, such as 00next) and the person's **phones**. Everything between a phone and its node is
+sealed end to end (HPKE to the recipient's X25519 key) and signed by the sender's Ed25519 key; the
+format of the envelope's content is the harness's, not this document's. The relay routes sealed
+bytes by device id, keeps them while a side is offline, says who is online, and rate-limits. It never
+opens, verifies or logs an envelope's content (logs carry sizes and ids only), holds no key that
+opens one, and keeps nothing of a pairing but a verifier of its proof.
+
+A **phone** is a device of kind `phone` with exactly one node, its `peer`. It signs requests as in
+§1, but may use only the routes of this section: every other signed route answers it `403`
+`forbidden` ("A phone may use only the phone routes."), and an API key is `403` on all of them. A
+phone never receives webhook events and is never a device of the account's event log. Its nonces are
+spent in the account's phone object (below).
+
+### 10.1 Pairing
+
+1. **`POST /v1/phone/pairings`** (signed by a device of kind `device`)
+   `{ "pairingId": <16 bytes, unpadded base64url: 22 characters>, "verifier": <32 bytes, unpadded
+   base64url: 43 characters>, "expiresAt": <ms> }` → `201` `{ "pairingId", "expiresAt" }`.
+   `expiresAt` must be in the future (`400` `invalid` otherwise) and is clamped to at most
+   10 minutes from now; the answer says the expiry kept. An account has at most 5 open (unexpired,
+   unused) pairings: a sixth is `429` `rate_limited` with `Retry-After: 60`. A `pairingId` already
+   registered is `409` `conflict`. Audit: `phone.pairing`. The node computes `verifier =
+   b64url(SHA-256(UTF-8(proof)))` from the proof it gives the phone out of band (in 00next, a QR
+   code); the relay never sees the proof until the phone shows it, nor the secret it comes from.
+2. **`POST /v1/phone/pair`** (unsigned)
+   `{ "pairingId", "proof": <43 characters>, "deviceName": <1–100 characters>, "publicKey": <the
+   phone's Ed25519 key, as §2>, "sealKey": <the phone's X25519 key, as §2: required here>, "hello":
+   { "enc": <43 characters>, "ct": <standard base64, 16 to 8,192 bytes decoded> } }` →
+   `200` `{ "deviceId", "node" }`. In order:
+   - Rate limit per client address (an IPv4 address or an IPv6 /64; `PAIR_IP_LIMIT`, 10 a minute),
+     before anything else → `429` `rate_limited` with `Retry-After`. Without the binding the relay
+     answers `503` `unavailable`.
+   - The body's fields (`400` `invalid` with `field`); a `publicKey` that already belongs to a
+     device is `409` `conflict`; a `sealKey` is refused as in §2 (malformed or low-order).
+   - The proof: `b64url(SHA-256(UTF-8(proof)))` is compared in constant time with the pairing's
+     verifier. An unknown pairing or a wrong proof → `401` `unauthorized` "That pairing code isn't
+     valid."; the right proof for a used pairing → `409` `conflict` "That pairing code was already
+     used."; for an expired one → `401` `unauthorized` "That pairing code has expired.". A pairing
+     whose node has been revoked since is "isn't valid".
+   - The pairing is spent atomically (one conditional update), so of parallel redemptions exactly one
+     wins; the others see "already used".
+   - The phone is created as a **pending** device of the node's account: kind `phone`, `peer` the
+     node, pending until the pairing's expiry plus 5 minutes. The node is queued a `pair` sys message
+     (§10.4) carrying `hello` as given. Audit: `device.added`, with the node as actor.
+   The relay doesn't open `hello` (it is sealed to the node's key) and the phone checks that `node`
+   is the node it expected.
+3. **`POST /v1/phone/devices/<id>/confirm`** (signed by the phone's node) → `200`
+   `{ "device", "active": true }`. The phone must be pending, not revoked and within its pending
+   time, and the caller must be its `peer`; anything else (another device of the account, a phone
+   already confirmed, an unknown id) is `404`. From then on the phone may send. Audit:
+   `phone.confirmed`.
+
+A **pending** phone may open its socket (and receive) and unpair itself, nothing else: its sends are
+refused `not_paired`, and nothing may be sent to it. Once its pending time passes unconfirmed, it is
+as good as revoked: its requests are `401`, its socket is closed with `4401`, and it is no longer
+listed.
+
+### 10.2 Listing and unpairing
+
+- **`GET /v1/phone/devices`** (signed by a device of kind `device`) → `{ "phones": [{ "id", "name",
+  "peer", "createdAt", "lastSeenAt", "pending", "online" }] }`: the account's phones that aren't
+  revoked (nor pending past their time), oldest first. `online` is as in §10.4.
+- **`DELETE /v1/phone/self`** (signed by a phone, pending or not) → `204`: the phone revokes itself.
+- **`DELETE /v1/devices/<id>`** (§2) works on a phone too (signed by a device, or an API key with
+  `devices:write`).
+
+Revoking a phone, by either route: its socket closes at once with `4401`, its later requests are
+`401`, everything queued to it or from it is deleted, and its node, when connected, sees it go
+offline (`presence`) and is queued an `unpaired` sys message, **once**, whoever revoked it (the node
+itself included, so a node never has to tell revocations apart). Revoking a device of kind `device`
+also revokes every phone paired with it (no `unpaired` message: its node is the device being
+revoked), closes the device's phone socket with `4401` and deletes its unused pairings. Both are
+idempotent: a retry finishes a revocation that failed part-way.
+
+### 10.3 The socket
+
+**`GET /v1/phone/socket`** (signed as in §1, by a device of kind `device` or by a phone, pending or
+not), with `Upgrade: websocket` → `101`. Without the upgrade header the relay answers `426`
+`invalid` (`field: "Upgrade"`). The device's role on the socket is `node` (kind `device`) or `phone`.
+A second socket for the same device closes the first with `4409`.
+
+Frames are JSON text frames, one object each, with a `t` field; besides them, the text `ping` is
+answered `pong` at any time (without waking the relay's object). A binary frame, a frame that isn't
+a JSON object, or a frame of an unknown `t` closes the socket with `4400`.
+
+Client → relay:
+
+- `{"t":"hello","after":<seq ≥ 0>}`: must be the first frame (anything else first: `4400` "hello
+  first"), and is sent once (a second: `4400`). It also acknowledges every row up to `after` for this
+  device (`after` beyond the newest seq is clamped to it; the cursor never goes back). The relay
+  answers `{"t":"ready","after":<the device's cursor: max(after, acknowledged)>,"head":<the newest
+  seq queued for this device; 0 when none>,"peers":[{"device","online","since"}]}`, then the backlog
+  for this device in seq order: `{"t":"msg","seq","env"}`, `{"t":"sys","seq","sys"}`, and
+  `{"t":"gap","from","to"}` before the next frame wherever rows after the cursor were dropped (the
+  queue overflowed, or retention); `from` and `to` are inclusive seqs. Then the socket is live.
+  `peers` is a phone's node, or each of a node's phones that isn't revoked (pending ones included).
+- `{"t":"send","env":<envelope>}`: answered `{"t":"queued","id","seq"}` or
+  `{"t":"refused","id","code","retryAfter"?}` (`id` is the envelope's, or null when it has none).
+- `{"t":"ack","through":<seq>}`: deletes this device's rows up to `through`; monotonic, no answer.
+
+Relay → client, besides the above: `{"t":"msg","seq","env"}` and `{"t":"sys","seq","sys"}` live, as
+they are queued; `{"t":"presence","device","online","since"}` when a peer says `hello` (online) or
+its socket goes (offline). Nothing is sent to a socket before its `hello`.
+
+`seq` is per account (shared by every device's queue), strictly increasing, never reused, so a
+device's seqs have holes; only a `gap` frame reports a loss. **Online** means a socket that is open,
+past `hello`, and has shown life in the last 90 s (it opened, sent a frame, or was answered `pong`).
+`since` is when the device came online, or when it was last seen going (null when never seen).
+
+Close codes:
+
+| code | meaning | client should |
+|---|---|---|
+| `4401` | the device was revoked, or a pending phone's time ran out | stop; a phone forgets the pairing |
+| `4409` | a newer socket for this device replaced this one | stop (another process is connected) |
+| `4400` | protocol error (no `hello` first, not JSON, unknown frame) | fix the client; don't loop |
+| `1012` | the relay is restarting (a deploy) | reconnect with jitter |
+
+After any other drop, reconnect with backoff (1 s doubling to 30 s, with jitter; re-sign every
+attempt) and send `hello` with the last seq recorded. A send that got no `queued` is sent again with
+the same `id`.
+
+### 10.4 What is routed
+
+**The envelope** (`env`), checked for shape only:
+
+```
+{ "v": 1, "id": <22 base64url>, "from": "dev_…", "to": "dev_…", "at": <integer ms>,
+  "kid": <22 base64url>, "enc": <43 base64url>, "ct": <standard padded base64>,
+  "sig": <86 base64url>, "push"?: "approval" | "message" | "notice" }
+```
+
+Any other field, or any field of the wrong form, is refused `invalid`; so is `push` from a phone. The
+relay doesn't check `sig`, `kid` or `at` (the recipient does) and never opens `ct`. It stores the
+envelope as the JSON text it parsed (`JSON.stringify` of the received object: the same fields and
+values, in the order sent) and forwards it spliced into the `msg` frame without re-encoding, so
+every field the recipient reads is byte-identical to what the sender sent.
+
+Checks on a `send`, in order, each refusing with its `code`:
+
+| code | when |
+|---|---|
+| `too_large` | the frame is over 64 KiB from a phone, or 512 KiB from a node |
+| `rate_limited` | the socket's token bucket is empty (phone: 30, refilled 1 a second; node: 200, refilled 20 a second); `retryAfter` in seconds. Every send spends a token, refused or not |
+| `invalid` | the envelope's shape, or `push` from a phone |
+| `forbidden` | `from` isn't the socket's device |
+| `not_paired` | the sending phone is still pending |
+| `forbidden` | from a phone, `to` isn't its node; from a node, `to` isn't one of its own phones that is confirmed and not revoked |
+| `queue_full` | to a node: its queue already holds 1,000 rows or would pass 16 MiB |
+
+A resent `id` from the same sender that is still queued is answered `queued` with the seq it has
+and isn't stored again. A phone's queue holds at most 500 rows and 16 MiB: past either, its
+**oldest** rows are dropped to make room and the phone sees a `gap`. Rows are kept until the
+recipient acknowledges them, or 7 days (`RETENTION_DAYS`), after which they are dropped (a `gap`).
+
+**Sys messages** are the relay's own notices to a node, never content:
+
+- `{"kind":"pair","pairingId","device","name","publicKey","sealKey","hello":{"enc","ct"},"at"}`: a
+  phone redeemed the node's pairing (§10.1); `device` is the new phone, `publicKey` and `sealKey`
+  its keys as it registered them, `hello` its sealed hello as given.
+- `{"kind":"unpaired","device","at"}`: one of the node's phones was revoked (§10.2).
+
+### 10.5 Limits
+
+| | |
+|---|---|
+| pairings | at most 5 open per account; valid at most 10 minutes; one use |
+| pairing attempts | 10 a minute per client address (`PAIR_IP_LIMIT`) |
+| pending | the pairing's expiry plus 5 minutes |
+| frame | 64 KiB from a phone, 512 KiB from a node |
+| sends | phone: 30 at once, 1 a second; node: 200 at once, 20 a second |
+| queue to a node | 1,000 rows or 16 MiB, then `queue_full` |
+| queue to a phone | 500 rows or 16 MiB, then the oldest are dropped (`gap`) |
+| retention | 7 days (`RETENTION_DAYS`) |
+| hello | 8 KiB of ciphertext |
+
+A relay operator may lower the queue limits with `PHONE_NODE_QUEUE_MAX`, `PHONE_PHONE_QUEUE_MAX` and
+`PHONE_QUEUE_MAX_BYTES`.
+
+### 10.6 How the relay serves it (informative)
+
+One Durable Object per account (`PhoneObject`), separate from the account's event log, holds the
+queue (seq, recipient, sender, `msg` or `sys`, id, the envelope text, size, time), each device's
+cursor and gap records, the account's phones (peer, pending, revoked: so a socket's sends are
+checked without D1), the phones' request nonces and when each device was last seen. Its sockets use
+the hibernation API: per-socket state (role, peer, `hello` time, token bucket) is the socket's
+attachment, `ping` is auto-answered, and an alarm prunes rows past retention, nonces and pending
+phones whose time ran out, so an idle account costs nothing. The Worker authenticates the upgrade
+request, then hands it to the object, whose `101` goes back to the client.
+
+### 10.7 The push hook (designed, not built)
+
+When the relay queues an envelope that carries `push` for a phone whose socket isn't online, it
+calls `pushHook(env, deviceId, category)` (`relay/src/phone-push.ts`), which does nothing yet:
+sending through APNs needs the operator's Apple developer account and key. When it is built, the
+phone registers its APNs device token with the relay (a signed `PUT /v1/phone/push`), never with its
+node; the relay sends a fixed alert text per category with `mutable-content`, so the phone opens the
+sealed envelope itself and shows the real text only on the device; at most one push per category per
+phone per minute, and none while its socket is open. The hook is given the device id and the
+category, never the envelope.

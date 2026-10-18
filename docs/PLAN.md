@@ -12,7 +12,10 @@ and anyone can use the CLI on its own or run their own relay.
 
 Status: phases 0 and 1 are built (the relay, the CLI's `login`/`devices`/`hooks`/`keys`/`audit`/
 `listen`, presets, sealing, API keys and the audit); so is the screen of phase 5 (§6a, "Built"),
-in the relay, the `hooks-screen` crate, the runner, the CLI and 00next; the rest is planned. Sections marked
+in the relay, the `hooks-screen` crate, the runner, the CLI and 00next. The relay also carries
+00next's phone links, built: a phone pairs with its node, and the relay routes the sealed envelopes
+between them, keeps them while a side is offline and says who is online, without ever seeing their
+content (PROTOCOL §10). The rest is planned. Sections marked
 *(suggestion)* go beyond the original brief and are open for a decision.
 
 ---
