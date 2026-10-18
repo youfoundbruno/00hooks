@@ -7,7 +7,7 @@ use hooks_client::{Hook, HookPatch, StrictHook};
 use serde_json::{Map, Value, json};
 
 use crate::account::confirm;
-use crate::ctx::{CliResult, Ctx, Failure, key_store, sentence};
+use crate::ctx::{CliResult, Ctx, Failure, key_store, sentence, strict_index};
 use crate::output::{date_time, json_line, sanitize, size, table};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -117,6 +117,13 @@ pub fn verify_spec(preset: Preset, a: &VerifyArgs) -> CliResult<Value> {
             "An unverified hook has nothing to verify; drop --strict.",
         ));
     }
+    if preset == Preset::Token && a.strict {
+        return Err(Failure::new(
+            "A token hook can't be strict: the token reaches the relay in the clear with every \
+             delivery, so the relay could mint events with it. Use a signing preset (hmac, say), \
+             or drop --strict.",
+        ));
+    }
     if preset == Preset::StandardWebhooksEd25519 {
         if a.secret.is_some() {
             return Err(Failure::new(
@@ -182,15 +189,15 @@ pub fn verify_spec(preset: Preset, a: &VerifyArgs) -> CliResult<Value> {
     Ok(Value::Object(v))
 }
 
-/// What a strict hook keeps on this device: its `verify` (from the relay, plus the public key for
-/// Ed25519) and its secrets.
+/// What a strict hook keeps on this device: its `verify`, built here from what the person said
+/// (never taken from the relay: a relay that could rewrite it could make the device verify
+/// nothing), plus the public key for Ed25519, and its secrets.
 fn strict_entry(
-    hook: &Hook,
+    mut verify: Value,
     secret: String,
     public_key: Option<&str>,
     previous: Option<StrictHook>,
 ) -> StrictHook {
-    let mut verify = serde_json::to_value(&hook.verify).expect("json");
     if let Some(k) = public_key {
         verify["publicKey"] = json!(k);
     }
@@ -244,7 +251,7 @@ pub async fn create(
     let ctx = Ctx::load()?;
     let mut created = ctx
         .client
-        .create_hook(&name, verify)
+        .create_hook(&name, verify.clone())
         .await
         .map_err(|e| ctx.explain(e))?;
     if args.strict {
@@ -254,8 +261,11 @@ pub async fn create(
             .clone()
             .or_else(|| args.public_key.clone())
             .expect("checked");
-        let entry = strict_entry(&created.hook, secret, args.public_key.as_deref(), None);
-        if let Err(e) = entry.save(store.as_ref(), &created.hook.id) {
+        let entry = strict_entry(verify.clone(), secret, args.public_key.as_deref(), None);
+        let kept = entry
+            .save(store.as_ref(), &created.hook.id)
+            .and_then(|()| strict_index(&ctx.state).add(&created.hook.id));
+        if let Err(e) = kept {
             // A strict hook nobody can verify is no use: take it back.
             let _ = ctx.client.delete_hook(&created.hook.id).await;
             return Err(Failure::new(format!(
@@ -435,12 +445,127 @@ pub async fn rotate(which: String) -> CliResult {
     Ok(())
 }
 
+/// The verify settings `hooks secret` is given: the preset and its fields, as the person says them.
+/// With no preset, the relay's description is shown and confirmed instead.
+#[derive(Debug, Clone, Default)]
+pub struct SecretArgs {
+    pub preset: Option<Preset>,
+    pub header: Option<String>,
+    pub algorithm: Option<Algorithm>,
+    pub encoding: Option<Encoding>,
+    pub prefix: Option<String>,
+    /// Accept the relay's description without asking (scripts).
+    pub yes: bool,
+}
+
+fn parse_preset(wire: &str) -> Option<Preset> {
+    Preset::value_variants()
+        .iter()
+        .copied()
+        .find(|p| p.wire() == wire)
+}
+
+/// The verify object to keep for strict hook `h`, from what the person said (`a.preset` and its
+/// fields), or else from the relay's description, rebuilt through the same checks (only the
+/// preset's own non-secret fields survive) and shown for confirmation.
+pub fn strict_spec(
+    h: &Hook,
+    a: &SecretArgs,
+    secret: Option<String>,
+    public_key: Option<String>,
+) -> CliResult<(Value, bool)> {
+    let relay = h.verify.preset.as_str();
+    let (preset, from_relay) = match a.preset {
+        Some(p) => (p, false),
+        None => (
+            parse_preset(relay).ok_or_else(|| {
+                Failure::new(format!(
+                    "The relay calls this hook a {} hook, which this version doesn't know; say \
+                     which with --preset.",
+                    sanitize(relay, false)
+                ))
+            })?,
+            true,
+        ),
+    };
+    if preset.wire() != relay {
+        return Err(Failure::new(format!(
+            "The relay says this hook is a {} hook, but you said {}. Its events are signed as {} \
+             hooks, so they wouldn't verify: check the hook, or recreate it.",
+            sanitize(relay, false),
+            preset.wire(),
+            sanitize(relay, false)
+        )));
+    }
+    let field = |k: &str| {
+        from_relay
+            .then(|| {
+                h.verify
+                    .fields
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .flatten()
+    };
+    let args = VerifyArgs {
+        header: a.header.clone().or_else(|| field("header")),
+        algorithm: a.algorithm.or_else(|| match field("algorithm").as_deref() {
+            Some("sha1") => Some(Algorithm::Sha1),
+            Some(_) => Some(Algorithm::Sha256),
+            None => None,
+        }),
+        encoding: a.encoding.or_else(|| match field("encoding").as_deref() {
+            Some("base64") => Some(Encoding::Base64),
+            Some(_) => Some(Encoding::Hex),
+            None => None,
+        }),
+        prefix: a.prefix.clone().or_else(|| field("prefix")),
+        secret,
+        public_key,
+        strict: true,
+    };
+    // A relay's description may carry fields of other presets; they would be refused below, so
+    // keep only what this preset takes.
+    let args = if from_relay && preset != Preset::Hmac {
+        VerifyArgs {
+            header: None,
+            algorithm: None,
+            encoding: None,
+            prefix: None,
+            ..args
+        }
+    } else {
+        args
+    };
+    Ok((verify_spec(preset, &args)?, from_relay))
+}
+
+/// How a verify object reads, one line per setting.
+fn describe_spec(v: &Value) -> String {
+    let mut out = Vec::new();
+    if let Some(o) = v.as_object() {
+        for (k, x) in o {
+            if k == "strict" {
+                continue;
+            }
+            let x = match x {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            out.push(format!("  {}: {}", sanitize(k, false), sanitize(&x, false)));
+        }
+    }
+    out.join("\n")
+}
+
 /// `00hooks hooks secret`: keep a strict hook's secret (or Ed25519 public key) on this computer.
 /// The previous one keeps verifying alongside it, for a switch-over.
 pub async fn secret(
     which: String,
     secret: Option<String>,
     public_key: Option<String>,
+    a: SecretArgs,
 ) -> CliResult {
     let ctx = Ctx::load()?;
     let h = resolve(&ctx, &which).await?;
@@ -450,7 +575,11 @@ pub async fn secret(
             sanitize(&h.name, false)
         )));
     }
-    let ed = h.verify.preset == "standard-webhooks-ed25519";
+    let ed = a
+        .preset
+        .map(Preset::wire)
+        .unwrap_or(h.verify.preset.as_str())
+        == "standard-webhooks-ed25519";
     let value = match (ed, secret, public_key) {
         (true, None, Some(k)) => k,
         (false, Some(s), None) => s,
@@ -465,12 +594,41 @@ pub async fn secret(
             ));
         }
     };
+    let (verify, from_relay) = if ed {
+        strict_spec(&h, &a, None, Some(value.clone()))?
+    } else {
+        strict_spec(&h, &a, Some(value.clone()), None)?
+    };
+    if from_relay {
+        eprintln!(
+            "This computer will verify {} ({}) with these settings, as the relay describes it:\n{}",
+            sanitize(&h.name, false),
+            h.id,
+            describe_spec(&verify)
+        );
+        if !a.yes
+            && !confirm(
+                "Check them against the sender's webhook settings: a wrong preset or header \
+                 means nothing verifies. Keep the secret with these settings? (Say them yourself \
+                 with --preset and its options, or pass --yes in a script.)",
+            )?
+        {
+            eprintln!("Nothing kept.");
+            return Ok(());
+        }
+    }
     let store = key_store(&ctx.config.key_store, &ctx.state);
     let previous = StrictHook::load(store.as_ref(), &h.id)
         .map_err(|e| Failure::new(sentence(&e.to_string())))?;
-    let entry = strict_entry(&h, value.clone(), ed.then_some(value.as_str()), previous);
+    let entry = strict_entry(
+        verify,
+        value.clone(),
+        ed.then_some(value.as_str()),
+        previous,
+    );
     entry
         .save(store.as_ref(), &h.id)
+        .and_then(|()| strict_index(&ctx.state).add(&h.id))
         .map_err(|e| Failure::new(format!("Couldn't keep the secret: {e}.")))?;
     println!(
         "Kept the secret for {} in {}; events for it are verified here.{}",
@@ -601,6 +759,76 @@ mod tests {
                 .message
                 .contains("--public-key")
         );
+    }
+
+    #[test]
+    fn a_token_hook_cannot_be_strict() {
+        let a = VerifyArgs {
+            secret: Some("tok".into()),
+            strict: true,
+            ..Default::default()
+        };
+        assert!(
+            verify_spec(Preset::Token, &a)
+                .unwrap_err()
+                .message
+                .contains("can't be strict")
+        );
+    }
+
+    fn hook(verify: Value) -> Hook {
+        serde_json::from_value(json!({
+            "id": "hk_1", "name": "n", "url": "https://r.example/h/hk_1", "enabled": true,
+            "verify": verify, "maxBodyBytes": 1, "createdAt": 0, "lastEventAt": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_strict_spec_kept_is_built_here_never_copied_from_the_relay() {
+        // What the person says wins, and must agree with the relay's preset.
+        let h = hook(json!({"preset": "hmac", "header": "X-Relay", "strict": true}));
+        let said = SecretArgs {
+            preset: Some(Preset::Hmac),
+            header: Some("X-Sig".into()),
+            ..Default::default()
+        };
+        let (v, from_relay) = strict_spec(&h, &said, Some("s".into()), None).unwrap();
+        assert!(!from_relay);
+        assert_eq!(v["header"], "X-Sig");
+        assert!(v.get("secret").is_none());
+        let wrong = SecretArgs {
+            preset: Some(Preset::Github),
+            ..Default::default()
+        };
+        assert!(
+            strict_spec(&h, &wrong, Some("s".into()), None)
+                .unwrap_err()
+                .message
+                .contains("you said github")
+        );
+        // From the relay's description: rebuilt through the same checks, its other fields
+        // (a planted public key, say) dropped, and flagged for confirmation.
+        let h = hook(json!({"preset": "github", "strict": true,
+                            "publicKey": "whpk_planted", "header": "X"}));
+        let (v, from_relay) =
+            strict_spec(&h, &SecretArgs::default(), Some("s".into()), None).unwrap();
+        assert!(from_relay);
+        assert_eq!(v, json!({"preset": "github", "strict": true}));
+        // A relay that says the hook is unverified or token gets nothing kept.
+        for p in ["unverified", "token"] {
+            let h = hook(json!({"preset": p, "strict": true}));
+            assert!(strict_spec(&h, &SecretArgs::default(), Some("s".into()), None).is_err());
+        }
+        // The Ed25519 key is the person's, never the relay's.
+        let h = hook(
+            json!({"preset": "standard-webhooks-ed25519", "strict": true,
+                            "publicKey": "whpk_relay"}),
+        );
+        let (v, _) =
+            strict_spec(&h, &SecretArgs::default(), None, Some("whpk_mine".into())).unwrap();
+        let e = strict_entry(v, "whpk_mine".into(), Some("whpk_mine"), None);
+        assert_eq!(e.verify["publicKey"], "whpk_mine");
     }
 
     #[test]

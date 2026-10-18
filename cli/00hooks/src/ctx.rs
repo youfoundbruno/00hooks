@@ -4,7 +4,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use hooks_client::seal::StoreStrictSecrets;
+use hooks_client::seal::{IndexedStrictSecrets, ReplayCache, StrictIndex};
 use hooks_client::{
     Client, Config, DeviceKey, Error, KeyStore, KeychainStore, Opener, SealKey, StateDir,
     describe_skew,
@@ -143,7 +143,7 @@ impl Ctx {
             })?;
         let client = Client::with_device(&config.relay, &config.device_id, key)
             .map_err(|e| Failure::new(sentence(&e.to_string())))?;
-        client.set_opener(opener(&config, store)?);
+        client.set_opener(opener(&config, store, &state)?);
         Ok(Ctx {
             state,
             config,
@@ -157,9 +157,11 @@ impl Ctx {
 }
 
 /// What opens this device's sealed events (PROTOCOL §5): its sealing keys, the relay key pinned at
-/// login, and the strict hooks' secrets, all from the login's key store. A missing sealing key
-/// isn't fatal here: events sealed to it are quarantined with the reason, and `listen` says so.
-pub fn opener(config: &Config, store: Box<dyn KeyStore>) -> CliResult<Opener> {
+/// login, and the strict hooks' secrets, all from the login's key store; the index of strict hooks
+/// (so the relay can't switch strict mode off for one) and the replay marks of strict events, both
+/// in the state directory. A missing sealing key isn't fatal here: events sealed to it are held,
+/// then quarantined whole, and `listen` says so.
+pub fn opener(config: &Config, store: Box<dyn KeyStore>, state: &StateDir) -> CliResult<Opener> {
     let store: Arc<dyn KeyStore> = Arc::from(store);
     let mut opener = Opener::new(&config.device_id, config.relay_key.as_deref())
         .map_err(|e| Failure::new(sentence(&e.to_string())))?;
@@ -170,7 +172,17 @@ pub fn opener(config: &Config, store: Box<dyn KeyStore>) -> CliResult<Opener> {
             Err(e) => return Err(Failure::new(sentence(&e.to_string()))),
         }
     }
-    Ok(opener.with_strict(Box::new(StoreStrictSecrets(store))))
+    Ok(opener
+        .with_strict(Box::new(IndexedStrictSecrets {
+            store,
+            index: strict_index(state),
+        }))
+        .with_replay_cache(ReplayCache::at(state.path().join(ReplayCache::FILE))))
+}
+
+/// The index of the hooks this computer keeps strict secrets for.
+pub fn strict_index(state: &StateDir) -> StrictIndex {
+    StrictIndex::new(state.path().join(StrictIndex::FILE))
 }
 
 #[cfg(test)]
