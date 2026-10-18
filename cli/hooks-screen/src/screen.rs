@@ -1,7 +1,9 @@
 //! The screen itself: one decision per item, the quarantine list, and what the evaluator costs.
 //!
 //! The order (PLAN §6a): the source must have the screen on; then the rules you wrote, in order;
-//! then learned rules, newest first; then, only for an item something would act on, the evaluator
+//! then learned rules, newest first (a rule that can't be read, say a hand-edited `rules.json`,
+//! holds every item it applies to, in its place, rather than being skipped:
+//! [`Screen::rule_errors`] lists them); then, only for an item something would act on, the evaluator
 //! (from its cache when the same item was evaluated before, within the source's daily cap, never for
 //! a sensitive source with a decider that can't promise zero retention). When the evaluator fails,
 //! times out or is over its cap, the item gets the source's fallback: **quarantine** when anything
@@ -260,10 +262,45 @@ struct Cached {
     at: i64,
 }
 
+/// A rule that couldn't be made ready (a hand-edited `rules.json`, a rule from a newer version):
+/// items it applies to are held, never screened as if it weren't there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleError {
+    pub id: String,
+    pub name: String,
+    /// One sentence.
+    pub error: String,
+}
+
+/// A rule as the screen tests it: ready, or broken.
+#[derive(Debug, Clone)]
+enum Entry {
+    Ready(Compiled),
+    Broken { rule: Rule, error: String },
+}
+
+impl Entry {
+    fn rule(&self) -> &Rule {
+        match self {
+            Entry::Ready(c) => &c.rule,
+            Entry::Broken { rule, .. } => rule,
+        }
+    }
+
+    fn rule_mut(&mut self) -> &mut Rule {
+        match self {
+            Entry::Ready(c) => &mut c.rule,
+            Entry::Broken { rule, .. } => rule,
+        }
+    }
+}
+
 struct State {
     settings: Settings,
     rules: Vec<Rule>,
-    compiled: Vec<Compiled>,
+    /// One per rule, in the same order; compiled once, when the rules change.
+    compiled: Vec<Entry>,
     held: Vec<Held>,
     cache: BTreeMap<String, Cached>,
     usage: Usage,
@@ -298,10 +335,16 @@ fn day(ms: i64) -> i64 {
     ms.div_euclid(86_400_000)
 }
 
-fn compile_all(rules: &[Rule]) -> Vec<Compiled> {
+fn compile_all(rules: &[Rule]) -> Vec<Entry> {
     rules
         .iter()
-        .filter_map(|r| Compiled::new(r.clone()).ok())
+        .map(|r| match Compiled::new(r.clone()) {
+            Ok(c) => Entry::Ready(c),
+            Err(error) => Entry::Broken {
+                rule: r.clone(),
+                error,
+            },
+        })
         .collect()
 }
 
@@ -520,6 +563,25 @@ impl Screen {
         self.lock().rules.clone()
     }
 
+    /// The rules that couldn't be made ready, with why. While one is enabled (and, if learned, not
+    /// expired), items it applies to are held with a reason naming it, until it is fixed, switched
+    /// off or removed.
+    pub fn rule_errors(&self) -> Vec<RuleError> {
+        self.refresh();
+        self.lock()
+            .compiled
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Broken { rule, error } => Some(RuleError {
+                    id: rule.id.clone(),
+                    name: rule.name.clone(),
+                    error: error.clone(),
+                }),
+                Entry::Ready(_) => None,
+            })
+            .collect()
+    }
+
     /// Add a rule, or replace the one with its id (keeping its match history).
     pub fn put_rule(&self, mut rule: Rule) -> Result<Rule, String> {
         Compiled::new(rule.clone())?;
@@ -591,27 +653,45 @@ impl Screen {
         let kind = item.source.kind.as_str();
         let mut view = View::default();
         let mut order: Vec<usize> = (0..st.compiled.len())
-            .filter(|i| st.compiled[*i].rule.learned.is_none())
+            .filter(|i| st.compiled[*i].rule().learned.is_none())
             .collect();
         let mut learned: Vec<usize> = (0..st.compiled.len())
-            .filter(|i| st.compiled[*i].rule.learned.is_some())
+            .filter(|i| st.compiled[*i].rule().learned.is_some())
             .collect();
-        learned.sort_by_key(|i| std::cmp::Reverse(st.compiled[*i].rule.created_at));
+        learned.sort_by_key(|i| std::cmp::Reverse(st.compiled[*i].rule().created_at));
         order.extend(learned);
         let hit = order.into_iter().find(|i| {
-            let c = &st.compiled[*i];
-            c.rule.enabled
-                && !c.rule.expired(now, days)
-                && c.rule.applies_to(kind, &item.source.id)
-                && c.test(item, &mut view)
+            let e = &st.compiled[*i];
+            let r = e.rule();
+            r.enabled
+                && !r.expired(now, days)
+                && r.applies_to(kind, &item.source.id)
+                && match e {
+                    Entry::Ready(c) => c.test(item, &mut view),
+                    // It can't be tested, so it can't be ruled out: fail closed.
+                    Entry::Broken { .. } => true,
+                }
         })?;
-        let rule = st.compiled[hit].rule.clone();
+        if let Entry::Broken { rule, error } = &st.compiled[hit] {
+            let mut d = Decision::new(
+                Verdict::Quarantine,
+                By::Rule,
+                format!(
+                    "the rule {:?} can't be read ({error}), so what it applies to is held until \
+                     it is fixed, switched off or removed",
+                    crate::cut(&rule.name, 80)
+                ),
+            );
+            d.rule = Some(rule.id.clone());
+            return Some(d);
+        }
+        let rule = st.compiled[hit].rule().clone();
         if let Some(r) = st.rules.iter_mut().find(|r| r.id == rule.id) {
             r.matches += 1;
             r.last_matched_at = Some(now);
         }
         if let Some(c) = st.compiled.get_mut(hit) {
-            c.rule.last_matched_at = Some(now);
+            c.rule_mut().last_matched_at = Some(now);
         }
         st.rules_dirty = true;
         if st.rules_saved.elapsed() >= SAVE_EVERY {

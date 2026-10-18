@@ -32,7 +32,7 @@ use serde_json::Value;
 
 pub use evaluator::{Answers, Decider, EvaluatorSettings, Provider, Retention, Thresholds};
 pub use rules::{Condition, FieldOp, Rule};
-pub use screen::{By, Decision, Held, HeldState, Screen, Settings, SourceSettings};
+pub use screen::{By, Decision, Held, HeldState, RuleError, Screen, Settings, SourceSettings};
 
 /// What happens to an item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

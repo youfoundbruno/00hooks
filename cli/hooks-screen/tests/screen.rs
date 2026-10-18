@@ -904,3 +904,50 @@ fn the_cache_key_covers_the_whole_item() {
     b.payload = deep_b;
     assert_ne!(cache_key(&a), cache_key(&b));
 }
+
+#[tokio::test]
+async fn a_rule_that_can_not_be_read_holds_what_it_applies_to() {
+    let dir = temp("broken");
+    let s = Screen::open(&dir).unwrap();
+    on(&s, false);
+    s.put_rule(rule(
+        "links",
+        Verdict::Pass,
+        vec![field("payload.message.text", FieldOp::Pattern, r"bit\.ly")],
+    ))
+    .unwrap();
+    assert!(s.rule_errors().is_empty());
+    // Edited by hand into a pattern that doesn't compile.
+    let path = dir.join("rules.json");
+    let mut rules: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    rules[0]["conditions"][0]["value"] = json!("(");
+    std::fs::write(&path, serde_json::to_vec(&rules).unwrap()).unwrap();
+    let s = Screen::open(&dir).unwrap();
+    let errors = s.rule_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        (errors[0].id.as_str(), errors[0].name.as_str()),
+        ("links", "links")
+    );
+    assert!(errors[0].error.contains("valid pattern"), "{errors:?}");
+    // Not skipped: what it applies to is held, naming it.
+    let d = s.check(&junk("Ana")).await;
+    assert_eq!((d.verdict, d.by), (Verdict::Quarantine, By::Rule), "{d:?}");
+    assert!(
+        d.reason.contains("\"links\"") && d.reason.contains("can't be read"),
+        "{}",
+        d.reason
+    );
+    assert_eq!(d.rule.as_deref(), Some("links"));
+    // Switched off, it no longer holds anything (and it is still listed).
+    s.set_rule_enabled("links", false).unwrap();
+    assert_eq!(s.check(&junk("Ana")).await.verdict, Verdict::Pass);
+    assert_eq!(s.rule_errors().len(), 1);
+    // Scoped to another source, it doesn't hold this one's items.
+    let mut rules: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    rules[0]["enabled"] = json!(true);
+    rules[0]["sources"] = json!(["webhook:hk_other"]);
+    std::fs::write(&path, serde_json::to_vec(&rules).unwrap()).unwrap();
+    let s = Screen::open(&dir).unwrap();
+    assert_eq!(s.check(&junk("Ana")).await.verdict, Verdict::Pass);
+}
