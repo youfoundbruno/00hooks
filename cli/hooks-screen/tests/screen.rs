@@ -854,3 +854,53 @@ async fn a_chat_model_through_structured_output() {
     assert_eq!(body["response_format"]["type"], "json_schema");
     let _ = DecisionsApi::new("https://x.example", "m", None, true);
 }
+
+#[test]
+fn the_cache_key_covers_the_whole_item() {
+    use hooks_screen::screen::cache_key;
+    let base = item(json!({"order": {"id": "o_1", "total": 100, "paid": true, "note": null}}));
+    let key = cache_key(&base);
+    // The same item (another delivery id, another time) shares a verdict.
+    let mut same = base.clone();
+    same.id = "evt_other".into();
+    same.received_at = 99;
+    assert_eq!(cache_key(&same), key);
+    // Key order doesn't matter.
+    let mut reordered = base.clone();
+    reordered.payload = serde_json::from_str(
+        r#"{"order": {"note": null, "paid": true, "total": 100, "id": "o_1"}}"#,
+    )
+    .unwrap();
+    assert_eq!(cache_key(&reordered), key);
+
+    let differs = |f: &dyn Fn(&mut Item)| {
+        let mut it = base.clone();
+        f(&mut it);
+        assert_ne!(cache_key(&it), key, "{it:?}");
+    };
+    differs(&|it| it.payload["order"]["total"] = json!(101));
+    differs(&|it| it.payload["order"]["paid"] = json!(false));
+    differs(&|it| it.payload["order"]["note"] = json!(0));
+    differs(&|it| {
+        it.headers
+            .insert("x-shop-topic".into(), "orders/paid".into());
+    });
+    differs(&|it| it.origin.ip = Some("198.51.100.1".into()));
+    differs(&|it| it.origin.country = Some("US".into()));
+    differs(&|it| it.source.id = "hk_2".into());
+    differs(&|it| it.purpose = Some("orders".into()));
+    // A string deeper than similarity reads (32 levels) still counts.
+    let mut deep = json!("a");
+    for _ in 0..40 {
+        deep = json!({ "x": deep });
+    }
+    let mut a = base.clone();
+    a.payload = deep.clone();
+    let mut b = base.clone();
+    let mut deep_b = json!("b");
+    for _ in 0..40 {
+        deep_b = json!({ "x": deep_b });
+    }
+    b.payload = deep_b;
+    assert_ne!(cache_key(&a), cache_key(&b));
+}

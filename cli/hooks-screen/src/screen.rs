@@ -305,17 +305,78 @@ fn compile_all(rules: &[Rule]) -> Vec<Compiled> {
         .collect()
 }
 
-/// The cache key of an item: its source and what similarity sees of it, hashed.
+/// The cache key of an item: everything about it, canonically, hashed: its source, its whole
+/// payload (keys sorted, whatever order the map keeps; numbers, booleans and nulls included, at any
+/// depth), its headers, its origin, its own text and the purpose it is screened for. Two items share
+/// a cached verdict only when they are the same item.
 pub fn cache_key(item: &Item) -> String {
     let mut h = Sha256::new();
-    h.update(item.source.kind.as_str());
-    h.update([0]);
-    h.update(&item.source.id);
-    h.update([0]);
-    h.update(crate::shape::shape_hash(&item.payload));
-    h.update([0]);
-    h.update(item.similarity_text());
+    h.update(b"00hooks-screen-cache-v2\0");
+    feed_str(&mut h, item.source.kind.as_str());
+    feed_str(&mut h, &item.source.id);
+    feed_str(&mut h, &item.source.name);
+    feed(&mut h, &item.payload);
+    h.update((item.headers.len() as u64).to_be_bytes());
+    // A `BTreeMap`: already in order.
+    for (k, v) in &item.headers {
+        feed_str(&mut h, k);
+        feed_str(&mut h, v);
+    }
+    feed(
+        &mut h,
+        &serde_json::to_value(&item.origin).unwrap_or(Value::Null),
+    );
+    feed_opt(&mut h, item.text.as_deref());
+    feed_opt(&mut h, item.purpose.as_deref());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn feed_str(h: &mut Sha256, s: &str) {
+    h.update((s.len() as u64).to_be_bytes());
+    h.update(s.as_bytes());
+}
+
+fn feed_opt(h: &mut Sha256, s: Option<&str>) {
+    match s {
+        None => h.update(b"-"),
+        Some(s) => {
+            h.update(b"+");
+            feed_str(h, s);
+        }
+    }
+}
+
+/// A JSON value, canonically: a tag per type, lengths before contents, object keys sorted.
+fn feed(h: &mut Sha256, v: &Value) {
+    match v {
+        Value::Null => h.update(b"n"),
+        Value::Bool(b) => h.update(if *b { b"t" } else { b"f" }),
+        Value::Number(n) => {
+            h.update(b"#");
+            feed_str(h, &n.to_string());
+        }
+        Value::String(s) => {
+            h.update(b"s");
+            feed_str(h, s);
+        }
+        Value::Array(items) => {
+            h.update(b"[");
+            h.update((items.len() as u64).to_be_bytes());
+            for i in items {
+                feed(h, i);
+            }
+        }
+        Value::Object(m) => {
+            h.update(b"{");
+            h.update((m.len() as u64).to_be_bytes());
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            for k in keys {
+                feed_str(h, k);
+                feed(h, &m[k]);
+            }
+        }
+    }
 }
 
 impl Screen {
