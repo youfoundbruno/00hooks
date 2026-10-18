@@ -299,7 +299,8 @@ describe("retention and gaps", () => {
   async function age(accountId: string, seqs: number[], daysAgo: number) {
     await runInDurableObject(accountObject(accountId), async (_obj: AccountObject, state) => {
       for (const s of seqs) {
-        state.storage.sql.exec("UPDATE events SET received_at = ? WHERE seq = ?", Date.now() - daysAgo * 86_400_000, s);
+        const at = Date.now() - daysAgo * 86_400_000;
+        state.storage.sql.exec("UPDATE events SET received_at = ?, stored_at = ? WHERE seq = ?", at, at, s);
       }
     });
   }

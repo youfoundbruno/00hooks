@@ -47,10 +47,21 @@ export interface Principal {
   deviceId: string | null;
   keyId: string | null;
   actor: string;
+  /** An API key's scopes; null for a device, which may do everything its account may. */
+  scopes: readonly string[] | null;
 }
 
 export function deviceAsPrincipal(c: Caller): Principal {
-  return { accountId: c.accountId, deviceId: c.deviceId, keyId: null, actor: c.deviceId };
+  return { accountId: c.accountId, deviceId: c.deviceId, keyId: null, actor: c.deviceId, scopes: null };
+}
+
+/**
+ * Whether a caller may be shown a hook's secret (PROTOCOL §9): a device, or an API key with the
+ * `hooks:secrets` scope. `hooks:write` alone never returns a secret, so a leaked CI key can't take
+ * over a hook's signing and forge verified events.
+ */
+export function maySeeSecrets(p: Principal): boolean {
+  return p.scopes === null || p.scopes.includes("hooks:secrets");
 }
 
 export function phoneStub(env: Env, accountId: string): DurableObjectStub<PhoneObject> {

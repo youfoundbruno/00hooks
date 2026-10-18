@@ -8,7 +8,11 @@ import { constantTimeEqualStrings, isId, newId, randomBytes, toBase64Url } from 
 import { HttpError, error, forbidden, invalid, json, notFound, parseJsonObject } from "./http.ts";
 import { pepperedHash } from "./seal.ts";
 
-export const SCOPES = ["hooks:read", "hooks:write", "events:read", "devices:write", "audit:read"] as const;
+/**
+ * `hooks:secrets` is the only scope that is ever shown a hook's secret (creating a hook whose secret
+ * the relay generates, rotating one); `hooks:write` alone can't, so it can't forge verified events.
+ */
+export const SCOPES = ["hooks:read", "hooks:write", "hooks:secrets", "events:read", "devices:write", "audit:read"] as const;
 export type Scope = (typeof SCOPES)[number];
 
 export const DEFAULT_KEY_DAYS = 90;
@@ -77,7 +81,7 @@ export async function authenticateKey(request: Request, env: Env, ctx: Execution
   if (row.last_used_at === null || now - row.last_used_at > LAST_USED_EVERY_MS) {
     ctx.waitUntil(env.DB.prepare("UPDATE api_keys SET last_used_at = ? WHERE id = ?").bind(now, id).run());
   }
-  return { accountId: row.account_id, deviceId: null, keyId: id, actor: id };
+  return { accountId: row.account_id, deviceId: null, keyId: id, actor: id, scopes };
 }
 
 /** Refuses an API key on a route only a device may use. */

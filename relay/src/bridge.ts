@@ -127,6 +127,14 @@ export class SseBridge {
         this.pushEvent(`id: ${gap.to}\nevent: gap\ndata: ${JSON.stringify(gap)}\n\n`, Number(gap.to));
         break;
       }
+      case "change": {
+        // A hook change (PROTOCOL §6): no `id`, so it never moves the client's Last-Event-ID. Left
+        // out while the queue overflows, like events (the stream ends with a resync anyway).
+        if (this.overflowed) break;
+        const { t: _t, ...change } = msg;
+        this.push(`event: hook-change\ndata: ${JSON.stringify(change)}\n\n`);
+        break;
+      }
       case "more":
         this.awaitingMore = true;
         if (this.queue.length === 0) this.drained();

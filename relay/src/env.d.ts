@@ -12,6 +12,21 @@ interface __BaseEnv_Env {
   RELAY_SIGNING_KEY?: string;
   /** When set, account creation needs `Authorization: Bearer <SIGNUP_TOKEN>`. */
   SIGNUP_TOKEN?: string;
+  /** "1": signups need no token. Without it and without SIGNUP_TOKEN, signups are refused (403). */
+  OPEN_SIGNUP?: string;
+  /** Node devices (not phones) one account may have; 10 when unset. */
+  ACCOUNT_MAX_DEVICES?: string;
+  /** One verified hook's share of the account's log (PROTOCOL §4); half the account's when unset. */
+  HOOK_MAX_EVENTS?: string;
+  HOOK_MAX_BYTES?: string;
+  /** One strict or unverified hook's share; a sixteenth of the account's when unset. */
+  UNCHECKED_HOOK_MAX_EVENTS?: string;
+  UNCHECKED_HOOK_MAX_BYTES?: string;
+  /** What the screen may hold per hook, apart from the log (PROTOCOL §4b); 200 events, 16 MiB when unset. */
+  HELD_MAX_EVENTS?: string;
+  HELD_MAX_BYTES?: string;
+  /** Days body-hash replay marks are kept for presets that sign no timestamp; 180 when unset. */
+  REPLAY_MARK_DAYS?: string;
   /** How many days the screen holds an event before dropping it (PROTOCOL §4b); 7 when unset. */
   SCREEN_HELD_DAYS?: string;
   /**

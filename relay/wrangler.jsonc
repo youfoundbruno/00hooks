@@ -1,13 +1,20 @@
 // The 00hooks relay: one Worker and two Durable Object classes, each one object per account: the
 // webhook log (AccountObject) and the phone links' mailbox and sockets (PhoneObject, PROTOCOL §10).
-// Self-hosting: create the D1 database and put its id below, then set the secrets listed in
-// `.dev.vars.example` with `wrangler secret put`. See README.md.
+// Self-hosting: copy this file to the gitignored `wrangler.deploy.jsonc`, put your D1 database's id
+// and your own rate-limit namespace ids there, set the secrets listed in `.dev.vars.example` with
+// `wrangler secret put`, and deploy with `-c wrangler.deploy.jsonc`. See README.md.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "00hooks-relay",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-30",
-  "observability": { "enabled": true },
+  // Invocation logs are off: they record each request's URL, and Meta's endpoint check carries the
+  // hook's verify token in its query string (`hub.verify_token`). The relay's own logs never do.
+  "observability": { "enabled": true, "logs": { "invocation_logs": false } },
+
+  // Once a day, D1 rows past their use (expired enrolments and pairings, old failure counts, long
+  // dead API keys) are deleted (src/prune.ts).
+  "triggers": { "crons": ["17 4 * * *"] },
 
   "durable_objects": {
     "bindings": [
@@ -37,15 +44,24 @@
   // many people, since a big provider sends every one of their hooks from a few addresses.
   // REDEEM_IP_LIMIT and REDEEM_GLOBAL_LIMIT: enrolment redemptions per minute, per address and in all.
   // PAIR_IP_LIMIT: phone pairing attempts (PROTOCOL §10) per minute per address.
+  // SIGNUP_IP_LIMIT: account creations per minute per address. API_IP_LIMIT: management requests
+  // (`/v1/*` except `/v1/info`) per 10 s per address, checked before any database read.
+  // Rate Limiting counts per Cloudflare location, so even the "global" limits are per location.
+  // Each namespace_id must be unique within your Cloudflare account.
   "ratelimits": [
     { "name": "HOOK_LIMIT", "namespace_id": "1001", "simple": { "limit": 60, "period": 10 } },
     { "name": "RECEIVE_IP_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 10 } },
     { "name": "REDEEM_IP_LIMIT", "namespace_id": "1003", "simple": { "limit": 10, "period": 60 } },
     { "name": "REDEEM_GLOBAL_LIMIT", "namespace_id": "1004", "simple": { "limit": 300, "period": 60 } },
-    { "name": "PAIR_IP_LIMIT", "namespace_id": "1005", "simple": { "limit": 10, "period": 60 } }
+    { "name": "PAIR_IP_LIMIT", "namespace_id": "1005", "simple": { "limit": 10, "period": 60 } },
+    { "name": "SIGNUP_IP_LIMIT", "namespace_id": "1006", "simple": { "limit": 5, "period": 60 } },
+    { "name": "API_IP_LIMIT", "namespace_id": "1007", "simple": { "limit": 300, "period": 10 } }
   ],
 
   // ACCOUNT_MAX_EVENTS and ACCOUNT_MAX_BYTES: what one account's log may hold before deliveries are
   // refused with 429 `quota` (events waiting for an acknowledgement; bytes of bodies and headers).
+  // Each hook may hold only a share of it, and the screen's hold has its own quota (src/env.d.ts
+  // lists the optional settings). Signups are refused unless SIGNUP_TOKEN is set as a secret, or
+  // OPEN_SIGNUP is "1".
   "vars": { "RETENTION_DAYS": "7", "ACCOUNT_MAX_EVENTS": "10000", "ACCOUNT_MAX_BYTES": "268435456" }
 }

@@ -9,6 +9,7 @@ import { currentSecrets, offlineNoticeOf, screenOf, verifyTokenHash, type HookRo
 import { decide, screenKey } from "./screen.ts";
 import type { Origin } from "./envelope.ts";
 import { clientKey } from "./ip.ts";
+import { countAtEdge } from "./edge-counts.ts";
 import { pepperedHash } from "./seal.ts";
 import {
   SPECS,
@@ -18,6 +19,7 @@ import {
   metaSubscribe,
   noticeSender,
   providerAnswer,
+  signsTimestamp,
   strictHeaders,
   verifyDelivery,
   type VerifyConfig,
@@ -60,11 +62,12 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   // The URL as the sender reached it: Workers don't rewrite it, and Twilio signs it.
   const url = request.url;
   const verdict = await verifyDelivery(config, await currentSecrets(env, hook, now), { body, headers: request.headers, now, url });
-  const stub = accountStub(env, hook.account_id);
   if (!verdict.ok) {
-    ctx.waitUntil(stub.recordFailure(hookId).catch(() => {}));
+    // Counted at the edge, not written per request: a public URL's junk never wakes the account.
+    countAtEdge(env, ctx, hook.account_id, "verify.failed", hookId);
     return error(401, "signature", "The delivery's signature doesn't verify.");
   }
+  const stub = accountStub(env, hook.account_id);
   // An endpoint check (Slack's url_verification) is answered, not stored: it carries no event.
   const handshake = handshakeAnswer(config, body);
   if (handshake) return handshake;
@@ -89,7 +92,7 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
       key: await screenKey(env.HASH_PEPPER, hook.account_id),
     });
     if (verdict?.verdict === "drop") {
-      ctx.waitUntil(stub.countAudit("screen.dropped", hookId, hook.name).catch(() => {}));
+      countAtEdge(env, ctx, hook.account_id, "screen.dropped", hookId, hook.name);
       const nobody = newId("evt");
       return providerAnswer(config, null, { received: nobody }) ?? json({ received: nobody });
     }
@@ -108,9 +111,14 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   // Marks are stored as keyed hashes: a delivery id or an event id read from the body is content
   // too, and storage keeps none in the clear.
   const dedupeKeys = await Promise.all(verdict.dedupeKeys.map((k) => pepperedHash(env.HASH_PEPPER, `dedupe:${hookId}:${k}`)));
+  // Without a signed timestamp a captured genuine delivery verifies forever: its body-hash mark is
+  // kept for REPLAY_MARK_DAYS, not a week (PROTOCOL §4).
+  const long = !signsTimestamp(config);
+  const longKeys = long ? dedupeKeys.filter((_, i) => verdict.dedupeKeys[i]!.startsWith("body:")) : [];
   const result = await stub.append({
     hookId,
     dedupeKeys,
+    ...(longKeys.length > 0 ? { longKeys } : {}),
     verified: verdict.verified,
     strict,
     preset: config.preset,
@@ -129,13 +137,13 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   });
   if (result.duplicate) return providerAnswer(config, null, { duplicate: true }) ?? json({ duplicate: true });
   if (result.full) {
-    return error(
-      429,
-      "quota",
-      "This account's event log is full; deliveries resume once its devices acknowledge what's waiting.",
-      {},
-      { "Retry-After": String(QUOTA_RETRY_AFTER_S) },
-    );
+    const message =
+      result.scope === "held"
+        ? "This hook's held events are at their limit; deliveries the screen holds resume once they're released or dropped."
+        : result.scope === "hook"
+          ? "This hook's share of the account's event log is full; deliveries resume once its devices acknowledge what's waiting."
+          : "This account's event log is full; deliveries resume once its devices acknowledge what's waiting.";
+    return error(429, "quota", message, { scope: result.scope }, { "Retry-After": String(QUOTA_RETRY_AFTER_S) });
   }
   ctx.waitUntil(env.DB.prepare("UPDATE hooks SET last_event_at = ? WHERE id = ?").bind(now, hookId).run());
   if (result.held) ctx.waitUntil(stub.countAudit("screen.held", hookId, hook.name).catch(() => {}));
@@ -182,7 +190,7 @@ export async function receiveGet(request: Request, env: Env, ctx: ExecutionConte
   const ask = metaSubscribe(new URL(request.url));
   const presented = ask ? await verifyTokenHash(env, hookId, ask.token) : "";
   if (!ask || !constantTimeEqualStrings(presented, hook.handshake_token_hash)) {
-    ctx.waitUntil(accountStub(env, hook.account_id).recordFailure(hookId).catch(() => {}));
+    countAtEdge(env, ctx, hook.account_id, "verify.failed", hookId);
     return error(401, "signature", "The endpoint check doesn't carry this hook's verify token.");
   }
   return challengeAnswer(ask.challenge);

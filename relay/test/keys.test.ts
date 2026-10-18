@@ -64,8 +64,15 @@ describe("API keys", () => {
     expect((await withKey(reader, "GET", "/v1/audit")).status).toBe(403);
     expect((await withKey(reader, "GET", "/v1/devices")).status).toBe(403);
 
-    const created = await withKey(writer, "POST", "/v1/hooks", { name: "from ci", verify: { preset: "github" } });
+    // hooks:write is never shown a secret: a hook whose secret the relay generates needs hooks:secrets,
+    // and so does rotating one (PROTOCOL §9).
+    const generated = await withKey(writer, "POST", "/v1/hooks", { name: "from ci", verify: { preset: "github" } });
+    expect(generated.status).toBe(403);
+    expect(await generated.json()).toMatchObject({ error: "forbidden" });
+    expect((await withKey(writer, "POST", `/v1/hooks/${hook.id}/rotate`)).status).toBe(403);
+    const created = await withKey(writer, "POST", "/v1/hooks", { name: "from ci", verify: { preset: "github", secret: "a supplied github secret" } });
     expect(created.status).toBe(201);
+    expect(await created.clone().json()).not.toHaveProperty("secret");
     const { hook: h2 } = (await created.json()) as { hook: { id: string } };
     expect((await withKey(writer, "PATCH", `/v1/hooks/${h2.id}`, { enabled: false })).status).toBe(200);
     expect((await withKey(writer, "DELETE", `/v1/hooks/${h2.id}`)).status).toBe(204);

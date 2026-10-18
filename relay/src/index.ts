@@ -1,15 +1,18 @@
 // The 00hooks relay Worker: routes, signed-request checks, and the SSE bridge's front half.
 // The contract is docs/PROTOCOL.md at the repository root.
 
-import { createAccount, createEnrolment, listDevices, putSealKey, redeemEnrolment, revokeDevice } from "./accounts.ts";
+import { createAccount, createEnrolment, listDevices, putSealKey, redeemEnrolment, revokeDevice, signupOpen } from "./accounts.ts";
 import { listEvents, readAudit } from "./audit.ts";
 import { authenticate, deviceAsPrincipal, type Caller, type Principal } from "./auth.ts";
 import { importRelayKey } from "./envelope.ts";
 import { describeError } from "./describe-error.ts";
 import { isId } from "./encoding.ts";
-import { HttpError, error, forbidden, json, notFound, readLimited, tooLarge } from "./http.ts";
+import { HttpError, error, forbidden, json, notFound, readLimited, tooLarge, unavailable } from "./http.ts";
+import { clientKey } from "./ip.ts";
+import { pruneD1 } from "./prune.ts";
+import { RATE_LIMIT_PERIOD_S } from "./receive.ts";
 import { createHook, deleteHook, getHook, getScreen, listHooks, patchHook, putScreen, rotateHook } from "./hooks.ts";
-import { dropHeld, listHeld, releaseHeld, screenInfo, screenKeyFor } from "./held.ts";
+import { dropHeld, dropHeldBulk, listHeld, releaseHeld, screenInfo, screenKeyFor } from "./held.ts";
 import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
 import { confirmPhone, createPairing, listPhones, openPhoneSocket, redeemPairing, unpairSelf } from "./phone.ts";
 import { PHONE_PROTOCOL } from "./phone-object.ts";
@@ -39,6 +42,11 @@ export default {
       return json({ error: "internal", message: "The relay failed to handle this request." }, 500);
     }
   },
+
+  /** The daily cron trigger (wrangler.jsonc): deletes D1 rows past their use. */
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(pruneD1(env, Date.now()).catch((e: unknown) => console.error("prune failed", describeError(e))));
+  },
 } satisfies ExportedHandler<Env>;
 
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -64,12 +72,19 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       version: VERSION,
       protocol: STREAM_PROTOCOL,
       protocols: PROTOCOLS,
-      signupOpen: !env.SIGNUP_TOKEN,
+      signupOpen: signupOpen(env),
       relayKey,
       serverTime: Date.now(),
       ...screenInfo(env),
       phone: { protocol: PHONE_PROTOCOL },
     });
+  }
+
+  // Per client address, before the body is read or anything is looked up (PROTOCOL §2): a flood of
+  // management requests costs the sender their budget, not the relay a database read each.
+  if (!env.API_IP_LIMIT) return unavailable();
+  if (!(await env.API_IP_LIMIT.limit({ key: clientKey(request) })).success) {
+    return error(429, "rate_limited", "Too many requests from this address; slow down.", {}, { "Retry-After": String(RATE_LIMIT_PERIOD_S) });
   }
 
   const isScreenPut = method === "PUT" && /^\/v1\/hooks\/[^/]+\/screen$/.test(path);
@@ -158,6 +173,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
   if (path === "/v1/screen/key" && method === "GET") return screenKeyFor(env, await signed());
   if (path === "/v1/held" && method === "GET") return listHeld(env, await scoped("events:read"));
+  if (path === "/v1/held" && method === "DELETE") return dropHeldBulk(env, await scoped("hooks:write"), url);
   const hd = /^\/v1\/held\/([^/]+)(\/release)?$/.exec(path);
   if (hd) {
     const release = hd[2] !== undefined;
@@ -173,7 +189,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const rotate = hk[2] !== undefined;
     if (rotate && method !== "POST") return notFound();
     if (!rotate && method !== "GET" && method !== "PATCH" && method !== "DELETE") return notFound();
-    const caller = await scoped(method === "GET" ? "hooks:read" : "hooks:write");
+    // Rotating returns the new secret: `hooks:secrets`, never `hooks:write` alone (PROTOCOL §9).
+    const caller = await scoped(rotate ? "hooks:secrets" : method === "GET" ? "hooks:read" : "hooks:write");
     if (!isId("hk", id)) return notFound();
     if (rotate) return rotateHook(env, caller, id);
     if (method === "GET") return getHook(env, caller, origin, id);

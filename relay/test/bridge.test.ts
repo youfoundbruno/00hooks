@@ -83,6 +83,21 @@ describe("SseBridge", () => {
     expect(up.closed?.code).toBe(1000);
   });
 
+  it("frames a hook change as `hook-change` with no id, so Last-Event-ID never moves for it", async () => {
+    const up = new FakeUpstream();
+    const b = new SseBridge(up);
+    const t = tap(b);
+    b.onUpstreamMessage(JSON.stringify({ t: "ready", after: 3, head: 3 }));
+    b.onUpstreamMessage(JSON.stringify({ t: "change", n: 2, kind: "hook.rotated", hookId: "hk_x", name: "pay", actor: "key_y", at: 5 }));
+    const { text } = await t.take();
+    expect(text).toBe(
+      "retry: 5000\n\n" +
+        'event: ready\ndata: {"after":3,"head":3}\n\n' +
+        'event: hook-change\ndata: {"n":2,"kind":"hook.rotated","hookId":"hk_x","name":"pay","actor":"key_y","at":5}\n\n',
+    );
+    await t.cancel();
+  });
+
   it("writes `: hb` every 15 s", async () => {
     const up = new FakeUpstream();
     const b = new SseBridge(up);

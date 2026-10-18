@@ -12,6 +12,26 @@ export const ENROLMENT_TTL_MS = 10 * 60_000;
 export const ENROLMENT_MAX_FAILURES = 5;
 export const ENROLMENT_WINDOW_MS = 10 * 60_000;
 export const ENROLMENT_BLOCK_MS = 10 * 60_000;
+/** Node devices (not phones) an account may have at once (`ACCOUNT_MAX_DEVICES`). */
+export const DEFAULT_MAX_DEVICES = 10;
+
+export function maxDevices(env: Env): number {
+  const n = Number(env.ACCOUNT_MAX_DEVICES);
+  return Number.isInteger(n) && n > 0 ? n : DEFAULT_MAX_DEVICES;
+}
+
+const tooManyDevices = () =>
+  new HttpError(error(409, "conflict", "This account has as many devices as it may; revoke one before adding another."));
+
+/** Whether a D1 error is the unique public key losing a race: answered 409, like the check. */
+function keyTaken(e: unknown): boolean {
+  return e instanceof Error && /UNIQUE constraint failed: devices\.public_key/.test(e.message);
+}
+
+/** Whether signups need no token: only when the operator says so explicitly (`OPEN_SIGNUP=1`). */
+export function signupOpen(env: Env): boolean {
+  return !env.SIGNUP_TOKEN && env.OPEN_SIGNUP === "1";
+}
 
 export function deviceName(v: unknown): string {
   if (typeof v !== "string" || v.trim().length < 1 || v.trim().length > 100) {
@@ -45,34 +65,60 @@ export async function sealKeyField(v: unknown): Promise<{ text: string; raw: Uin
   return { text: v as string, raw, kid: await sealKid(raw) };
 }
 
-/** Inserts the device in D1, then registers it (and its sealing key) with the account's object. */
-async function addDevice(
-  env: Env,
-  accountId: string,
-  name: string,
-  key: string,
-  seal: { text: string; raw: Uint8Array; kid: string } | null,
-  now: number,
-  actor: string | null,
-): Promise<string> {
-  const deviceId = newId("dev");
-  await env.DB.prepare(
-    "INSERT INTO devices (id, account_id, name, public_key, created_at, seal_key, seal_kid) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  )
-    .bind(deviceId, accountId, name, key, now, seal?.text ?? null, seal?.kid ?? null)
-    .run();
+type SealField = { text: string; raw: Uint8Array; kid: string } | null;
+
+/** The statement that inserts a node device, only while the account is under its device cap. */
+function insertDevice(env: Env, deviceId: string, accountId: string, name: string, key: string, seal: SealField, now: number) {
+  return env.DB.prepare(
+    `INSERT INTO devices (id, account_id, name, public_key, created_at, seal_key, seal_kid)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+     WHERE (SELECT count(*) FROM devices WHERE account_id = ?2 AND kind = 'device' AND revoked_at IS NULL) < ?8`,
+  ).bind(deviceId, accountId, name, key, now, seal?.text ?? null, seal?.kid ?? null, maxDevices(env));
+}
+
+/**
+ * Registers a device D1 already holds with the account's object, and audits it. When the object
+ * can't be reached, the D1 rows (`undo`) are removed, so a retry starts clean.
+ */
+async function registerDevice(env: Env, accountId: string, deviceId: string, name: string, seal: SealField, actor: string | null, undo: D1PreparedStatement[]) {
   const stub = accountStub(env, accountId);
-  await stub.addDevice(deviceId, seal ? { key: seal.raw, kid: seal.kid } : undefined);
+  try {
+    await stub.addDevice(deviceId, seal ? { key: seal.raw, kid: seal.kid } : undefined);
+  } catch (e) {
+    await env.DB.batch(undo).catch(() => {});
+    throw e;
+  }
   await stub.audit({ kind: "device.added", actor: actor ?? deviceId, subject: deviceId, name });
+}
+
+/** Inserts a device in D1 (within the account's device cap), then registers it with the account's object. */
+async function addDevice(env: Env, accountId: string, name: string, key: string, seal: SealField, now: number, actor: string | null): Promise<string> {
+  const deviceId = newId("dev");
+  const r = await insertDevice(env, deviceId, accountId, name, key, seal, now)
+    .run()
+    .catch((e: unknown) => {
+      if (keyTaken(e)) throw new HttpError(error(409, "conflict", "That public key already belongs to a device."));
+      throw e;
+    });
+  if (r.meta.changes === 0) throw tooManyDevices();
+  await registerDevice(env, accountId, deviceId, name, seal, actor, [env.DB.prepare("DELETE FROM devices WHERE id = ?").bind(deviceId)]);
   return deviceId;
 }
 
 export async function createAccount(request: Request, env: Env, body: Uint8Array): Promise<Response> {
+  // Fail closed: without its per-address limit, anyone could make accounts as fast as they like.
+  if (!env.SIGNUP_IP_LIMIT) return unavailable();
+  if (!(await env.SIGNUP_IP_LIMIT.limit({ key: clientKey(request) })).success) {
+    return error(429, "rate_limited", "Too many signups from this address; try again later.", {}, { "Retry-After": "60" });
+  }
   if (env.SIGNUP_TOKEN) {
     const auth = request.headers.get("Authorization") ?? "";
     if (!constantTimeEqualStrings(auth, `Bearer ${env.SIGNUP_TOKEN}`)) {
       return error(401, "unauthorized", "Signing up on this relay needs its signup token.");
     }
+  } else if (!signupOpen(env)) {
+    // Signups fail closed: a relay without a signup token takes none unless OPEN_SIGNUP=1 says so.
+    return error(403, "forbidden", "This relay doesn't take signups.");
   }
   const input = parseJsonObject(body);
   const name = deviceName(input.deviceName);
@@ -80,8 +126,22 @@ export async function createAccount(request: Request, env: Env, body: Uint8Array
   const seal = await sealKeyField(input.sealKey);
   const now = Date.now();
   const accountId = newId("acc");
-  await env.DB.prepare("INSERT INTO accounts (id, created_at) VALUES (?, ?)").bind(accountId, now).run();
-  const deviceId = await addDevice(env, accountId, name, key, seal, now, null);
+  const deviceId = newId("dev");
+  // One transaction: the account never exists without its first device. A lost race on the public
+  // key answers 409, as the check above does.
+  try {
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO accounts (id, created_at) VALUES (?, ?)").bind(accountId, now),
+      insertDevice(env, deviceId, accountId, name, key, seal, now),
+    ]);
+  } catch (e) {
+    if (keyTaken(e)) return error(409, "conflict", "That public key already belongs to a device.");
+    throw e;
+  }
+  await registerDevice(env, accountId, deviceId, name, seal, null, [
+    env.DB.prepare("DELETE FROM devices WHERE id = ?").bind(deviceId),
+    env.DB.prepare("DELETE FROM accounts WHERE id = ?").bind(accountId),
+  ]);
   return json({ accountId, deviceId }, 201);
 }
 
@@ -105,6 +165,11 @@ export function normalizeCode(code: string): string | null {
 }
 
 export async function createEnrolment(env: Env, caller: Caller): Promise<Response> {
+  // A code that could only fail is refused now, not at redemption.
+  const n = await env.DB.prepare("SELECT count(*) AS n FROM devices WHERE account_id = ? AND kind = 'device' AND revoked_at IS NULL")
+    .bind(caller.accountId)
+    .first<{ n: number }>();
+  if ((n?.n ?? 0) >= maxDevices(env)) throw tooManyDevices();
   const code = newCode();
   const now = Date.now();
   const expiresAt = now + ENROLMENT_TTL_MS;
@@ -239,6 +304,11 @@ export async function revokeDevice(env: Env, caller: Principal, deviceId: string
   if (!device) return notFound();
   const stub = accountStub(env, caller.accountId);
   if (device.kind === "phone") {
+    // A relay deployed without phone links (no PHONE binding) has no PhoneObject to tell.
+    if (!env.PHONE) {
+      await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").bind(Date.now(), deviceId).run();
+      return new Response(null, { status: 204 });
+    }
     await revokePhone(env, caller.accountId, caller.actor, { id: deviceId, name: device.name, peer: device.peer ?? "" });
     return new Response(null, { status: 204 });
   }
@@ -251,7 +321,8 @@ export async function revokeDevice(env: Env, caller: Principal, deviceId: string
   const { results: phones } = await env.DB.prepare("SELECT id, name, revoked_at FROM devices WHERE account_id = ? AND kind = 'phone' AND peer = ?")
     .bind(caller.accountId, deviceId)
     .all<{ id: string; name: string; revoked_at: number | null }>();
-  await phoneStub(env, caller.accountId).revokeNode(deviceId, phones.map((p) => p.id));
+  // A relay deployed without phone links (no PHONE binding) has no PhoneObject: D1 alone records it.
+  if (env.PHONE) await phoneStub(env, caller.accountId).revokeNode(deviceId, phones.map((p) => p.id));
   const now = Date.now();
   for (const p of phones) {
     if (p.revoked_at !== null) continue;

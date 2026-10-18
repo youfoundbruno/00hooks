@@ -378,11 +378,13 @@ describe("the hold", () => {
     const a = ((await (await post(hook.id, { n: 1 })).json()) as { received: string }).received;
     await post(hook.id, { n: 2 });
     expect((await stats(dev)).held).toBe(2);
-    expect((await stats(dev)).usage.events).toBe(2);
+    // The hold is counted apart from the log (PROTOCOL §4b): held events never fill it.
+    expect((await stats(dev)).usage.events).toBe(0);
+    expect((await stats(dev)).heldUsage.events).toBe(2);
     expect((await signed(dev, "DELETE", `/v1/held/${a}`)).status).toBe(204);
     expect((await signed(dev, "DELETE", `/v1/held/${a}`)).status).toBe(404);
     expect((await stats(dev)).held).toBe(1);
-    expect((await stats(dev)).usage.events).toBe(1);
+    expect((await stats(dev)).heldUsage.events).toBe(1);
     // Past the wait (7 days by default): the alarm drops it.
     await runInDurableObject(accountObject(dev.accountId), (_o: AccountObject, state) => {
       state.storage.sql.exec("UPDATE held_events SET received_at = received_at - ?", 8 * 86_400_000);
@@ -391,6 +393,7 @@ describe("the hold", () => {
     const s = await stats(dev);
     expect(s.held).toBe(0);
     expect(s.usage).toEqual({ events: 0, bytes: 0 });
+    expect(s.heldUsage).toEqual({ events: 0, bytes: 0 });
     expect(s.head).toBe(0);
   });
 

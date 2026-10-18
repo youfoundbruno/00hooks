@@ -3,8 +3,9 @@
 // says about the screen and any hosted extras.
 
 import { accountStub, type Caller, type Principal } from "./auth.ts";
-import { toBase64Url } from "./encoding.ts";
-import { json, notFound } from "./http.ts";
+import { isId, toBase64Url } from "./encoding.ts";
+import { HttpError, error, invalid, json, notFound } from "./http.ts";
+import { QUOTA_RETRY_AFTER_S } from "./receive.ts";
 import { DEFAULT_HELD_DAYS } from "./account-object.ts";
 import { MAX_RULES, screenKey } from "./screen.ts";
 
@@ -18,8 +19,34 @@ export async function releaseHeld(env: Env, caller: Principal, id: string): Prom
   const stub = accountStub(env, caller.accountId);
   const r = await stub.releaseHeld(id);
   if (!r) return notFound();
+  if ("full" in r) {
+    return error(
+      429,
+      "quota",
+      "The event log has no room for this event now; release it once the devices have acknowledged what's waiting.",
+      { scope: r.full },
+      { "Retry-After": String(QUOTA_RETRY_AFTER_S) },
+    );
+  }
   await stub.audit({ kind: "held.released", actor: caller.actor, subject: id, name: null });
   return json({ released: id, seq: r.seq });
+}
+
+/**
+ * `DELETE /v1/held?hookId=&rule=` (device, or `hooks:write`): drops every held event of a hook, or
+ * held by a rule, or both; with neither, everything held. Answers how many went.
+ */
+export async function dropHeldBulk(env: Env, caller: Principal, url: URL): Promise<Response> {
+  const hookId = url.searchParams.get("hookId") ?? undefined;
+  const rule = url.searchParams.get("rule") ?? undefined;
+  if (hookId !== undefined && !isId("hk", hookId)) throw new HttpError(invalid("hookId", "hookId must be a hook's id."));
+  if (rule !== undefined && !/^[A-Za-z0-9_-]{1,64}$/.test(rule)) throw new HttpError(invalid("rule", "rule must be a rule's id."));
+  const stub = accountStub(env, caller.accountId);
+  const dropped = await stub.dropHeldWhere({ ...(hookId ? { hookId } : {}), ...(rule !== undefined ? { rule } : {}) });
+  if (dropped > 0) {
+    await stub.audit({ kind: "held.dropped", actor: caller.actor, subject: hookId ?? "*", name: rule ?? null });
+  }
+  return json({ dropped });
 }
 
 /** `DELETE /v1/held/<id>` (device, or `hooks:write`): it is never streamed. */

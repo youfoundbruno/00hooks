@@ -265,7 +265,8 @@ describe("receiving", () => {
     expect(await limited.json()).toMatchObject({ error: "rate_limited" });
     // Per hook: another hook on the same account is unaffected.
     expect((await post(other.hook.id, "{}")).status).toBe(200);
-  });
+    // It may wait up to 4 s for the start of a window, then sends 62 deliveries.
+  }, 20_000);
 
   it("answers unknown hooks and other methods with 404, and accepts PUT and PATCH", async () => {
     const dev = await newAccount();
@@ -306,6 +307,9 @@ describe("receiving", () => {
     const stub = accountObject(dev.accountId);
     await runInDurableObject(stub, (o: AccountObject) => {
       o.quotaOverride = { events: 2, bytes: 1_000_000 };
+      // The hook may hold the whole log here: this is the account's quota (per-hook shares are tested apart).
+      const all = { events: 1_000_000, bytes: 1_000_000_000 };
+      o.hookQuotaOverride = { checked: all, unchecked: all, held: all };
     });
     expect((await post(hook.id, '{"n":1}')).status).toBe(200);
     expect((await post(hook.id, '{"n":2}')).status).toBe(200);

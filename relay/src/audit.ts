@@ -20,13 +20,12 @@ export async function readAudit(env: Env, caller: Principal, url: URL): Promise<
   if (sinceRaw !== null && !/^\d{1,16}$/.test(sinceRaw)) throw new HttpError(invalid("since", "since must be a time in Unix ms."));
   const since = sinceRaw === null ? 0 : Number(sinceRaw);
   const entries = await accountStub(env, caller.accountId).readAudit(since, limitParam(url, 100));
-  // Counted verification failures are recorded by hook id alone; add the hook's name when it still exists.
-  const unnamed = [...new Set(entries.filter((e) => e.kind === "verify.failed").map((e) => e.subject))];
-  if (unnamed.length > 0) {
-    const { results } = await env.DB.prepare(
-      `SELECT id, name FROM hooks WHERE account_id = ? AND id IN (${unnamed.map(() => "?").join(",")})`,
-    )
-      .bind(caller.accountId, ...unnamed)
+  // Counted verification failures are recorded by hook id alone; add the hook's name when it still
+  // exists. The account's hooks are read once and matched here: one bound parameter, however many
+  // hooks failed (D1 binds at most 100).
+  if (entries.some((e) => e.kind === "verify.failed")) {
+    const { results } = await env.DB.prepare("SELECT id, name FROM hooks WHERE account_id = ?")
+      .bind(caller.accountId)
       .all<{ id: string; name: string }>();
     const names = new Map(results.map((r) => [r.id, r.name]));
     for (const e of entries) if (e.kind === "verify.failed") e.name = names.get(e.subject) ?? null;

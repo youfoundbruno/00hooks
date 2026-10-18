@@ -13,7 +13,11 @@ export const BASE = "https://relay.test";
 const worker = (exports as unknown as { default: Fetcher }).default;
 
 export function fetchRelay(path: string, init: RequestInit = {}): Promise<Response> {
-  return worker.fetch(new Request(BASE + path, init));
+  const req = new Request(BASE + path, init);
+  // Management requests are limited per address (API_IP_LIMIT, SIGNUP_IP_LIMIT): a fresh test address
+  // each time, unless the test names one, so the limits never couple tests.
+  if (path.startsWith("/v1/") && !req.headers.has("CF-Connecting-IP")) req.headers.set("CF-Connecting-IP", randomTestIp());
+  return worker.fetch(req);
 }
 
 /** A device's X25519 sealing key pair, raw. */
@@ -96,7 +100,13 @@ export interface CreatedHook {
   secret?: string;
 }
 
-export async function createHook(dev: DeviceKey, verify: Record<string, unknown>, name = "test"): Promise<CreatedHook> {
+/** Hooks each test account has made through `createHook`, so default names stay unique (they must be). */
+const hookCounts = new Map<string, number>();
+
+export async function createHook(dev: DeviceKey, verify: Record<string, unknown>, name?: string): Promise<CreatedHook> {
+  const n = (hookCounts.get(dev.deviceId) ?? 0) + 1;
+  hookCounts.set(dev.deviceId, n);
+  name ??= n === 1 ? "test" : `test ${n}`;
   const res = await signed(dev, "POST", "/v1/hooks", { name, verify });
   expect(res.status).toBe(201);
   return (await res.json()) as CreatedHook;

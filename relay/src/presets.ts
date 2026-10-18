@@ -440,6 +440,14 @@ function effectiveSpec(config: VerifyConfig): Spec {
   };
 }
 
+/**
+ * Whether the hook's deliveries carry a signed timestamp the relay checks. Without one, a captured
+ * genuine delivery verifies forever, so its body-hash replay mark is kept far longer (PROTOCOL §4).
+ */
+export function signsTimestamp(config: VerifyConfig): boolean {
+  return effectiveSpec(config).timestamp !== undefined;
+}
+
 /** Parses Stripe-style `k=v,k=v` parameters; every value of a repeated key is kept. */
 function sigParams(value: string): Map<string, string[]> {
   const out = new Map<string, string[]>();
