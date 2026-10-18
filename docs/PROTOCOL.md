@@ -798,7 +798,7 @@ metadata only. `size` is the bytes held for it (its envelopes).
 ## 10. Phone links
 
 The relay also carries the link between a **node** (a device of kind `device` that runs an agent
-harness, such as 00next) and the person's **phones**. Everything between a phone and its node is
+harness) and the person's **phones**. Everything between a phone and its node is
 sealed end to end (HPKE to the recipient's X25519 key) and signed by the sender's Ed25519 key; the
 format of the envelope's content is the harness's, not this document's. The relay routes sealed
 bytes by device id, keeps them while a side is offline, says who is online, and rate-limits. It never
@@ -820,8 +820,8 @@ spent in the account's phone object (below).
    10 minutes from now; the answer says the expiry kept. An account has at most 5 open (unexpired,
    unused, not burned) pairings: a sixth is `429` `rate_limited` with `Retry-After: 60`. A `pairingId` already
    registered is `409` `conflict`. Audit: `phone.pairing`. The node computes `verifier =
-   b64url(SHA-256(UTF-8(proof)))` from the proof it gives the phone out of band (in 00next, a QR
-   code); the relay never sees the proof until the phone shows it, nor the secret it comes from.
+   b64url(SHA-256(UTF-8(proof)))` from the proof it gives the phone out of band (a QR code,
+   say); the relay never sees the proof until the phone shows it, nor the secret it comes from.
 2. **`POST /v1/phone/pair`** (unsigned)
    `{ "pairingId", "proof": <43 characters>, "deviceName": <1–100 characters>, "publicKey": <the
    phone's Ed25519 key, as §2>, "sealKey": <the phone's X25519 key, as §2: required here>, "hello":
