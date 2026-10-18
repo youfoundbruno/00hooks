@@ -43,7 +43,8 @@
   // client address (IPv6 by /64), checked before the hook lookup; raise it for a relay that serves
   // many people, since a big provider sends every one of their hooks from a few addresses.
   // REDEEM_IP_LIMIT and REDEEM_GLOBAL_LIMIT: enrolment redemptions per minute, per address and in all.
-  // PAIR_IP_LIMIT: phone pairing attempts (PROTOCOL §10) per minute per address.
+  // PAIR_IP_LIMIT and PAIR_GLOBAL_LIMIT: phone pairing attempts (PROTOCOL §10) per minute, per
+  // address and in all.
   // SIGNUP_IP_LIMIT: account creations per minute per address. API_IP_LIMIT: management requests
   // (`/v1/*` except `/v1/info`) per 10 s per address, checked before any database read.
   // Rate Limiting counts per Cloudflare location, so even the "global" limits are per location.
@@ -55,7 +56,8 @@
     { "name": "REDEEM_GLOBAL_LIMIT", "namespace_id": "1004", "simple": { "limit": 300, "period": 60 } },
     { "name": "PAIR_IP_LIMIT", "namespace_id": "1005", "simple": { "limit": 10, "period": 60 } },
     { "name": "SIGNUP_IP_LIMIT", "namespace_id": "1006", "simple": { "limit": 5, "period": 60 } },
-    { "name": "API_IP_LIMIT", "namespace_id": "1007", "simple": { "limit": 300, "period": 10 } }
+    { "name": "API_IP_LIMIT", "namespace_id": "1007", "simple": { "limit": 300, "period": 10 } },
+    { "name": "PAIR_GLOBAL_LIMIT", "namespace_id": "1008", "simple": { "limit": 120, "period": 60 } }
   ],
 
   // ACCOUNT_MAX_EVENTS and ACCOUNT_MAX_BYTES: what one account's log may hold before deliveries are
