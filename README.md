@@ -9,7 +9,7 @@ or Linux machine. There it runs your automations: notify you, call a URL, run an
 write to a file.
 
 > Status: built are the relay (hooks, presets, sealing, device pairing, API keys, the audit, the
-> screen and phone links), the CLI and its automation runner: phases 0, 1, 2 and 5 of
+> screen and phone links), the CLI and its automation runner: phases 0 to 3, 5 and 6 of
 > [`docs/PLAN.md`](docs/PLAN.md) §7. PLAN marks what is not built. The wire contract is
 > [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
