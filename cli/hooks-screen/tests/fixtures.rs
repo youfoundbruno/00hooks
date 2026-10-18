@@ -1,10 +1,14 @@
 //! The vectors the relay is held to as well (`fixtures/screen.v1.json`): words, shapes, MinHash
-//! signatures, domains, keyed field hashes and which patterns may go to the edge. Run with
-//! `HOOKS_WRITE_SCREEN_FIXTURES=1` to write the file after a deliberate change.
+//! signatures, domains, keyed field hashes, which patterns may go to the edge (and their weight),
+//! and what edge patterns match. Run with `HOOKS_WRITE_SCREEN_FIXTURES=1` to write the file after a
+//! deliberate change.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hooks_screen::fields::{domain_of, domain_suffixes, edge_safe_pattern, fold, keyed_hash};
+use hooks_screen::fields::{
+    domain_of, domain_suffixes, edge_pattern_matches, edge_pattern_weight, edge_regex, fold,
+    keyed_hash,
+};
 use hooks_screen::minhash::{Signature, murmur3_32};
 use hooks_screen::{parse_payload, shape, text};
 use serde_json::{Value, json};
@@ -53,11 +57,19 @@ fn build() -> Value {
         .iter()
         .map(|s| json!({"text": s, "hash": murmur3_32(s.as_bytes(), 0)}))
         .collect();
+    let long_labels = format!("x@{}a", "a.".repeat(127));
+    let long_name = format!("x@{}", "x".repeat(254));
+    let long_bytes = format!("x@{}", "é".repeat(127));
+    let most_labels = format!("x@{}a.", "a.".repeat(126));
     let domains: Vec<Value> = [
         "Promo@Mail.Deals.Example.",
         "https://user@Bit.ly:443/x?y",
         "deals.example",
         "http://[::1]:80/",
+        long_labels.as_str(),
+        long_name.as_str(),
+        long_bytes.as_str(),
+        most_labels.as_str(),
     ]
     .iter()
     .map(
@@ -80,6 +92,9 @@ fn build() -> Value {
         json!({"path": p, "op": op, "value": v, "normalised": n, "hash": keyed_hash(&key, p, &n)})
     })
     .collect();
+    let too_long = "a".repeat(201);
+    let too_deep = format!("{}a{}", "(".repeat(9), ")".repeat(9));
+    let deepest = format!("{}a{}", "(".repeat(8), ")".repeat(8));
     let patterns: Vec<Value> = [
         r"bit\.ly/\w+",
         "(a+)+$",
@@ -88,9 +103,145 @@ fn build() -> Value {
         "a*b*c*",
         "[(*+]x{2,5}",
         "a{2,}b+",
+        r"(?i)free (crypto|bitcoin)",
+        r"^\d{3}-\d{4}$",
+        "colou?r",
+        r"\bcat\b",
+        "[^a-z0-9_-]",
+        "a|",
+        "()",
+        "x{0}y",
+        "a{2,3}?",
+        r"\.\*\+\?\(\)\|\[\]\{\}\^\$\-\/\#\&\~\!\%",
+        r"[\]\-]",
+        "[-a]",
+        "[a-]",
+        "(?i:abc)d",
+        "^.$",
+        r"\s\S\d\D\w\W\B",
+        r"[\d\s\n]",
+        "ş+",
+        "a b#c",
+        r"\w{250}",
+        r"(\w{0,50}){4}x",
+        deepest.as_str(),
+        "(?<n>a)",
+        "(?s).",
+        "a(?i)b",
+        "(?-i)a",
+        "a**",
+        "a+*",
+        "^*",
+        r"\b+",
+        "{2}",
+        "x}",
+        "x]",
+        "[]a]",
+        "[]",
+        "[^]",
+        "[[]",
+        "[a-c-e]",
+        "[a&&b]",
+        "[a~~b]",
+        r"[\d-z]",
+        "[z-a]",
+        "a{3,2}",
+        "a{1001}",
+        "a{,3}",
+        "a{2, 5}",
+        r"\w{251}",
+        r"(\w{100}){3}",
+        too_deep.as_str(),
+        r"\x41",
+        r"\pL",
+        r"\<",
+        r"\A",
+        r"\z",
+        r"\0",
+        r"a\",
+        "(",
+        ")",
+        "",
+        too_long.as_str(),
     ]
     .iter()
-    .map(|p| json!({"pattern": p, "edge": edge_safe_pattern(p).is_ok()}))
+    .map(|p| {
+        let w = edge_pattern_weight(p).ok();
+        json!({"pattern": p, "edge": w.is_some(), "weight": w})
+    })
+    .collect();
+    let a3000 = format!("{}!", "a".repeat(3000));
+    let at3000 = "@".repeat(3000);
+    let opt = format!("^{}{}$", "a?".repeat(28), "a".repeat(28));
+    let a28 = "a".repeat(28);
+    let a27 = "a".repeat(27);
+    let w100 = format!("{}!", "a".repeat(100));
+    let matches: Vec<Value> = [
+        (r"bit\.ly/\w+", "see bit.ly/abc"),
+        (r"bit\.ly/\w+", "see bit.ly/"),
+        ("(a+)+$", a3000.as_str()),
+        ("(a+)+$", "aaab"),
+        ("^a*$", a3000.as_str()),
+        ("!$", a3000.as_str()),
+        (r".*@.*\.ru", at3000.as_str()),
+        (r".*@.*\.ru", "x@y.ru"),
+        (opt.as_str(), a28.as_str()),
+        (opt.as_str(), a27.as_str()),
+        (r"\w{0,60}\w{0,60}\w{0,60}!", a3000.as_str()),
+        (r"\w{0,60}\w{0,60}\w{0,60}!", w100.as_str()),
+        (r"(?i)free (crypto|bitcoin)", "Get FREE Bitcoin"),
+        (r"(?i)free (crypto|bitcoin)", "free coins"),
+        ("(?i)s", "ſ"),
+        ("(?i)σ", "ς"),
+        ("(?i)[^k]", "\u{212A}"),
+        ("(?i)[^k]", "K"),
+        ("(?i)[^k]", "x"),
+        ("(?i)[a-z]+", "\u{212A}"),
+        (r"\bcat\b", "a cat!"),
+        (r"\bcat\b", "concat"),
+        (r"\bcat\b", "é cat"),
+        (r"\bcat\b", "écat"),
+        (r"\Bcat", "concat"),
+        (r"\Bcat", "cat"),
+        ("^.$", "\r"),
+        ("^.$", "\n"),
+        ("^.$", "\u{2028}"),
+        ("^.$", "😀"),
+        (r"^\w$", "é"),
+        (r"^\w$", "٣"),
+        (r"^\w$", "‿"),
+        (r"^\w$", "-"),
+        (r"^\d+$", "٣٤"),
+        (r"^\d+$", "12a"),
+        (r"\s", "a\u{a0}b"),
+        (r"\s", "ab"),
+        (r"\W", "abc"),
+        (r"\W", "a-b"),
+        ("colou?r", "color"),
+        ("colou?r", "colr"),
+        ("a{2,3}b", "aab"),
+        ("a{2,3}b", "ab"),
+        ("x{0}y", "y"),
+        ("a|", "zzz"),
+        (r"[\]\-]", "]"),
+        (r"[\]\-]", "-"),
+        (r"[\]\-]", "a"),
+        ("^ş+$", "şş"),
+        ("^$", ""),
+        ("(?i:abc)d", "ABCd"),
+        ("(?i:abc)d", "ABCD"),
+        (r"\.\*\+", ".*+"),
+        ("[^a-z0-9_-]", "abc-_"),
+        ("[^a-z0-9_-]", "abc!"),
+        ("(a*)*b", "aaaa"),
+        ("()", "x"),
+    ]
+    .iter()
+    .map(|(p, v)| {
+        assert!(edge_pattern_weight(p).is_ok(), "{p} is an edge pattern");
+        let re = edge_regex(p).unwrap();
+        json!({"pattern": p, "value": v, "matches": edge_pattern_matches(&re, v)})
+    })
     .collect();
     json!({
         "version": 1,
@@ -102,6 +253,7 @@ fn build() -> Value {
         "domains": domains,
         "fieldHashes": hashes,
         "edgePatterns": patterns,
+        "edgeMatches": matches,
     })
 }
 

@@ -471,7 +471,9 @@ Condition  =
   { "on": "ip", "in": [address or CIDR…], "not"?: true, "preset"?: "github" }
   { "on": "asn", "in": [number…], "not"?: true }
   { "on": "country", "in": ["PT"…], "not"?: true }
-  { "on": "header", "name", "op": "present" | "absent" | "is" | "contains", "value"? }
+  { "on": "header", "name", "op": "present" | "absent" }
+  { "on": "header", "name", "op": "is", "hashes": [22 chars…] }
+  { "on": "header", "name", "op": "contains", "value" }                     needs consent.words
   { "on": "size", "op": "gt" | "lt", "bytes" }
   { "on": "field", "path", "op": "is" | "domain_is" | "one_of", "hashes": [22 chars…], "not"?: true }
   { "on": "field", "path", "op": "contains", "words", "not"?: true }         needs consent.words
@@ -488,22 +490,57 @@ missing network, country or field.
 
 - **Fields** are named by their catalogue path (PLAN §5.0): `payload.sender.email`,
   `payload.items[].sku` (any item), `headers.<name>`. Only scalars count: strings as they are,
-  numbers and booleans as their JSON text.
+  numbers and booleans as their JSON text. A path reads at most the first 64 values, in document
+  order (the harness, screening on the device, reads up to 1,000).
 - **Keyed hashes.** `is` and `one_of` compare a value trimmed and lower-cased; `domain_is` compares
   the domain of an address (after the last `@`) or a URL (its host, without user, port or a trailing
-  dot), and matches the domain or any parent of it. Each value travels only as
+  dot), and matches the domain or any parent of it; a domain of more than 253 bytes (UTF-8) or 127
+  labels never matches, at the relay and in the harness alike. Each value travels only as
   `HMAC-SHA256(screenKey, "00hooks-screen-field-v1\n" + path + "\n" + normalised)`, its first 16
   bytes in unpadded base64url; the relay hashes the incoming field (each parent domain, for
   `domain_is`) and compares. `GET /v1/screen/key` (device only) → `{ "key" }`: the account's screen
   key, 32 bytes, unpadded base64url (`HMAC-SHA256(HASH_PEPPER, "screen-key:" + accountId)`), so
   another account's hashes never match here. A keyed hash keeps the value from storage and logs,
   not from the relay's operator, who holds the key and could test guesses.
-- **Words.** `contains` (the words appear in order and adjacent, case-insensitive), `pattern` (a
-  JavaScript regular expression over the first 2,048 characters, from a safe subset: no
-  back-references, no look-around, no repeated groups, at most two unbounded repeats, 200
-  characters) and `similar_text` make the relay read the words, so a screen with any of them is
-  refused (`400`, `field: "screen.consent"`) unless `consent.words` is `true`; the screen kept says
-  whether it reads words.
+- **Headers.** A header's `is` is a field rule on `headers.<name>` by another spelling: it carries
+  the keyed hashes of the trimmed, lower-cased value over the path `headers.<name>` (the name
+  lower-cased), never the value. A screen that sends `value` with a header's `is` is refused
+  (`400`, `field: "…conditions[j].value"`); a screen kept from before this rule, with a plain value,
+  still runs until it is pushed again. A header's `contains` reads the words, so it needs
+  `consent.words`.
+- **Words.** `contains` (the words appear in order and adjacent, case-insensitive; on a field or a
+  header), `pattern` and `similar_text` make the relay read the words, so a screen with any of them
+  is refused (`400`, `field: "screen.consent"`) unless `consent.words` is `true`; the screen kept
+  says whether it reads words.
+- **Patterns** are matched in time linear in what they read, whatever the pattern: the relay runs
+  its own Thompson-NFA matcher (no backtracking) on the first 2,048 characters (code points) of a
+  value, unanchored, with the meaning the Rust `regex` crate gives the same text: `\w`, `\d`, `\s`
+  and `\b` are Unicode's, `.` is any character but a line feed, `^` and `$` are the start and end
+  of the text, and `(?i)` folds case by Unicode's simple case folding. It takes this subset, and a
+  pattern outside it is refused (`400` on the pattern):
+
+  ```
+  pattern := alt                                 1 to 200 characters; may start with (?i)
+  alt     := concat ("|" concat)*                an empty branch matches the empty text
+  concat  := (atom [quant ["?"]])*               no quantifier on ^ $ \b \B; none stacked
+  quant   := * | + | ? | {n} | {n,} | {n,m}      0 <= n <= m <= 1000, digits only
+  atom    := character | . | ^ | $ | escape | class | ( alt ) | (?: alt ) | (?i: alt )
+             (groups nest at most 8 deep; a character is anything but \ . + * ? ( ) | [ ] { } ^ $)
+  escape  := \d \D \w \W \s \S \b \B \n \t \r \f \v | "\" + ASCII punctuation but < >
+  class   := "[" ["^"] item+ "]"                 items: characters, escapes (not \b \B), ranges
+             between two characters (low to high), \d \D \w \W \s \S; no nesting, no && ~~ --,
+             "-" only first or last
+  ```
+
+  Its weight, near the size of its NFA, is at most 250: a character, class or assertion weighs 1,
+  a sequence the sum, an alternation the sum plus one per `|`, `x{n,m}` weight(x)·max(m, 1) and
+  `x{n,}` weight(x)·(n + 1) (`*` is `{0,}`, `+` is `{1,}`, `?` is `{0,1}`). The different patterns of
+  one screen weigh at most 4,000 together (`400`, `field: "screen.rules"`).
+- **Bounds.** A screen is compiled once per relay isolate. What one delivery can make it do is
+  bounded: its keyed hashes read at most 256 KiB (path and value; each (path, value) is hashed
+  once), its patterns and `contains` comparisons take at most 2,000,000 steps, and its field paths
+  pass at most 1,000,000 payload nodes. A delivery that would need more is held, as if a rule had
+  said `quarantine`, under the rule id `~over-budget` (not a valid rule id, so it names no rule).
 - **Fingerprints** (`similar`): `shape` is the payload's shape hash (its field paths and types:
   every path `payload.a`, `payload.l[]`… with its types sorted and joined by `|`, the lines
   `path:types` sorted and joined by `\n`, then hex SHA-256; at most 2,000 fields, 32 levels and 50
@@ -514,8 +551,10 @@ missing network, country or field.
   base64url (342 characters). A fingerprint holds when the shape is equal (if given) and the share of
   equal slots is at least `threshold` (0.5 to 1; 0.8 when absent).
 
-`fixtures/screen.v1.json` pins words, shapes, signatures, domains, keyed hashes and safe patterns;
-the relay's tests and the harness's (`cli/hooks-screen`) both run it.
+`fixtures/screen.v1.json` pins words, shapes, signatures, domains (with the caps), keyed hashes,
+which patterns are in the edge's subset with their weights, and what edge patterns match
+(pathological inputs included); the relay's tests and the harness's (`cli/hooks-screen`) both run
+it.
 
 **The hold.** A quarantined event is sealed to every device as usual, but with the associated data
 `00hooks-seal-v1\n<hookId>\nheld\n<id>` (it has no seq yet), kept aside with its dedupe marks, and

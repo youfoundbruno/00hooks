@@ -5,9 +5,14 @@
 //
 // What it reads: the sender's address, network (ASN) and country from Cloudflare (`request.cf`),
 // headers, the size, and, unless the hook is strict, the body: its shape hash, a MinHash of its
-// text, and fields whose values the rules hold only as keyed hashes. `contains`, `pattern` and
-// `similar text` read the words, so a device may push them only with `consent.words`. Nothing read
-// here is stored: a decision keeps the rule's id and a count.
+// text, and fields and headers whose values the rules hold only as keyed hashes. `contains` (on a
+// field or a header), `pattern` and `similar text` read the words, so a device may push them only
+// with `consent.words`. Nothing read here is stored: a decision keeps the rule's id and a count.
+//
+// What one delivery can cost is bounded whatever the screen and the payload: a screen is compiled
+// once per isolate; patterns run on a linear-time matcher (`screen-pattern.ts`); a path reads at
+// most 64 values; and the hashing, pattern steps and walking of one delivery have a budget, past
+// which the delivery is held (`~over-budget`) rather than screened further.
 //
 // The harness's half is `cli/hooks-screen`; both compute words, shapes, signatures, domains and
 // keyed hashes alike, held to `fixtures/screen.v1.json`.
@@ -15,6 +20,7 @@
 import { fromBase64, hmac, sha256Hex, toBase64Url, utf8 } from "./encoding.ts";
 import { HttpError, invalid } from "./http.ts";
 import { expandIpv6 } from "./ip.ts";
+import { codePoints, compilePattern, patternWeight, PatternError, type CompiledPattern, type Steps } from "./screen-pattern.ts";
 
 export type Verdict = "pass" | "quarantine" | "drop";
 const VERDICTS: readonly Verdict[] = ["pass", "quarantine", "drop"];
@@ -29,15 +35,18 @@ const MAX_FIELDS = 2000;
 const MAX_ITEMS = 50;
 export const SLOTS = 64;
 export const DEFAULT_THRESHOLD = 0.8;
-/** What a pattern reads of a value at the edge. */
+/** What a pattern reads of a value at the edge: its first 2,048 characters (code points). */
 export const EDGE_PATTERN_INPUT = 2048;
-const MAX_PATTERN = 200;
+/** The most the different patterns of one screen weigh together (`screen-pattern.ts`). */
+export const MAX_SCREEN_PATTERN_WEIGHT = 4000;
 
 export type Condition =
   | { on: "ip"; in: string[]; not?: boolean; preset?: string }
   | { on: "asn"; in: number[]; not?: boolean }
   | { on: "country"; in: string[]; not?: boolean }
-  | { on: "header"; name: string; op: "present" | "absent" | "is" | "contains"; value?: string }
+  | { on: "header"; name: string; op: "present" | "absent" }
+  | { on: "header"; name: string; op: "is"; hashes: string[] }
+  | { on: "header"; name: string; op: "contains"; value: string }
   | { on: "size"; op: "gt" | "lt"; bytes: number }
   | { on: "field"; path: string; op: "is" | "domain_is" | "one_of"; hashes: string[]; not?: boolean }
   | { on: "field"; path: string; op: "contains"; words: string; not?: boolean }
@@ -288,23 +297,40 @@ function scalarText(v: unknown): string | null {
   return null;
 }
 
-/** The values at a catalogue path (`payload.a[].b`, `headers.name`). */
-export function valuesAt(payload: unknown, headers: Headers, path: string): string[] {
+/** The values of one path the edge reads: the first 64, in document order. */
+export const MAX_VALUES = 64;
+
+/**
+ * The values at a catalogue path (`payload.a[].b`, `headers.name`): at most `max`, in document
+ * order. `visit` is told of every node the walk passes, so a delivery's budget can count them.
+ */
+export function valuesAt(payload: unknown, headers: Headers, path: string, max = MAX_VALUES, visit: () => void = () => {}): string[] {
   if (path.startsWith("headers.")) {
     const v = headers.get(path.slice("headers.".length));
     return v === null ? [] : [v];
   }
   if (!path.startsWith("payload")) return [];
-  let cur: unknown[] = [payload];
-  for (const part of splitPath(path.slice("payload".length))) {
-    const next: unknown[] = [];
-    for (const v of cur) {
-      if (part === "[]" && Array.isArray(v)) next.push(...v);
-      else if (part !== "[]" && isObject(v) && Object.hasOwn(v, part)) next.push(v[part]);
+  const parts = splitPath(path.slice("payload".length));
+  const out: string[] = [];
+  // Depth first is document order: every value of a0 before any of a1.
+  const walk = (v: unknown, i: number): void => {
+    visit();
+    if (i === parts.length) {
+      const s = scalarText(v);
+      if (s !== null) out.push(s);
+      return;
     }
-    cur = next;
-  }
-  return cur.map(scalarText).filter((s): s is string => s !== null);
+    const part = parts[i]!;
+    if (part === "[]") {
+      if (!Array.isArray(v)) return;
+      for (const x of v) {
+        if (out.length >= max) return;
+        walk(x, i + 1);
+      }
+    } else if (isObject(v) && Object.hasOwn(v, part)) walk(v[part], i + 1);
+  };
+  walk(payload, 0);
+  return out;
 }
 
 export const fold = (v: string) => v.trim().toLowerCase();
@@ -328,10 +354,22 @@ export function domainOf(raw: string): string {
       host = c >= 0 ? authority.slice(0, c) : authority;
     }
   } else host = v;
-  return host.replace(/\.+$/, "");
+  // Without the trailing dots (a loop: a regular expression here is quadratic on a run of dots).
+  let end = host.length;
+  while (end > 0 && host.charCodeAt(end - 1) === 0x2e) end--;
+  return host.slice(0, end);
 }
 
+/** The longest domain the edge reads, in UTF-8 bytes, and its most labels (as DNS has them). */
+export const MAX_DOMAIN_BYTES = 253;
+export const MAX_DOMAIN_LABELS = 127;
+
+/** The domain and every parent of it; none for a domain longer than DNS allows (it never matches). */
 export function domainSuffixes(domain: string): string[] {
+  if (domain.length > MAX_DOMAIN_BYTES || utf8(domain).byteLength > MAX_DOMAIN_BYTES) return [];
+  let labels = 1;
+  for (let i = 0; i < domain.length; i++) if (domain.charCodeAt(i) === 0x2e) labels++;
+  if (labels > MAX_DOMAIN_LABELS) return [];
   const out: string[] = [];
   let d = domain;
   for (;;) {
@@ -342,9 +380,17 @@ export function domainSuffixes(domain: string): string[] {
   }
 }
 
+const fieldInput = (path: string, normalised: string) => utf8(`00hooks-screen-field-v1\n${path}\n${normalised}`);
+
+/** The screen key as a `CryptoKey`: imported once for a delivery, not once per hash. */
+export function importScreenKey(raw: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+
 /** HMAC-SHA256 under the screen key of `00hooks-screen-field-v1\n<path>\n<value>`, 16 bytes, base64url. */
-export async function keyedHash(key: Uint8Array<ArrayBuffer>, path: string, normalised: string): Promise<string> {
-  const mac = await hmac("SHA-256", key, utf8(`00hooks-screen-field-v1\n${path}\n${normalised}`));
+export async function keyedHash(key: Uint8Array<ArrayBuffer> | CryptoKey, path: string, normalised: string): Promise<string> {
+  const k = key instanceof Uint8Array ? await importScreenKey(key) : key;
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", k, fieldInput(path, normalised)));
   return toBase64Url(mac.subarray(0, 16));
 }
 
@@ -353,46 +399,23 @@ export async function screenKey(pepper: string, accountId: string): Promise<Uint
   return hmac("SHA-256", utf8(pepper), utf8(`screen-key:${accountId}`));
 }
 
+/** The account's screen key, ready to hash with, for one delivery. */
+export async function screenCryptoKey(pepper: string, accountId: string): Promise<CryptoKey> {
+  return importScreenKey(await screenKey(pepper, accountId));
+}
+
 /**
- * Whether a pattern is safe for the relay's backtracking engine: no back-references, no
- * look-around, no repeated groups, at most two unbounded repeats. The harness checks the same.
+ * Whether a pattern can run at the edge: it is in the subset the relay's linear-time matcher takes
+ * (`screen-pattern.ts`: no back-references or look-around, at most 200 characters, a weight of at
+ * most 250 once its repeats are counted). The harness checks the same.
  */
 export function edgeSafePattern(pattern: string): boolean {
-  const chars = [...pattern];
-  if (chars.length > MAX_PATTERN || chars.length === 0) return false;
-  let unbounded = 0;
-  let inClass = false;
-  for (let i = 0; i < chars.length; i++) {
-    const c = chars[i]!;
-    if (c === "\\") {
-      const n = chars[i + 1] ?? " ";
-      if ((/[1-9]/.test(n)) || n === "k") return false;
-      i++;
-      continue;
-    }
-    if (inClass) {
-      if (c === "]") inClass = false;
-      continue;
-    }
-    if (c === "[") inClass = true;
-    else if (c === "(" && chars[i + 1] === "?") {
-      const n = chars[i + 2] ?? " ";
-      if (n === "=" || n === "!" || n === "<") return false;
-    } else if (c === ")") {
-      if (["*", "+", "?", "{"].includes(chars[i + 1] ?? "")) return false;
-    } else if (c === "*" || c === "+") unbounded++;
-    else if (c === "{") {
-      const j = chars.indexOf("}", i);
-      if (j >= 0 && chars.slice(i + 1, j).join("").endsWith(",")) unbounded++;
-    }
-  }
-  if (unbounded > 2) return false;
   try {
-    new RegExp(pattern);
+    patternWeight(pattern);
+    return true;
   } catch {
     return false;
   }
-  return true;
 }
 
 // ── parsing what a device pushes ────────────────────────────────────────────────────────────────
@@ -464,6 +487,8 @@ function threshold(v: unknown, field: string): number | undefined {
   return v as number;
 }
 
+const hashList = (v: unknown, field: string) => list(v, field, (x) => (typeof x === "string" && HASH.test(x) ? x : null));
+
 function parseCondition(raw: unknown, field: string): Condition {
   if (!isObject(raw)) return bad(field, "A condition is an object.");
   const not = raw.not === undefined ? undefined : raw.not === true ? true : raw.not === false ? false : bad(`${field}.not`, "not is true or false.");
@@ -481,12 +506,17 @@ function parseCondition(raw: unknown, field: string): Condition {
     case "header": {
       const name = typeof raw.name === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(raw.name) ? raw.name.toLowerCase() : bad(`${field}.name`, "A header name is letters, digits, - or _.");
       const op = raw.op;
-      if (op !== "present" && op !== "absent" && op !== "is" && op !== "contains") return bad(`${field}.op`, "A header's op is present, absent, is or contains.");
-      if (op === "is" || op === "contains") {
+      if (op === "is") {
+        // Held as keyed hashes, as a field's `is` is (path `headers.<name>`): never the value.
+        if (raw.value !== undefined) return bad(`${field}.value`, "A header's is travels as keyed hashes (hashes over headers.<name>), as a field's does; the relay keeps no header value.");
+        return { on: "header", name, op, hashes: hashList(raw.hashes, `${field}.hashes`) };
+      }
+      if (op === "contains") {
         const value = typeof raw.value === "string" && raw.value.trim().length > 0 && raw.value.length <= 1000 ? raw.value.trim().toLowerCase() : bad(`${field}.value`, "A header condition needs a value.");
         return { on: "header", name, op, value };
       }
-      return { on: "header", name, op };
+      if (op === "present" || op === "absent") return { on: "header", name, op };
+      return bad(`${field}.op`, "A header's op is present, absent, is or contains.");
     }
     case "size": {
       if (raw.op !== "gt" && raw.op !== "lt") return bad(`${field}.op`, "A size's op is gt or lt.");
@@ -499,14 +529,20 @@ function parseCondition(raw: unknown, field: string): Condition {
         case "is":
         case "domain_is":
         case "one_of":
-          return withNot({ on: "field", path, op: raw.op, hashes: list(raw.hashes, `${field}.hashes`, (x) => (typeof x === "string" && HASH.test(x) ? x : null)) });
+          return withNot({ on: "field", path, op: raw.op, hashes: hashList(raw.hashes, `${field}.hashes`) });
         case "contains": {
           const words = typeof raw.words === "string" && raw.words.length <= 1000 && tokens(raw.words).length > 0 ? raw.words : bad(`${field}.words`, "contains needs words.");
           return withNot({ on: "field", path, op: "contains", words });
         }
         case "pattern": {
-          const pattern = typeof raw.pattern === "string" && edgeSafePattern(raw.pattern) ? raw.pattern : bad(`${field}.pattern`, "This pattern can't run at the edge (no back-references, look-around or repeated groups; at most two unbounded repeats; 200 characters).");
-          return withNot({ on: "field", path, op: "pattern", pattern });
+          if (typeof raw.pattern !== "string") return bad(`${field}.pattern`, "A pattern is text.");
+          try {
+            patternWeight(raw.pattern);
+          } catch (e) {
+            if (!(e instanceof PatternError)) throw e;
+            return bad(`${field}.pattern`, `This pattern can't run at the edge: ${e.message}. The edge takes a linear-time subset (PROTOCOL §4b).`);
+          }
+          return withNot({ on: "field", path, op: "pattern", pattern: raw.pattern });
         }
         case "similar_text": {
           const signature = typeof raw.signature === "string" && decodeSignature(raw.signature) ? raw.signature : bad(`${field}.signature`, "A signature is 342 base64url characters.");
@@ -529,7 +565,8 @@ function parseCondition(raw: unknown, field: string): Condition {
   }
 }
 
-const needsWords = (c: Condition) => c.on === "field" && (c.op === "contains" || c.op === "pattern" || c.op === "similar_text");
+const needsWords = (c: Condition) =>
+  (c.on === "field" && (c.op === "contains" || c.op === "pattern" || c.op === "similar_text")) || (c.on === "header" && c.op === "contains");
 
 /** Reads a hook's screen as a device pushed it (`PUT /v1/hooks/<id>/screen`); throws `invalid`. */
 export function parseScreen(raw: unknown): EdgeScreen | null {
@@ -549,14 +586,143 @@ export function parseScreen(raw: unknown): EdgeScreen | null {
     }
     const conditions = r.conditions.map((c, j) => parseCondition(c, `${f}.conditions[${j}]`));
     if (!consent && conditions.some(needsWords)) {
-      return bad("screen.consent", "contains, pattern and similar_text rules make the relay read words; send consent.words to allow it.");
+      return bad("screen.consent", "contains (on a field or a header), pattern and similar_text rules make the relay read words; send consent.words to allow it.");
     }
     return { id, verdict, ...(r.any === true ? { any: true } : {}), conditions };
   });
+  const weights = new Map<string, number>();
+  for (const r of rules) for (const c of r.conditions) if (c.on === "field" && c.op === "pattern") weights.set(c.pattern, patternWeight(c.pattern));
+  if ([...weights.values()].reduce((s, w) => s + w, 0) > MAX_SCREEN_PATTERN_WEIGHT) {
+    return bad("screen.rules", `The patterns of one screen weigh at most ${MAX_SCREEN_PATTERN_WEIGHT} together, once their repeats are counted (each different pattern once).`);
+  }
   return { rules, consent: { words: consent && rules.some((r) => r.conditions.some(needsWords)) } };
 }
 
+// ── compiling, once per isolate ─────────────────────────────────────────────────────────────────
+
+type Check =
+  | { on: "ip"; nets: Net[]; not: boolean }
+  | { on: "asn"; in: Set<number>; not: boolean }
+  | { on: "country"; in: Set<string>; not: boolean }
+  | { on: "header"; name: string; op: "present" | "absent" }
+  /** `plain`: a value stored before header values became hashes, until the screen is pushed again. */
+  | { on: "header"; name: string; op: "is"; path: string; hashes: Set<string>; plain: string | null }
+  | { on: "header"; name: string; op: "contains"; value: string }
+  | { on: "size"; op: "gt" | "lt"; bytes: number }
+  | { on: "field"; path: string; not: boolean; op: "hash"; domain: boolean; hashes: Set<string> }
+  | { on: "field"; path: string; not: boolean; op: "contains"; words: string[] }
+  /** `re` is null for a pattern stored before the subset that it isn't in: it never holds. */
+  | { on: "field"; path: string; not: boolean; op: "pattern"; re: CompiledPattern | null }
+  | { on: "field"; path: string; not: boolean; op: "similar_text"; signature: Uint32Array | null; threshold: number }
+  | { on: "similar"; shape: string | undefined; text: Uint32Array | null | undefined; threshold: number };
+
+export interface CompiledScreen {
+  rules: { id: string; verdict: Verdict; any: boolean; checks: Check[] }[];
+}
+
+/** A screen as kept, made ready to run: networks parsed, patterns compiled, hashes in sets. */
+export function compileScreen(screen: EdgeScreen): CompiledScreen {
+  const patterns = new Map<string, CompiledPattern | null>();
+  const pattern = (p: string) => {
+    if (!patterns.has(p)) {
+      let re: CompiledPattern | null = null;
+      try {
+        re = compilePattern(p);
+      } catch {
+        re = null;
+      }
+      patterns.set(p, re);
+    }
+    return patterns.get(p)!;
+  };
+  const check = (c: Condition): Check => {
+    const not = "not" in c && c.not === true;
+    switch (c.on) {
+      case "ip":
+        return { on: "ip", nets: c.in.map(parseNet).filter((n): n is Net => n !== null), not };
+      case "asn":
+        return { on: "asn", in: new Set(c.in), not };
+      case "country":
+        return { on: "country", in: new Set(c.in.map((x) => x.toUpperCase())), not };
+      case "header":
+        if (c.op === "is") {
+          const legacy = (c as { value?: unknown }).value;
+          return { on: "header", name: c.name, op: "is", path: `headers.${c.name}`, hashes: new Set(c.hashes ?? []), plain: typeof legacy === "string" ? legacy : null };
+        }
+        if (c.op === "contains") return { on: "header", name: c.name, op: "contains", value: c.value };
+        return { on: "header", name: c.name, op: c.op };
+      case "size":
+        return { on: "size", op: c.op, bytes: c.bytes };
+      case "field":
+        return fieldCheck(c, not);
+      case "similar":
+        return { on: "similar", shape: c.shape, text: c.text ? decodeSignature(c.text) : undefined, threshold: c.threshold ?? DEFAULT_THRESHOLD };
+    }
+  };
+  const fieldCheck = (c: Extract<Condition, { on: "field" }>, not: boolean): Check => {
+    switch (c.op) {
+      case "is":
+      case "one_of":
+      case "domain_is":
+        return { on: "field", path: c.path, not, op: "hash", domain: c.op === "domain_is", hashes: new Set(c.hashes) };
+      case "contains":
+        return { on: "field", path: c.path, not, op: "contains", words: tokens(c.words) };
+      case "pattern":
+        return { on: "field", path: c.path, not, op: "pattern", re: pattern(c.pattern) };
+      case "similar_text":
+        return { on: "field", path: c.path, not, op: "similar_text", signature: decodeSignature(c.signature), threshold: c.threshold ?? DEFAULT_THRESHOLD };
+    }
+  };
+  return { rules: screen.rules.map((r) => ({ id: r.id, verdict: r.verdict, any: r.any === true, checks: r.conditions.map(check) })) };
+}
+
+/** Compiled screens kept by an isolate: at most this many, and this much stored JSON among them. */
+export const MAX_CACHED_SCREENS = 256;
+const MAX_CACHED_CHARS = 4 * 1024 * 1024;
+const cached = new Map<string, { screen: CompiledScreen; size: number }>();
+let cachedChars = 0;
+
+/**
+ * The hook's screen, compiled, from the JSON its row keeps: compiled once per isolate, keyed by the
+ * hook and a hash of that JSON (so a new screen is a new entry), least recently used out first.
+ */
+export async function screenFor(hookId: string, stored: string | null | undefined): Promise<CompiledScreen | null> {
+  if (!stored) return null;
+  const id = `${hookId}:${await sha256Hex(utf8(stored))}`;
+  const hit = cached.get(id);
+  if (hit) {
+    cached.delete(id);
+    cached.set(id, hit);
+    return hit.screen;
+  }
+  const screen = compileScreen(JSON.parse(stored) as EdgeScreen);
+  if (stored.length <= MAX_CACHED_CHARS) {
+    cached.set(id, { screen, size: stored.length });
+    cachedChars += stored.length;
+    while (cached.size > MAX_CACHED_SCREENS || cachedChars > MAX_CACHED_CHARS) {
+      const [oldest, entry] = cached.entries().next().value!;
+      cached.delete(oldest);
+      cachedChars -= entry.size;
+    }
+  }
+  return screen;
+}
+
+/** How many compiled screens this isolate keeps (for tests). */
+export const cachedScreens = () => cached.size;
+
 // ── deciding ────────────────────────────────────────────────────────────────────────────────────
+
+/** The most bytes one delivery's keyed hashes read (the HMAC input, path and value). */
+export const MAX_HASHED_BYTES = 256 * 1024;
+/** The most steps one delivery's patterns and `contains` comparisons take. */
+export const MAX_SCREEN_STEPS = 2_000_000;
+/** The most payload nodes one delivery's field paths pass. */
+export const MAX_WALK = 1_000_000;
+/** The rule a delivery is held under when screening it would cost more than the budget. */
+export const OVER_BUDGET_RULE = "~over-budget";
+
+class OverBudget extends Error {}
 
 export interface Delivery {
   ip: string | null;
@@ -567,16 +733,25 @@ export interface Delivery {
   contentType: string | null;
   /** A strict hook: the relay never parses its body, so body conditions don't hold. */
   strict: boolean;
-  /** The account's screen key. */
-  key: Uint8Array<ArrayBuffer>;
+  /** The account's screen key, imported once for this delivery. */
+  key: CryptoKey;
 }
 
-/** What the conditions read, worked out at most once. */
-class View {
+/** What the conditions read, worked out at most once, and the delivery's budget. */
+class View implements Steps {
   private payloadValue: unknown;
   private parsed = false;
   private shapeValue: Promise<string> | null = null;
   private textSig: Uint32Array | null | undefined;
+  private hashed = 0;
+  private steps = 0;
+  private walked = 0;
+  private readonly values = new Map<string, string[]>();
+  private readonly hashes = new Map<string, Promise<string>>();
+  private readonly words = new Map<string, string[]>();
+  private readonly sigs = new Map<string, Uint32Array | null>();
+  private readonly points = new Map<string, Int32Array>();
+  private readonly matched = new Map<CompiledPattern, Map<string, boolean>>();
   readonly ip: { v4: boolean; bytes: number[] } | null;
   readonly d: Delivery;
   constructor(d: Delivery) {
@@ -600,103 +775,168 @@ class View {
     if (this.textSig === undefined) this.textSig = signatureOf(itemText(this.payload()));
     return this.textSig;
   }
+  step(n: number): void {
+    this.steps += n;
+    if (this.steps > MAX_SCREEN_STEPS) throw new OverBudget();
+  }
+  valuesAt(path: string): string[] {
+    let v = this.values.get(path);
+    if (v === undefined) {
+      const payload = path.startsWith("headers.") ? undefined : this.payload();
+      v = valuesAt(payload, this.d.headers, path, MAX_VALUES, () => {
+        if (++this.walked > MAX_WALK) throw new OverBudget();
+      });
+      this.values.set(path, v);
+    }
+    return v;
+  }
+  /** A keyed hash, once per (path, value); the bytes it reads count against the budget. */
+  hash(path: string, normalised: string): Promise<string> {
+    const memo = `${path}\n${normalised}`;
+    let h = this.hashes.get(memo);
+    if (h === undefined) {
+      const input = fieldInput(path, normalised);
+      this.hashed += input.byteLength;
+      if (this.hashed > MAX_HASHED_BYTES) throw new OverBudget();
+      h = crypto.subtle.sign("HMAC", this.d.key, input).then((mac) => toBase64Url(new Uint8Array(mac).subarray(0, 16)));
+      this.hashes.set(memo, h);
+    }
+    return h;
+  }
+  tokens(value: string): string[] {
+    let t = this.words.get(value);
+    if (t === undefined) this.words.set(value, (t = tokens(value)));
+    return t;
+  }
+  signature(value: string): Uint32Array | null {
+    let s = this.sigs.get(value);
+    if (s === undefined) this.sigs.set(value, (s = signatureOf(value)));
+    return s;
+  }
+  matches(re: CompiledPattern, value: string): boolean {
+    let seen = this.matched.get(re);
+    if (!seen) this.matched.set(re, (seen = new Map()));
+    let m = seen.get(value);
+    if (m === undefined) {
+      let cps = this.points.get(value);
+      if (!cps) this.points.set(value, (cps = codePoints(value, EDGE_PATTERN_INPUT)));
+      seen.set(value, (m = re.test(cps, this)));
+    }
+    return m;
+  }
 }
 
-async function holds(c: Condition, v: View): Promise<boolean> {
+async function holds(c: Check, v: View): Promise<boolean> {
   const d = v.d;
   switch (c.on) {
     case "ip":
-      return v.ip !== null && c.in.some((n) => inNet(v.ip!, parseNet(n)!)) !== (c.not === true);
+      return v.ip !== null && c.nets.some((n) => inNet(v.ip!, n)) !== c.not;
     case "asn":
-      return d.asn !== null && c.in.includes(d.asn) !== (c.not === true);
+      return d.asn !== null && c.in.has(d.asn) !== c.not;
     case "country":
-      return d.country !== null && c.in.includes(d.country.toUpperCase()) !== (c.not === true);
+      return d.country !== null && c.in.has(d.country.toUpperCase()) !== c.not;
     case "header": {
       const h = d.headers.get(c.name);
-      if (c.op === "present") return h !== null;
-      if (c.op === "absent") return h === null;
-      if (h === null) return false;
-      return c.op === "is" ? h.trim().toLowerCase() === c.value : h.toLowerCase().includes(c.value!);
+      switch (c.op) {
+        case "present":
+          return h !== null;
+        case "absent":
+          return h === null;
+        case "contains":
+          return h !== null && h.toLowerCase().includes(c.value);
+        case "is": {
+          if (h === null) return false;
+          const folded = fold(h);
+          if (c.plain !== null && folded === c.plain) return true;
+          return c.hashes.size > 0 && c.hashes.has(await v.hash(c.path, folded));
+        }
+      }
+      return false;
     }
     case "size":
       return c.op === "gt" ? d.body.byteLength > c.bytes : d.body.byteLength < c.bytes;
     case "field": {
-      const payload = v.payload();
-      if (payload === undefined && !c.path.startsWith("headers.")) return false;
-      const values = valuesAt(payload, d.headers, c.path);
+      if (!c.path.startsWith("headers.") && v.payload() === undefined) return false;
+      const values = v.valuesAt(c.path);
       if (values.length === 0) return false;
       let any = false;
       for (const value of values) {
-        if (await fieldHolds(c, value, d.key)) {
+        if (await fieldHolds(c, value, v)) {
           any = true;
           break;
         }
       }
-      return any !== (c.not === true);
+      return any !== c.not;
     }
     case "similar": {
       if (c.shape) {
         const s = v.shape();
         if (s === null || (await s) !== c.shape) return false;
       }
-      if (!c.text) return true;
+      if (c.text === undefined) return true;
       const mine = v.text();
-      const theirs = decodeSignature(c.text);
-      return mine !== null && theirs !== null && similarity(mine, theirs) >= (c.threshold ?? DEFAULT_THRESHOLD);
+      return mine !== null && c.text !== null && similarity(mine, c.text) >= c.threshold;
     }
   }
 }
 
-async function fieldHolds(c: Extract<Condition, { on: "field" }>, value: string, key: Uint8Array<ArrayBuffer>): Promise<boolean> {
+async function fieldHolds(c: Extract<Check, { on: "field" }>, value: string, v: View): Promise<boolean> {
   switch (c.op) {
-    case "is":
-    case "one_of":
-      return c.hashes.includes(await keyedHash(key, c.path, fold(value)));
-    case "domain_is": {
-      for (const s of domainSuffixes(domainOf(value))) if (c.hashes.includes(await keyedHash(key, c.path, s))) return true;
+    case "hash":
+      if (!c.domain) return c.hashes.has(await v.hash(c.path, fold(value)));
+      for (const s of domainSuffixes(domainOf(value))) if (c.hashes.has(await v.hash(c.path, s))) return true;
       return false;
-    }
     case "contains": {
-      const want = tokens(c.words);
-      const have = tokens(value);
+      const want = c.words;
+      const have = v.tokens(value);
       for (let i = 0; i + want.length <= have.length; i++) {
-        if (want.every((w, j) => have[i + j] === w)) return true;
+        let j = 0;
+        while (j < want.length && have[i + j] === want[j]) j++;
+        v.step(j + 1);
+        if (j === want.length) return true;
       }
       return false;
     }
     case "pattern":
-      return new RegExp(c.pattern).test(value.slice(0, EDGE_PATTERN_INPUT));
+      return c.re !== null && v.matches(c.re, value);
     case "similar_text": {
-      const mine = signatureOf(value);
-      const theirs = decodeSignature(c.signature);
-      return mine !== null && theirs !== null && similarity(mine, theirs) >= (c.threshold ?? DEFAULT_THRESHOLD);
+      const mine = v.signature(value);
+      return mine !== null && c.signature !== null && similarity(mine, c.signature) >= c.threshold;
     }
   }
 }
 
-/** The first rule that holds for a delivery, or null (pass). */
-export async function decide(screen: EdgeScreen, d: Delivery): Promise<{ verdict: Verdict; rule: string } | null> {
+/**
+ * The first rule that holds for a delivery, or null (pass). A delivery whose screening would cost
+ * more than the budget (hashing, pattern steps, the walk) is held under `~over-budget`.
+ */
+export async function decide(screen: CompiledScreen, d: Delivery): Promise<{ verdict: Verdict; rule: string } | null> {
   const view = new View(d);
-  for (const r of screen.rules) {
-    let ok: boolean;
-    if (r.any) {
-      ok = false;
-      for (const c of r.conditions) {
-        if (await holds(c, view)) {
-          ok = true;
-          break;
+  try {
+    for (const r of screen.rules) {
+      let ok: boolean;
+      if (r.any) {
+        ok = false;
+        for (const c of r.checks) {
+          if (await holds(c, view)) {
+            ok = true;
+            break;
+          }
+        }
+      } else {
+        ok = true;
+        for (const c of r.checks) {
+          if (!(await holds(c, view))) {
+            ok = false;
+            break;
+          }
         }
       }
-    } else {
-      ok = true;
-      for (const c of r.conditions) {
-        if (!(await holds(c, view))) {
-          ok = false;
-          break;
-        }
-      }
+      if (ok) return { verdict: r.verdict, rule: r.id };
     }
-    if (ok) return { verdict: r.verdict, rule: r.id };
+  } catch (e) {
+    if (e instanceof OverBudget) return { verdict: "quarantine", rule: OVER_BUDGET_RULE };
+    throw e;
   }
   return null;
 }

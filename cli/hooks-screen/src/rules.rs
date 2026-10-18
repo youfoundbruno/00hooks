@@ -206,9 +206,7 @@ impl Rule {
 
     /// Whether any condition needs the relay to read words.
     pub fn needs_words(&self) -> bool {
-        self.conditions
-            .iter()
-            .any(|c| matches!(c, Condition::Field { op, .. } if op.needs_words()))
+        self.conditions.iter().any(Condition::needs_words)
     }
 
     /// The rule in a sentence: "Drop when payload.sender.email domain is deals.example".
@@ -274,6 +272,18 @@ fn describe(c: &Condition) -> String {
             format!("{path} {}{} {what}", neg(*not), op.label())
         }
         Condition::Similar { .. } => "it is similar to the item it was made from".into(),
+    }
+}
+
+impl Condition {
+    /// Whether the relay must read the words to check it (a field's `contains`, `pattern` and
+    /// `similar text`, and a header's `contains`), so pushing it to the edge asks first.
+    pub fn needs_words(&self) -> bool {
+        match self {
+            Condition::Field { op, .. } => op.needs_words(),
+            Condition::Header { op, .. } => *op == HeaderOp::Contains,
+            _ => false,
+        }
     }
 }
 
