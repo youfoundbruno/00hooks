@@ -19,4 +19,10 @@ interface __BaseEnv_Env {
    * `{ "id", "title", "description"?, "url"? }`. A self-hosted relay leaves it unset.
    */
   HOSTED_EXTRAS?: string;
+  /** Phone links (PROTOCOL §10): rows a node's queue may hold before a phone's send is refused; 1000 when unset. */
+  PHONE_NODE_QUEUE_MAX?: string;
+  /** Rows a phone's queue may hold before the oldest are dropped; 500 when unset. */
+  PHONE_PHONE_QUEUE_MAX?: string;
+  /** Bytes one device's queue may hold, either way; 16 MiB when unset. */
+  PHONE_QUEUE_MAX_BYTES?: string;
 }

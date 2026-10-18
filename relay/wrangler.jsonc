@@ -1,4 +1,5 @@
-// The 00hooks relay: one Worker and one Durable Object class (one object per account).
+// The 00hooks relay: one Worker and two Durable Object classes, each one object per account: the
+// webhook log (AccountObject) and the phone links' mailbox and sockets (PhoneObject, PROTOCOL §10).
 // Self-hosting: create the D1 database and put its id below, then set the secrets listed in
 // `.dev.vars.example` with `wrangler secret put`. See README.md.
 {
@@ -9,9 +10,15 @@
   "observability": { "enabled": true },
 
   "durable_objects": {
-    "bindings": [{ "name": "ACCOUNT", "class_name": "AccountObject" }]
+    "bindings": [
+      { "name": "ACCOUNT", "class_name": "AccountObject" },
+      { "name": "PHONE", "class_name": "PhoneObject" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountObject"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AccountObject"] },
+    { "tag": "v2", "new_sqlite_classes": ["PhoneObject"] }
+  ],
 
   // Accounts, devices, hooks (with their sealed secrets), enrolments, and the routing from a hook
   // id to its account. Replace the id with your own database's (`wrangler d1 create 00hooks`).
@@ -29,11 +36,13 @@
   // client address (IPv6 by /64), checked before the hook lookup; raise it for a relay that serves
   // many people, since a big provider sends every one of their hooks from a few addresses.
   // REDEEM_IP_LIMIT and REDEEM_GLOBAL_LIMIT: enrolment redemptions per minute, per address and in all.
+  // PAIR_IP_LIMIT: phone pairing attempts (PROTOCOL §10) per minute per address.
   "ratelimits": [
     { "name": "HOOK_LIMIT", "namespace_id": "1001", "simple": { "limit": 60, "period": 10 } },
     { "name": "RECEIVE_IP_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 10 } },
     { "name": "REDEEM_IP_LIMIT", "namespace_id": "1003", "simple": { "limit": 10, "period": 60 } },
-    { "name": "REDEEM_GLOBAL_LIMIT", "namespace_id": "1004", "simple": { "limit": 300, "period": 60 } }
+    { "name": "REDEEM_GLOBAL_LIMIT", "namespace_id": "1004", "simple": { "limit": 300, "period": 60 } },
+    { "name": "PAIR_IP_LIMIT", "namespace_id": "1005", "simple": { "limit": 10, "period": 60 } }
   ],
 
   // ACCOUNT_MAX_EVENTS and ACCOUNT_MAX_BYTES: what one account's log may hold before deliveries are

@@ -3,8 +3,9 @@
 import { env, exports } from "cloudflare:workers";
 import { expect } from "vitest";
 import type { AccountObject } from "../src/account-object.ts";
+import type { PhoneObject } from "../src/phone-object.ts";
 import { generateDeviceKey, signRequest, type DeviceKey } from "../src/canonical.ts";
-import { fromBase64, toBase64Url, utf8 } from "../src/encoding.ts";
+import { concatBytes, fromBase64, toBase64, toBase64Url, toHex, utf8 } from "../src/encoding.ts";
 import { SUITE, decodeContent, envelopeSigString, heldAad, openWith, sealAad, sealKid, type SealedContent } from "../src/envelope.ts";
 
 export const BASE = "https://relay.test";
@@ -235,4 +236,240 @@ export async function openEvent(dev: TestDevice, ev: StreamedEvent): Promise<Sea
   const pt = await openWith(dev.seal!.privateKey, fromBase64(ev.sealed.enc)!, ct, aad);
   const content = decodeContent(pt);
   return { ...content, text: new TextDecoder().decode(content.body) };
+}
+
+// ── phone links (PROTOCOL §10) ──────────────────────────────────────────────
+
+export function phoneObject(accountId: string): DurableObjectStub<PhoneObject> {
+  const ns = env.PHONE as unknown as DurableObjectNamespace<PhoneObject>;
+  return ns.get(ns.idFromName(accountId));
+}
+
+const sha256 = async (b: Uint8Array<ArrayBuffer>) => new Uint8Array(await crypto.subtle.digest("SHA-256", b));
+
+/** What a node makes for "Add a phone" (00next docs/phone.md §3.1): the secret never reaches the relay. */
+export interface TestPairing {
+  secret: Uint8Array;
+  pairingId: string;
+  proof: string;
+  verifier: string;
+}
+
+export async function newPairingSecret(): Promise<TestPairing> {
+  const secret = crypto.getRandomValues(new Uint8Array(32));
+  const pairingId = toBase64Url((await sha256(concatBytes(utf8("00next-pair-id-v1\n"), secret))).subarray(0, 16));
+  const proof = toBase64Url(await sha256(concatBytes(utf8("00next-pair-relay-v1\n"), secret)));
+  const verifier = toBase64Url(await sha256(utf8(proof)));
+  return { secret, pairingId, proof, verifier };
+}
+
+/** Registers a pairing for `node`; returns the secret's derived values. */
+export async function registerPairing(node: DeviceKey, expiresIn = 10 * 60_000): Promise<TestPairing> {
+  const p = await newPairingSecret();
+  const res = await signed(node, "POST", "/v1/phone/pairings", { pairingId: p.pairingId, verifier: p.verifier, expiresAt: Date.now() + expiresIn });
+  expect(res.status).toBe(201);
+  return p;
+}
+
+export const PHONE_INFO = "00next phone v1";
+
+/** HPKE-seals (the suite of PROTOCOL §5) with the phone link's info string. */
+export async function phoneSeal(recipient: Uint8Array, plaintext: Uint8Array, aad: Uint8Array): Promise<{ enc: string; ct: string }> {
+  const recipientPublicKey = await SUITE.kem.deserializePublicKey(recipient);
+  const { ct, enc } = await SUITE.seal({ recipientPublicKey, info: utf8(PHONE_INFO) }, plaintext, aad);
+  return { enc: toBase64Url(new Uint8Array(enc)), ct: toBase64(new Uint8Array(ct)) };
+}
+
+export async function phoneOpen(privateKey: Uint8Array, enc: string, ct: string, aad: Uint8Array): Promise<Uint8Array> {
+  const recipientKey = await SUITE.kem.deserializePrivateKey(privateKey);
+  return new Uint8Array(await SUITE.open({ recipientKey, enc: fromBase64(enc)!, info: utf8(PHONE_INFO) }, fromBase64(ct)!, aad));
+}
+
+/** A node: its 00hooks device plus the X25519 key phones seal to. */
+export interface TestNode extends TestDevice {
+  phoneSeal: SealPair;
+}
+
+export async function newNode(name = "mac"): Promise<TestNode> {
+  const dev = await newAccount(name);
+  return { ...dev, phoneSeal: await newSealPair() };
+}
+
+export interface TestPhone extends TestDevice {
+  seal: SealPair;
+  node: string;
+  pairingId: string;
+}
+
+/** A phone redeems `pairing` (unsigned); returns the response and, on success, the phone. */
+export async function redeemPhone(
+  node: TestNode,
+  pairing: TestPairing,
+  opts: { name?: string; ip?: string; proof?: string } = {},
+): Promise<{ res: Response; phone: TestPhone | null }> {
+  const { privateKey, publicKey } = await generateDeviceKey();
+  const seal = await newSealPair();
+  const name = opts.name ?? "Ana's iPhone";
+  const hello = await phoneSeal(
+    node.phoneSeal.publicKey,
+    utf8(JSON.stringify({ type: "pair_hello", name, model: "iPhone", signKey: publicKey, sealKey: seal.text, proof: "x" })),
+    utf8(`00next-pair-v1\n${pairing.pairingId}`),
+  );
+  const res = await fetchRelay("/v1/phone/pair", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "CF-Connecting-IP": opts.ip ?? randomTestIp() },
+    body: JSON.stringify({ pairingId: pairing.pairingId, proof: opts.proof ?? pairing.proof, deviceName: name, publicKey, sealKey: seal.text, hello }),
+  });
+  if (res.status !== 200) return { res, phone: null };
+  const body = (await res.clone().json()) as { deviceId: string; node: string };
+  return { res, phone: { accountId: node.accountId, deviceId: body.deviceId, privateKey, publicKey, seal, node: body.node, pairingId: pairing.pairingId } };
+}
+
+/** Pairs a phone with `node`; confirmed unless `confirm` is false. */
+export async function pairPhone(node: TestNode, opts: { confirm?: boolean; name?: string } = {}): Promise<TestPhone> {
+  const pairing = await registerPairing(node);
+  const { res, phone } = await redeemPhone(node, pairing, { name: opts.name });
+  expect(res.status).toBe(200);
+  if (opts.confirm !== false) {
+    const c = await signed(node, "POST", `/v1/phone/devices/${phone!.deviceId}/confirm`);
+    expect(c.status).toBe(200);
+  }
+  return phone!;
+}
+
+export type Frame = Record<string, unknown> & { t: string };
+
+/** One phone-link socket, as a client sees it. */
+export class PhoneSocket {
+  readonly frames: Frame[] = [];
+  private waiters: (() => void)[] = [];
+  closeCode: number | null = null;
+  closeReason = "";
+  readonly closed: Promise<number>;
+  readonly ws: WebSocket;
+
+  constructor(ws: WebSocket) {
+    this.ws = ws;
+    let resolveClosed!: (code: number) => void;
+    this.closed = new Promise((r) => (resolveClosed = r));
+    ws.accept();
+    ws.addEventListener("message", (e) => {
+      const text = typeof e.data === "string" ? e.data : new TextDecoder().decode(e.data as ArrayBuffer);
+      let f: Frame;
+      try {
+        f = JSON.parse(text) as Frame;
+      } catch {
+        f = { t: "text", text };
+      }
+      this.frames.push(f);
+      this.wake();
+    });
+    ws.addEventListener("close", (e) => {
+      this.closeCode = e.code;
+      this.closeReason = e.reason;
+      resolveClosed(e.code);
+      this.wake();
+    });
+  }
+
+  private wake(): void {
+    const w = this.waiters;
+    this.waiters = [];
+    for (const f of w) f();
+  }
+
+  send(frame: unknown): void {
+    this.ws.send(typeof frame === "string" ? frame : JSON.stringify(frame));
+  }
+
+  /** The next frame (any type). */
+  next(timeoutMs = 3000): Promise<Frame> {
+    return this.nextWhere(() => true, timeoutMs);
+  }
+
+  /** The first frame that matches, leaving the others queued in order. */
+  async nextWhere(match: (f: Frame) => boolean, timeoutMs = 3000): Promise<Frame> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const i = this.frames.findIndex(match);
+      if (i >= 0) return this.frames.splice(i, 1)[0]!;
+      if (this.closeCode !== null) throw new Error(`socket closed (${this.closeCode} ${this.closeReason})`);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`timed out waiting for a frame; have ${JSON.stringify(this.frames).slice(0, 300)}`);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await new Promise<void>((resolve) => {
+        this.waiters.push(resolve);
+        timer = setTimeout(resolve, remaining);
+      });
+      clearTimeout(timer);
+    }
+  }
+
+  /** The first frame of type `t`, leaving the others queued. */
+  nextOf(t: string, timeoutMs = 3000): Promise<Frame> {
+    return this.nextWhere((f) => f.t === t, timeoutMs);
+  }
+
+  /** Waits a moment and returns what arrived, without failing when nothing did. */
+  async drain(ms = 150): Promise<Frame[]> {
+    await new Promise((r) => setTimeout(r, ms));
+    return this.frames.splice(0);
+  }
+
+  async hello(after = 0): Promise<Frame> {
+    this.send({ t: "hello", after });
+    return this.nextOf("ready");
+  }
+
+  close(): void {
+    try {
+      this.ws.close(1000, "bye");
+    } catch {
+      // Already closed.
+    }
+  }
+}
+
+/** Opens `dev`'s phone socket (signed upgrade). */
+export async function openPhoneSocket(dev: DeviceKey): Promise<PhoneSocket> {
+  const res = await signed(dev, "GET", "/v1/phone/socket", undefined, { headers: { Upgrade: "websocket" } });
+  expect(res.status).toBe(101);
+  return new PhoneSocket(res.webSocket!);
+}
+
+/** A phone envelope (00next docs/phone.md §4.1), sealed to `to`'s key and signed by `from`. */
+export async function makeEnvelope(
+  from: DeviceKey,
+  to: { deviceId: string; sealKey: SealPair },
+  plaintext: string,
+  opts: { id?: string; push?: string; at?: number } = {},
+): Promise<Record<string, unknown>> {
+  const id = opts.id ?? toBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+  const at = opts.at ?? Date.now();
+  const sealed = await phoneSeal(to.sealKey.publicKey, utf8(plaintext), utf8(`00next-phone-v1\n${from.deviceId}\n${to.deviceId}\n${id}\n${at}`));
+  const ct = fromBase64(sealed.ct)!;
+  const lines = [
+    "00next-phone-envelope-v1",
+    from.deviceId,
+    to.deviceId,
+    id,
+    String(at),
+    to.sealKey.kid,
+    sealed.enc,
+    toHex(await crypto.subtle.digest("SHA-256", ct)),
+    opts.push ?? "-",
+  ].join("\n");
+  const sig = toBase64Url(new Uint8Array(await crypto.subtle.sign("Ed25519", from.privateKey, utf8(lines))));
+  return {
+    v: 1,
+    id,
+    from: from.deviceId,
+    to: to.deviceId,
+    at,
+    kid: to.sealKey.kid,
+    enc: sealed.enc,
+    ct: sealed.ct,
+    sig,
+    ...(opts.push !== undefined ? { push: opts.push } : {}),
+  };
 }

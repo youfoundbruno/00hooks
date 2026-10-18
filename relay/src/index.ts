@@ -7,10 +7,12 @@ import { authenticate, deviceAsPrincipal, type Caller, type Principal } from "./
 import { importRelayKey } from "./envelope.ts";
 import { describeError } from "./describe-error.ts";
 import { isId } from "./encoding.ts";
-import { HttpError, json, notFound, readLimited, tooLarge } from "./http.ts";
+import { HttpError, error, forbidden, json, notFound, readLimited, tooLarge } from "./http.ts";
 import { createHook, deleteHook, getHook, getScreen, listHooks, patchHook, putScreen, rotateHook } from "./hooks.ts";
 import { dropHeld, listHeld, releaseHeld, screenInfo, screenKeyFor } from "./held.ts";
 import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
+import { confirmPhone, createPairing, listPhones, openPhoneSocket, redeemPairing, unpairSelf } from "./phone.ts";
+import { PHONE_PROTOCOL } from "./phone-object.ts";
 import { receive, receiveGet } from "./receive.ts";
 import { ack, openStream } from "./stream.ts";
 import { PROTOCOLS, STREAM_PROTOCOL, VERSION } from "./version.ts";
@@ -18,6 +20,7 @@ import { PROTOCOLS, STREAM_PROTOCOL, VERSION } from "./version.ts";
 // The main module may export only handlers and Durable Object classes: workerd refuses anything
 // else (a plain constant here stops the Worker from starting).
 export { AccountObject } from "./account-object.ts";
+export { PhoneObject } from "./phone-object.ts";
 
 /** Management requests are small JSON; anything bigger is refused before it's hashed. */
 const API_BODY_LIMIT = 64 * 1024;
@@ -65,6 +68,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       relayKey,
       serverTime: Date.now(),
       ...screenInfo(env),
+      phone: { protocol: PHONE_PROTOCOL },
     });
   }
 
@@ -75,13 +79,47 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   // Unsigned: account creation and enrolment redemption.
   if (path === "/v1/accounts" && method === "POST") return createAccount(request, env, body);
   if (path === "/v1/enrolments/redeem" && method === "POST") return redeemEnrolment(request, env, body);
+  if (path === "/v1/phone/pair" && method === "POST") return redeemPairing(request, env, body);
 
   // A device's signature may do anything its account may; an API key only what its scopes allow,
   // and never what only a device may (the stream, acks, enrolments, sealing keys, keys themselves).
-  const signed = (): Promise<Caller> => (presentsKey(request) ? deviceOnly() : authenticate(request, env, ctx, body));
+  // A phone may use only the phone routes (PROTOCOL §10).
+  const notPhone = (c: Caller): Caller => {
+    if (c.kind === "phone") throw new HttpError(forbidden("A phone may use only the phone routes."));
+    return c;
+  };
+  const signed = async (): Promise<Caller> => (presentsKey(request) ? deviceOnly() : notPhone(await authenticate(request, env, ctx, body)));
   const scoped = async (scope: Scope): Promise<Principal> =>
-    presentsKey(request) ? authenticateKey(request, env, ctx, scope) : deviceAsPrincipal(await authenticate(request, env, ctx, body));
+    presentsKey(request)
+      ? authenticateKey(request, env, ctx, scope)
+      : deviceAsPrincipal(notPhone(await authenticate(request, env, ctx, body)));
   const origin = url.origin;
+
+  // The phone routes: a node device, a phone, or either; a pending phone only where `pending` says.
+  const phoneRoute = async (allow: { device: boolean; phone: boolean; pending?: boolean }): Promise<Caller> => {
+    if (presentsKey(request)) deviceOnly();
+    const c = await authenticate(request, env, ctx, body);
+    if (c.kind === "phone" && !allow.phone) throw new HttpError(forbidden("Only a node device can do this, not a phone."));
+    if (c.kind !== "phone" && !allow.device) throw new HttpError(forbidden("Only a phone can do this."));
+    if (c.kind === "phone" && c.pendingUntil !== null && !allow.pending) {
+      throw new HttpError(forbidden("This phone isn't confirmed by its node yet."));
+    }
+    return c;
+  };
+  if (path.startsWith("/v1/phone/")) {
+    if (path === "/v1/phone/pairings" && method === "POST") return createPairing(env, await phoneRoute({ device: true, phone: false }), body);
+    if (path === "/v1/phone/devices" && method === "GET") return listPhones(env, await phoneRoute({ device: true, phone: false }));
+    const cf = /^\/v1\/phone\/devices\/([^/]+)\/confirm$/.exec(path);
+    if (cf && method === "POST") return confirmPhone(env, await phoneRoute({ device: true, phone: false }), cf[1]!);
+    if (path === "/v1/phone/self" && method === "DELETE") return unpairSelf(env, await phoneRoute({ device: false, phone: true, pending: true }));
+    if (path === "/v1/phone/socket" && method === "GET") {
+      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return error(426, "invalid", "The phone socket is a WebSocket: send Upgrade: websocket.", { field: "Upgrade" }, { Upgrade: "websocket" });
+      }
+      return openPhoneSocket(env, await phoneRoute({ device: true, phone: true, pending: true }));
+    }
+    return notFound();
+  }
 
   if (path === "/v1/enrolments" && method === "POST") return createEnrolment(env, await signed());
   if (path === "/v1/devices" && method === "GET") return listDevices(env, await scoped("devices:write"));

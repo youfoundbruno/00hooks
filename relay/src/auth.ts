@@ -2,6 +2,7 @@
 // nonces spent in the account's Durable Object (GET requests too).
 
 import type { AccountObject } from "./account-object.ts";
+import type { PhoneObject } from "./phone-object.ts";
 import {
   HEADER_DEVICE,
   HEADER_NONCE,
@@ -19,10 +20,21 @@ export const CLOCK_WINDOW_MS = 300_000;
 /** `lastSeenAt` is refreshed at most this often, so reads don't each cost a write. */
 const LAST_SEEN_EVERY_MS = 60_000;
 
-/** A signed request from a device: it may do everything its account may. */
+/** The kinds of device (PROTOCOL §10): a phone may use only the phone routes. */
+export type DeviceKind = "device" | "phone";
+
+/**
+ * A signed request from a device. A device of kind `device` may do everything its account may; a
+ * phone only what the phone routes allow (index.ts refuses it everywhere else).
+ */
 export interface Caller {
   accountId: string;
   deviceId: string;
+  kind: DeviceKind;
+  /** A phone's node; null for a device. */
+  peer: string | null;
+  /** Set while a phone waits for its node to confirm it; null once confirmed, and for a device. */
+  pendingUntil: number | null;
 }
 
 /**
@@ -39,6 +51,11 @@ export interface Principal {
 
 export function deviceAsPrincipal(c: Caller): Principal {
   return { accountId: c.accountId, deviceId: c.deviceId, keyId: null, actor: c.deviceId };
+}
+
+export function phoneStub(env: Env, accountId: string): DurableObjectStub<PhoneObject> {
+  const ns = env.PHONE as unknown as DurableObjectNamespace<PhoneObject>;
+  return ns.get(ns.idFromName(accountId));
 }
 
 export function accountStub(env: Env, accountId: string): DurableObjectStub<AccountObject> {
@@ -69,10 +86,23 @@ export async function authenticate(
       error(401, "clock_skew", "The request's time is too far from the relay's clock.", { serverTime: now }),
     );
   }
-  const device = await env.DB.prepare("SELECT account_id, public_key, last_seen_at, revoked_at FROM devices WHERE id = ?")
+  const device = await env.DB.prepare(
+    "SELECT account_id, public_key, last_seen_at, revoked_at, kind, peer, pending_until FROM devices WHERE id = ?",
+  )
     .bind(deviceId)
-    .first<{ account_id: string; public_key: string; last_seen_at: number | null; revoked_at: number | null }>();
+    .first<{
+      account_id: string;
+      public_key: string;
+      last_seen_at: number | null;
+      revoked_at: number | null;
+      kind: string;
+      peer: string | null;
+      pending_until: number | null;
+    }>();
   if (!device || device.revoked_at !== null) throw new HttpError(unauthorized());
+  const kind: DeviceKind = device.kind === "phone" ? "phone" : "device";
+  // A pending phone whose pairing ran out is as good as revoked (PROTOCOL §10).
+  if (kind === "phone" && device.pending_until !== null && device.pending_until <= now) throw new HttpError(unauthorized());
 
   // The signature is 64 bytes, unpadded base64url: 86 characters.
   const sig = isUnpaddedBase64Url(signature, 86) ? fromBase64(signature) : null;
@@ -93,11 +123,22 @@ export async function authenticate(
   const ok = await crypto.subtle.verify("Ed25519", key, sig, utf8(canonical));
   if (!ok) throw new HttpError(unauthorized());
 
-  // Spent only after the signature holds, so unsigned junk can't fill the nonce table.
-  if (!(await accountStub(env, device.account_id).spendNonce(deviceId, nonce))) throw new HttpError(unauthorized());
+  // Spent only after the signature holds, so unsigned junk can't fill the nonce table. A phone's
+  // nonces live in the account's PhoneObject: it is never a device of the webhook log.
+  const spent =
+    kind === "phone"
+      ? await phoneStub(env, device.account_id).spendNonce(deviceId, nonce)
+      : await accountStub(env, device.account_id).spendNonce(deviceId, nonce);
+  if (!spent) throw new HttpError(unauthorized());
 
   if (device.last_seen_at === null || now - device.last_seen_at > LAST_SEEN_EVERY_MS) {
     ctx.waitUntil(env.DB.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").bind(now, deviceId).run());
   }
-  return { accountId: device.account_id, deviceId };
+  return {
+    accountId: device.account_id,
+    deviceId,
+    kind,
+    peer: kind === "phone" ? device.peer : null,
+    pendingUntil: kind === "phone" ? device.pending_until : null,
+  };
 }

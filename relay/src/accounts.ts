@@ -1,6 +1,6 @@
 // Accounts, devices and enrolments (PROTOCOL §2).
 
-import { accountStub, type Caller, type Principal } from "./auth.ts";
+import { accountStub, phoneStub, type Caller, type Principal } from "./auth.ts";
 import { importPublicKey } from "./canonical.ts";
 import { constantTimeEqualStrings, newId, randomBytes } from "./encoding.ts";
 import { parseSealKey, sealKid, sealTo } from "./envelope.ts";
@@ -13,14 +13,14 @@ export const ENROLMENT_MAX_FAILURES = 5;
 export const ENROLMENT_WINDOW_MS = 10 * 60_000;
 export const ENROLMENT_BLOCK_MS = 10 * 60_000;
 
-function deviceName(v: unknown): string {
+export function deviceName(v: unknown): string {
   if (typeof v !== "string" || v.trim().length < 1 || v.trim().length > 100) {
     throw new HttpError(invalid("deviceName", "deviceName must be 1 to 100 characters."));
   }
   return v.trim();
 }
 
-async function publicKey(env: Env, v: unknown): Promise<string> {
+export async function publicKey(env: Env, v: unknown): Promise<string> {
   if (typeof v !== "string" || !(await importPublicKey(v))) {
     throw new HttpError(invalid("publicKey", "publicKey must be a raw Ed25519 public key in base64url."));
   }
@@ -30,7 +30,7 @@ async function publicKey(env: Env, v: unknown): Promise<string> {
 }
 
 /** A device's sealing key (PROTOCOL §2): optional, so a client that has none can still join. */
-async function sealKeyField(v: unknown): Promise<{ text: string; raw: Uint8Array; kid: string } | null> {
+export async function sealKeyField(v: unknown): Promise<{ text: string; raw: Uint8Array; kid: string } | null> {
   if (v === undefined || v === null) return null;
   const raw = parseSealKey(v);
   const bad = () => new HttpError(invalid("sealKey", "sealKey must be a raw X25519 public key in base64url."));
@@ -177,11 +177,21 @@ export async function redeemEnrolment(request: Request, env: Env, body: Uint8Arr
 }
 
 export async function listDevices(env: Env, caller: Principal): Promise<Response> {
+  // A pending phone whose pairing ran out is as good as revoked (PROTOCOL §10), so it isn't listed.
   const { results } = await env.DB.prepare(
-    "SELECT id, name, created_at, last_seen_at, seal_kid FROM devices WHERE account_id = ? AND revoked_at IS NULL ORDER BY created_at, id",
+    `SELECT id, name, created_at, last_seen_at, seal_kid, kind, peer FROM devices
+     WHERE account_id = ? AND revoked_at IS NULL AND (pending_until IS NULL OR pending_until > ?) ORDER BY created_at, id`,
   )
-    .bind(caller.accountId)
-    .all<{ id: string; name: string; created_at: number; last_seen_at: number | null; seal_kid: string | null }>();
+    .bind(caller.accountId, Date.now())
+    .all<{
+      id: string;
+      name: string;
+      created_at: number;
+      last_seen_at: number | null;
+      seal_kid: string | null;
+      kind: string;
+      peer: string | null;
+    }>();
   return json({
     devices: results.map((d) => ({
       id: d.id,
@@ -190,6 +200,8 @@ export async function listDevices(env: Env, caller: Principal): Promise<Response
       lastSeenAt: d.last_seen_at,
       current: d.id === caller.deviceId,
       sealKid: d.seal_kid,
+      kind: d.kind,
+      peer: d.peer,
     })),
   });
 }
@@ -216,16 +228,53 @@ export async function putSealKey(env: Env, caller: Caller, deviceId: string, bod
  * Revokes a device, idempotently. The account's Durable Object is the authority (it refuses the
  * device's nonces and closes its stream with 4401), so it is told first, every time, even when D1
  * already says revoked: a retry after a failure part-way always finishes the job.
+ *
+ * A phone is revoked in the account's PhoneObject instead (its socket closes with 4401, its queue
+ * goes, and its node is sent `unpaired`). A device takes its phones with it (PROTOCOL §10.5).
  */
 export async function revokeDevice(env: Env, caller: Principal, deviceId: string): Promise<Response> {
-  const device = await env.DB.prepare("SELECT name, revoked_at FROM devices WHERE id = ? AND account_id = ?")
+  const device = await env.DB.prepare("SELECT name, revoked_at, kind, peer FROM devices WHERE id = ? AND account_id = ?")
     .bind(deviceId, caller.accountId)
-    .first<{ name: string; revoked_at: number | null }>();
+    .first<{ name: string; revoked_at: number | null; kind: string; peer: string | null }>();
   if (!device) return notFound();
   const stub = accountStub(env, caller.accountId);
+  if (device.kind === "phone") {
+    await revokePhone(env, caller.accountId, caller.actor, { id: deviceId, name: device.name, peer: device.peer ?? "" });
+    return new Response(null, { status: 204 });
+  }
   await stub.revokeDevice(deviceId);
   await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").bind(Date.now(), deviceId).run();
   if (device.revoked_at === null) await stub.audit({ kind: "device.revoked", actor: caller.actor, subject: deviceId, name: device.name });
+
+  // The cascade: every phone paired with it (revoked ones too, so a retry finishes the job), and
+  // the pairings it registered that nobody used.
+  const { results: phones } = await env.DB.prepare("SELECT id, name, revoked_at FROM devices WHERE account_id = ? AND kind = 'phone' AND peer = ?")
+    .bind(caller.accountId, deviceId)
+    .all<{ id: string; name: string; revoked_at: number | null }>();
+  await phoneStub(env, caller.accountId).revokeNode(deviceId, phones.map((p) => p.id));
+  const now = Date.now();
+  for (const p of phones) {
+    if (p.revoked_at !== null) continue;
+    const r = await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").bind(now, p.id).run();
+    if (r.meta.changes > 0) await stub.audit({ kind: "device.revoked", actor: caller.actor, subject: p.id, name: p.name });
+  }
+  await env.DB.prepare("DELETE FROM phone_pairings WHERE device_id = ? AND used_at IS NULL").bind(deviceId).run();
   return new Response(null, { status: 204 });
 }
 
+/**
+ * Revokes a phone, idempotently: the PhoneObject first (it closes the socket with 4401, deletes the
+ * phone's queue and nonces, and sends its node `unpaired` once), then D1, then the audit line.
+ */
+export async function revokePhone(
+  env: Env,
+  accountId: string,
+  actor: string,
+  phone: { id: string; name: string; peer: string },
+): Promise<void> {
+  await phoneStub(env, accountId).revokePhone(phone.id, phone.peer, true);
+  const r = await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").bind(Date.now(), phone.id).run();
+  if (r.meta.changes > 0) {
+    await accountStub(env, accountId).audit({ kind: "device.revoked", actor, subject: phone.id, name: phone.name });
+  }
+}
