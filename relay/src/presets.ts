@@ -301,6 +301,9 @@ export function parseVerify(raw: unknown): { config: VerifyConfig; secret: strin
   const strict = v.strict === undefined ? false : v.strict;
   if (typeof strict !== "boolean") field("verify.strict", "verify.strict must be true or false.");
   if (strict && p === "unverified") field("verify.strict", "An unverified hook has nothing to verify on your devices.");
+  // A token proves only that the sender knows it, and covers no content: a device given the token
+  // could check nothing the relay couldn't fake, so devices refuse to verify strict token hooks.
+  if (strict && p === "token") field("verify.strict", "A token hook can't be strict: the token signs nothing a device could check.");
 
   let secret: string | null = null;
   if (v.secret !== undefined) {

@@ -103,6 +103,13 @@ describe("hook secrets and names", () => {
     expect(await created.json()).toHaveProperty("secret");
   });
 
+  it("refuses a strict token hook (devices refuse to verify one)", async () => {
+    const dev = await newAccount();
+    const res = await signed(dev, "POST", "/v1/hooks", { name: "t", verify: { preset: "token", strict: true } });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid", field: "verify.strict" });
+  });
+
   it("hook names are unique per account: create and rename answer 409, other accounts are free", async () => {
     const dev = await newAccount();
     const a = await createHook(dev, { preset: "unverified" }, "payments");

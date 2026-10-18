@@ -259,9 +259,10 @@ scheme with Node's own crypto where they don't).
 | `token` | `header` (default `Authorization`), `secret`? | generated when absent | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength; **no dedupe** |
 | `unverified` | — | — | accepts anything; events carry `verified: false`; **no dedupe** |
 
-Every preset except `unverified` also takes `"strict": true` (below); a `token` hook can be made
-strict, but proves nothing on the device (the token reaches the relay in the clear), so the
-reference client refuses to create one and a device refuses to verify one. A `secret` is 8 to 512
+Every preset except `unverified` and `token` also takes `"strict": true` (below). A strict `token`
+hook would prove nothing on the device (the token reaches the relay in the clear and signs no
+content), so the relay refuses it (`400`, `field: "verify.strict"`), as it refuses a strict
+`unverified` one, and a device refuses to verify one. A `secret` is 8 to 512
 characters; the relay refuses to create a hook of a provider-issued preset without one (`400`,
 `field: "verify.secret"`), since it can't make one the provider would use.
 
