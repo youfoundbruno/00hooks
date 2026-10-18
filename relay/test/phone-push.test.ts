@@ -261,6 +261,7 @@ describe("POST /v1/phone/push", () => {
       reconnect: ["Your Mac is back online", "Open the app to reconnect.", "RECONNECT"],
       task: ["Something needs you", "An agent left you a task.", "TASK"],
       done: ["Done", "A task from a meeting is done.", "DONE"],
+      drive: ["Your Mac needs you", "Open 00next on your Mac to decide.", "DRIVE"],
     });
   });
 

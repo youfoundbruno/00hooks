@@ -11,7 +11,7 @@ import { isId } from "./encoding.ts";
 import { HttpError, error, invalid, json, parseJsonObject } from "./http.ts";
 import { isStandardBase64 } from "./phone-object.ts";
 
-export const PUSH_KINDS = ["approval", "ask", "finished", "handoff", "reconnect", "task", "done"] as const;
+export const PUSH_KINDS = ["approval", "ask", "finished", "handoff", "reconnect", "task", "done", "drive"] as const;
 export type PushKind = (typeof PUSH_KINDS)[number];
 
 /** The alert for each kind: fixed texts, so nothing the node or an agent wrote is shown by Apple. */
@@ -23,6 +23,7 @@ export const PUSH_TEXTS: Record<PushKind, { title: string; body: string; categor
   reconnect: { title: "Your Mac is back online", body: "Open the app to reconnect.", category: "RECONNECT" },
   task: { title: "Something needs you", body: "An agent left you a task.", category: "TASK" },
   done: { title: "Done", body: "A task from a meeting is done.", category: "DONE" },
+  drive: { title: "Your Mac needs you", body: "Open 00next on your Mac to decide.", category: "DRIVE" },
 };
 
 /** The largest sealed preview (`preview.ct`, in base64 characters): the payload stays well under APNs' 4 KiB. */
