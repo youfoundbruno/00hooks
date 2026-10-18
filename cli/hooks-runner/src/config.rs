@@ -140,7 +140,7 @@ pub enum ActionKind {
         name: Template,
         content: JsonTemplate,
     },
-    /// Ask an agent about the event (`crate::ask`). Only a host that runs agents (00next) makes
+    /// Ask an agent about the event (`crate::ask`). Only a host that runs agents (a program that embeds the runner) makes
     /// these; they aren't written in `automations.yaml`.
     Ask {
         /// The host's spelling: an agent's id, or "new" for a new agent per event.

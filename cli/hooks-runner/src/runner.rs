@@ -117,7 +117,7 @@ impl Runner {
         Self::start(opts, config, false)
     }
 
-    /// Open the runner's store with automations the host keeps as data (00next), instead of
+    /// Open the runner's store with automations the host keeps as data (a program that embeds the runner), instead of
     /// `automations.yaml`. `set_automations` replaces them; the file is never read.
     pub fn open_with(opts: RunnerOptions, automations: Automations) -> Result<Runner> {
         hooks_client::fsutil::create_private_dir(&opts.dir).map_err(Error::from_client)?;
@@ -976,7 +976,7 @@ impl Runner {
     async fn ask(&self, req: AskRequest) -> Result<crate::ask::AskReply, Failure> {
         let Some(asker) = self.opts.asker.clone() else {
             return Err(Failure::fatal(
-                "asking an agent needs a host that runs agents, such as 00next; the 00hooks CLI \
+                "asking an agent needs a host that runs agents (a program that embeds the runner); the 00hooks CLI \
                  runs plain actions only",
             ));
         };

@@ -20,7 +20,7 @@
 //! person when a hook's secret is rotated by someone else, or a hook takes a name the automations
 //! use.
 //!
-//! A host that embeds the runner (00next) gives it automations as data ([`Runner::open_with`],
+//! A program that embeds the runner gives it automations as data ([`Runner::open_with`],
 //! [`Runner::set_automations`]) instead of the file, and runs "ask an agent" actions for it
 //! ([`ask::Asker`]); the agent's reply is `{{agent.reply}}` for the actions after it.
 //!

@@ -9,7 +9,8 @@
 //! - [`seal`]: sealing keys, opening sealed events and checking the relay's signature (PROTOCOL §5).
 //! - [`presets`]: provider signature checks for strict hooks (PROTOCOL §3).
 //!
-//! The library does no terminal I/O; the `00hooks` CLI and the 00next node both embed it.
+//! The library does no terminal I/O; the `00hooks` CLI and other
+//! programs embed it.
 
 pub mod api;
 pub mod backoff;
