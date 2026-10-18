@@ -45,6 +45,15 @@ device and may use only the phone routes (`/v1/phone/*`); its own versioned sock
 phones and never sees their content. A client that ignores them keeps working; a phone is refused
 everywhere else with `403` `forbidden`.
 
+Additive within version 2 (hardening): the stream's `hook-change` event (§6), which has no `id` and
+which a client that predates it ignores; the `hooks:secrets` scope (§9); `scope` in a `quota` error
+(§4); and `DELETE /v1/held` (§4b). Some answers are stricter, and a
+client that handles the codes of §8 handles them: a hook name already used on the account is `409`
+(§3); an API key with `hooks:write` alone gets `403` where the answer would carry a secret (§3);
+management requests are rate-limited per address (`429`, §1); an account at its device cap gets
+`409` (§2); and a relay with neither a signup token nor `OPEN_SIGNUP=1` refuses signups with `403` (its
+`/v1/info` says `signupOpen: false`).
+
 ## 1. Signed requests
 
 Every `/v1/*` request except account creation and enrolment is signed by a **device**. A device has an
@@ -77,9 +86,14 @@ host and path lines from the request URL it received (`new URL(request.url)`), w
 client sent because Workers don't rewrite the path or query. `POST /v1/enrolments` and
 `POST /v1/hooks/<id>/rotate` have no body, so their last line is the empty string's hash.
 
+Every `/v1/*` request except `GET /v1/info`, signed or not, is first limited per client address (an
+IPv4 address, or an IPv6 /64; 300 requests per 10 s by default) → `429` `rate_limited` with
+`Retry-After`, before its body is read or anything is looked up.
+
 The relay refuses (`401`, body `{"error":"…"}`, never saying which check failed in detail):
 - a time more than 300 s from its clock;
-- a nonce already seen for that device in the last 600 s (nonces are stored in the account's Durable
+- a nonce already seen for that device in the last 660 s, more than twice the clock window, so a
+  request timed at the window's far edge can't be replayed at its other edge (nonces are stored in the account's Durable
   Object, so the check is strongly consistent; GET requests spend nonces too, because a replayed
   stream request would be a live copy of the account's events);
 - an unknown or revoked device, or a bad signature.
@@ -139,8 +153,15 @@ characters); both sides compute it.
   in its one spelling, and is refused (`400` `invalid`, `field: "sealKey"`) when it's malformed or a
   low-order point (the relay seals to it once on the spot; a point whose shared secret would be all
   zeros fails). When the relay has a `SIGNUP_TOKEN` secret, the request must carry
-  `Authorization: Bearer <SIGNUP_TOKEN>`; without the secret, signups are open (development only;
-  `/v1/info` says so).
+  `Authorization: Bearer <SIGNUP_TOKEN>` (`401` otherwise). Without the secret, signups are
+  **refused** (`403` `forbidden`) unless the operator sets `OPEN_SIGNUP=1` explicitly (development,
+  or a relay meant to be open); `/v1/info` says which. Account creation is limited per client address
+  (5 a minute by default, `429` `rate_limited`), checked first. A public key that already belongs to a
+  device is `409` `conflict`, also when two signups race for it; the account and its first device
+  are created together or not at all.
+- An account holds at most `ACCOUNT_MAX_DEVICES` node devices (10 by default; phones, §10, aren't
+  counted, and revoked devices free their place). At the cap, `POST /v1/enrolments` and the
+  redemption answer `409` `conflict`.
 - `POST /v1/enrolments` (signed) → `{ "code": "ABCD-EFGH-JKMN", "expiresAt" }`: a one-time code,
   valid 10 minutes, for adding another device to the same account. A code is 12 Crockford base32
   characters (60 random bits) in three groups of four; redeeming reads it case-insensitively, ignores
@@ -174,8 +195,9 @@ characters); both sides compute it.
   older backlog and doesn't hold it back from deletion.
 - `GET /v1/info` (unsigned) → `{ "version", "protocol": 2, "protocols": [2], "signupOpen": bool,
   "relayKey", "serverTime", "screen": { "edge": true, "maxRules": 200, "heldDays" }, "extras": [],
-  "phone": { "protocol": 1 } }`. `phone` says the relay carries phone links (§10) and the version of
-  their socket protocol.
+  "phone": { "protocol": 1 } }`. `signupOpen` is true only when a signup needs no token
+  (`OPEN_SIGNUP=1` and no `SIGNUP_TOKEN`). `phone` says the relay carries phone links (§10) and the
+  version of their socket protocol.
   `screen` says what the edge screen takes (§4b). `extras` lists the optional hosted extras this
   relay offers (fingerprint sync across devices, reputation lists shared as hashes, a longer hold,
   evaluator credits…), each `{ "id", "title", "description"?, "url"? }`, as the operator sets them
@@ -190,15 +212,24 @@ characters); both sides compute it.
 - `POST /v1/hooks` (signed, or `hooks:write`) `{ "name", "verify": <Verify>, "offlineNotice"? }` →
   `201` `{ "hook": <Hook>, "url", "secret"?, "verifyToken"? }`. `secret` appears **only here** and
   only when the relay generated it; so does `verifyToken` (a `meta` hook's, when the caller gave
-  none). `offlineNotice` is §4a's, for the presets that can carry one.
+  none). A hook whose answer would carry either needs a device or an API key with `hooks:secrets`;
+  `hooks:write` alone gets `403` `forbidden` and nothing is made (it may still create hooks with a
+  supplied secret, or none). `offlineNotice` is §4a's, for the presets that can carry one.
+- **Names are unique per account** (1 to 100 characters, compared exactly): creating or renaming a
+  hook to a name another of the account's hooks has is `409` `conflict`. Clients that let a person
+  refer to a hook by name resolve the name to the hook's id once and keep the id: a hook renamed
+  later, or a new hook given a freed name, is a different hook.
 - `GET /v1/hooks` (`hooks:read`) → `{ "hooks": [<Hook>] }`; `GET /v1/hooks/<id>` → `<Hook>`.
 - `PATCH /v1/hooks/<id>` (`hooks:write`) `{ "name"?, "enabled"?, "maxBodyBytes"?, "offlineNotice"? }`
   → `<Hook>`. `"offlineNotice": null` clears it.
-- `POST /v1/hooks/<id>/rotate` (`hooks:write`) → `{ "secret" }`; the previous secret keeps working for
-  24 h. Only for presets whose secret the relay generates; a provider-issued secret (Stripe, Slack,
+- `POST /v1/hooks/<id>/rotate` (a device, or `hooks:secrets`) → `{ "secret" }`; the previous secret
+  keeps working for 24 h. Only for presets whose secret the relay generates; a provider-issued secret (Stripe, Slack,
   Linear, Shopify, Twilio) is rotated at the provider, and a strict hook's secret is on the devices:
   both answer `409` `conflict`.
 - `DELETE /v1/hooks/<id>` (`hooks:write`) → `204`. Events already in the log stay until acknowledged.
+
+Every device's stream is told of each hook created, rotated, renamed or deleted (`hook-change`,
+§6), so a person notices a change they didn't make (an API key rotating a secret, say).
 
 `Hook`: `{ "id", "name", "url", "enabled", "verify": { "preset", …non-secret fields }, "maxBodyBytes",
 "createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null, "screenRules" }`
@@ -233,7 +264,9 @@ characters; the relay refuses to create a hook of a provider-issued preset witho
 `field: "verify.secret"`), since it can't make one the provider would use.
 
 What each preset's signature covers, what the relay uses besides, and its replay marks (a delivery is
-a duplicate when **any** mark was seen in the last 7 days):
+a duplicate when **any** mark was seen in the last 7 days; for the presets that sign no timestamp,
+`github`, `shopify`, `twilio`, `meta` and `hmac`, the body-hash mark is kept `REPLAY_MARK_DAYS`, 180
+days by default):
 
 | `preset` | signed | used but **not** signed (the sender's claim) | replay marks | `eventType` |
 |---|---|---|---|---|
@@ -253,8 +286,12 @@ a duplicate when **any** mark was seen in the last 7 days):
 Where the id a provider sends is **not** signed (GitHub, Linear, Shopify, Twilio), someone who
 captured one delivery could resend it under a new id; the body-hash mark answers that as a duplicate.
 The cost: two genuinely different deliveries with byte-identical bodies within 7 days are stored
-once. GitHub, Shopify and Twilio sign no timestamp and retry for hours, so for them these marks are
-the only replay defence. Marks are stored as keyed hashes (HMAC-SHA256 under `HASH_PEPPER` of the hook
+once. GitHub, Shopify, Twilio, Meta and the generic `hmac` preset sign no timestamp, so for them
+these marks are the only replay defence: a captured genuine delivery (GitHub shows recent ones, body
+and signature, to a repository's admins) verifies forever. That is why their body-hash mark is kept
+for `REPLAY_MARK_DAYS` rather than a week. Past it, a replay is accepted as a new event with a new
+`evt_` id, so a client that acts on events should also dedupe by the content's hash, kept at least
+as long as it keeps anything; the reference runner is meant to. Marks are stored as keyed hashes (HMAC-SHA256 under `HASH_PEPPER` of the hook
 id and the mark), never the ids themselves: an event id read from a body is content too.
 
 **Slack's endpoint check.** A `slack` delivery whose body is `{"type":"url_verification",
@@ -273,7 +310,8 @@ is stored. Hooks of other presets answer `GET` with `404`. The verify token is n
 (it proves nothing about later deliveries), so a strict `meta` hook keeps it at the relay too.
 
 `maxBodyBytes` is at most 1,835,008 (bodies live in 2 MB SQLite rows; larger ones move to R2 in a
-later phase). Secrets are stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM, the hook id
+later phase). It is 1 MiB by default, and 256 KiB for a strict or `unverified` hook (anyone who
+knows its URL can send it junk the relay can't tell from deliveries); `PATCH` raises it. Secrets are stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM, the hook id
 as associated data), never returned after creation.
 
 ### Strict mode: verify on your devices
@@ -305,7 +343,7 @@ Trade-offs, for choosing it:
 |---|---|---|
 | who holds the provider's secret | the relay (encrypted under `SECRETS_KEY`) and the provider | your devices and the provider |
 | a relay breach can | forge events (with the secret) | not forge events |
-| junk at the edge | refused `401` before it's stored | stored until a device refuses it (well-formed header, fresh header timestamp, new body); it costs quota and is visible as quarantined events |
+| junk at the edge | refused `401` before it's stored | stored until a device refuses it (well-formed header, fresh header timestamp, new body); it costs quota and is visible as quarantined events. It can fill only the hook's own share of the account's quota (a sixteenth by default, §4 step 7), so it can't make the account's other hooks answer `429` |
 | replay marks | provider ids and body hashes | body hashes at the edge; timestamps checked on the device |
 | `eventType` for routing | from the signed body | header-borne types only (the relay never reads the body) |
 | relay-generated secrets, rotation | the relay generates and rotates (24 h overlap) | the device generates; rotation happens on the device |
@@ -329,7 +367,10 @@ mode removes the secret, and the parsing, not the transit.
 3. Rate limit per hook (60 requests per 10 s by default) → `429` with `Retry-After`. Only then is the
    body read, and a body that turns out larger than the limit while streaming → `413`.
 4. Verify with the preset (for a strict hook, the edge checks of §3) → `401` `{"error":"signature"}`
-   on failure (counted per hour in the audit, §9, never stored).
+   on failure, never stored. Failures are counted in the Worker and written to the account's Durable
+   Object at most once a minute per hook per Worker instance, so a flood of forged signatures to a
+   public URL doesn't wake the account's object per request; the audit's hourly `verify.failed`
+   counts (§9) are therefore approximate (an instance evicted before its next write loses its count).
 5. A handshake the preset answers (Slack's `url_verification`) → answered, not stored.
 5a. The hook's screen (§4b), when it has one: **drop** → `200` `{"received": "<evt_…>"}` with an id
    that names nothing (the sender can't tell it from a delivery), nothing stored, counted per hour
@@ -339,12 +380,17 @@ mode removes the secret, and the parsing, not the transit.
    and is not stored again.
 7. Quota: an account's log holds at most `ACCOUNT_MAX_EVENTS` events (default 10,000) and
    `ACCOUNT_MAX_BYTES` of sealed envelopes (default 256 MiB; an event costs its sealed size once per
-   device) waiting for acknowledgement; past either → `429` `quota` with `Retry-After: 60`.
-   Acknowledging (or retention) frees it.
+   device) waiting for acknowledgement, and **each hook only a share of it**: half for a hook the
+   relay verifies (`HOOK_MAX_EVENTS`, `HOOK_MAX_BYTES`), a sixteenth for a strict or `unverified`
+   hook (`UNCHECKED_HOOK_MAX_EVENTS`, `UNCHECKED_HOOK_MAX_BYTES`), so a flood on one hook can't refuse
+   the others. Past any → `429` `{"error":"quota","scope":"account"|"hook"|"held"}` with
+   `Retry-After: 60` (`held`: the hook's hold is full, §4b). Acknowledging (or retention) frees it.
 8. Seal the content to every active device that has a sealing key, sign each envelope (§5), and
    append the event, its envelopes and its dedupe marks in one Durable Object transaction → `200`
-   `{"received": "<evt_…>"}`. The account's object takes no other request while it seals (the seq is
-   part of what is sealed), and the plaintext is never written to storage or logs.
+   `{"received": "<evt_…>"}`. The seq (part of what is sealed) and the quota are reserved first, the
+   sealing runs without blocking the account's object (nonces and acks are served meanwhile), and
+   the commits are written in seq order. The plaintext is never written to storage or logs. A device
+   whose key can't be sealed to gets that event as a `no_key` gap (§6), never a failed delivery.
 
 **Answers a provider reads.** A `twilio` delivery is answered with TwiML instead of JSON, `200`
 `text/xml`: `<?xml version="1.0" encoding="UTF-8"?><Response></Response>`, or, when §4a's notice is
@@ -453,7 +499,10 @@ the relay's tests and the harness's (`cli/hooks-screen`) both run it.
 
 **The hold.** A quarantined event is sealed to every device as usual, but with the associated data
 `00hooks-seal-v1\n<hookId>\nheld\n<id>` (it has no seq yet), kept aside with its dedupe marks, and
-counted in the account's quota. It is not streamed.
+counted in a quota of its own, **apart from the log**: at most `HELD_MAX_EVENTS` events (200) and
+`HELD_MAX_BYTES` (16 MiB) per hook, and the account's quota again across hooks. A quarantine flood
+fills only that hook's hold (deliveries the screen would hold answer `429` `quota` with
+`scope: "held"`), never the log. It is not streamed.
 
 - `GET /v1/held` (device, or `events:read`) → `{ "held": [{ "id", "hookId", "receivedAt",
   "verified", "strict", "preset", "eventType", "rule", "size", "expiresAt" }] }`, newest first,
@@ -463,6 +512,11 @@ counted in the account's quota. It is not streamed.
   is streamed like any event (devices revoked meanwhile get nothing). A second release is `404`.
 - `DELETE /v1/held/<id>` (device, or `hooks:write`) → `204`: it is never streamed; `404` when it
   isn't held.
+- `DELETE /v1/held?hookId=<hk_…>&rule=<rule id>` (device, or `hooks:write`) → `{ "dropped": n }`:
+  drops every held event of that hook, held by that rule, or both; with neither, everything held.
+  One audit line `held.dropped` (subject the hook id or `*`, name the rule).
+- A release needs room in the log: when there is none it answers `429` `quota` and the event stays
+  held.
 - A held event waits `SCREEN_HELD_DAYS` (7 by default), then is dropped by the alarm.
 - Audit: `screen.held` and `screen.dropped` are counted per hook per hour (`actor` null);
   `held.released` and `held.dropped` name the device or key.
@@ -599,6 +653,18 @@ data: {…event…}
   Durable Object (32 MiB). That can't happen within this version's limits (the largest event, a
   1,835,008-byte body sealed and base64-encoded with its headers, is under 2.5 MB); the rule exists
   so one undeliverable event can never wedge a stream.
+- **Hook changes**: `event: hook-change` `data: {"n": 7, "kind": "hook.rotated", "hookId": "hk_…",
+  "name": "…", "previousName"?: "…", "actor": "key_…" | "dev_…" | null, "at": <ms>}` says one of the
+  account's hooks was created, rotated, renamed (with `previousName`) or deleted (`kind` is
+  `hook.created`, `hook.rotated`, `hook.renamed` or `hook.deleted`; a client treats any other kind
+  as a generic change). It has **no `id:` line**, so it never moves `Last-Event-ID`, and it is never
+  acknowledged. After `ready`, a stream is sent the changes made since its device was last sent them
+  at a stream's start (at most 100; changes from before the device existed, and the device's own,
+  are never sent), then each new one as it happens. A change sent live is sent again when the device
+  next opens a stream (a stream that went away unnoticed could have lost it), so delivery is at least
+  once: `n` only grows within an account, and a client dedupes by it. It is a notice, not a record:
+  the audit log (§9) is the record. A client should tell the person about a change it didn't make,
+  above all `hook.rotated` (a secret now exists that the person didn't see).
 - `Last-Event-ID` beyond the head is clamped to the head; one that isn't a number answers `400`
   `invalid`.
 - **Heartbeat**: a comment line `: hb` every 15 s.
@@ -636,8 +702,10 @@ SSE.
 `POST /v1/ack` (signed) `{ "through": 42 }` → `{ "acked": 42 }`. Acknowledge only after the event is
 recorded locally (not after acting on it). Acks are per device and monotonic: a lower value is
 ignored. A device's own envelopes are deleted as soon as it acknowledges them; an event acknowledged by
-every device is deleted; unacknowledged events are kept 7 days (`RETENTION_DAYS`), then dropped,
-which shows up as a `gap`.
+every device is deleted; unacknowledged events are kept 7 days (`RETENTION_DAYS`), counted from
+when the event entered the log (when it was appended, or released from the screen's hold, §4b; not
+when it was received), then dropped, which shows up as a `gap`. Only events that old are dropped,
+each contiguous run of them as its own `gap`.
 
 Clients dedupe by `id` before acting, so at-least-once delivery never runs an automation twice.
 The reference client records an event (opened) before acknowledging it, and then hands it to its
@@ -685,17 +753,20 @@ scope, or on a route only a device may use, is `403` `forbidden`.
 | scope | allows |
 |---|---|
 | `hooks:read` | `GET /v1/hooks`, `GET /v1/hooks/<id>` |
-| `hooks:write` | `POST /v1/hooks`, `PATCH`/`DELETE /v1/hooks/<id>`, `POST /v1/hooks/<id>/rotate` |
+| `hooks:write` | `POST /v1/hooks` (without a relay-generated secret or verify token), `PATCH`/`DELETE /v1/hooks/<id>` |
+| `hooks:secrets` | `POST /v1/hooks/<id>/rotate`, and, with `hooks:write`, `POST /v1/hooks` for a hook whose secret or verify token the relay generates: the only scope ever shown a hook's secret |
 | `events:read` | `GET /v1/events` |
 | `devices:write` | `GET /v1/devices`, `DELETE /v1/devices/<id>` |
 | `audit:read` | `GET /v1/audit` |
 | `hooks:read` (screen) | `GET /v1/hooks/<id>/screen` |
-| `hooks:write` (screen) | `PUT /v1/hooks/<id>/screen`, `POST /v1/held/<id>/release`, `DELETE /v1/held/<id>` |
+| `hooks:write` (screen) | `PUT /v1/hooks/<id>/screen`, `POST /v1/held/<id>/release`, `DELETE /v1/held/<id>`, `DELETE /v1/held` |
 | `events:read` (screen) | `GET /v1/held` |
 | *(device only)* | `/v1/stream`, `/v1/ack`, `/v1/enrolments`, `PUT /v1/devices/<id>/seal-key`, `/v1/keys`, `/v1/screen/key`, `/v1/phone/*` (§10) |
 
 The device-only routes are what would turn a stolen key into a reader of the account's events (a
-stream, a new device, a sealing key) or into more keys.
+stream, a new device, a sealing key) or into more keys. `hooks:secrets` is kept apart from
+`hooks:write` for the same reason on the writing side: whoever holds a hook's secret can sign
+deliveries the relay marks `verified: true`, so a CI key that only manages hooks can't obtain one.
 
 **The audit log**: `GET /v1/audit?since=<ms>&limit=<1–500, default 100>` (device, or `audit:read`) →
 `{ "entries": [{ "at", "kind", "actor", "subject", "name", "count"? }] }`, newest first, kept 90 days.
@@ -703,15 +774,15 @@ Names and ids only: never a secret, a token, a header value or a payload.
 
 | `kind` | `subject` | `actor` | `name` |
 |---|---|---|---|
-| `hook.created`, `hook.rotated`, `hook.deleted` | the hook | the device or key | the hook's name |
+| `hook.created`, `hook.rotated`, `hook.renamed`, `hook.deleted` | the hook | the device or key | the hook's name (the new one, for a rename) |
 | `device.added` | the new device | itself (new account), or the device that issued the enrolment code | its name |
 | `device.revoked` | the device | the device or key | its name |
 | `device.seal_key` | the device | itself | the new kid |
 | `key.created`, `key.revoked` | the key | the device | the key's name |
 | `key.used` | the key | the key | the key's name; `count` uses in the hour starting at `at` |
-| `verify.failed` | the hook | null | the hook's name, while it exists; `count` failures in the hour starting at `at` |
+| `verify.failed` | the hook | null | the hook's name, while it exists; `count` failures in the hour starting at `at` (approximate: counted at the edge, §4 step 4) |
 | `hook.screen` | the hook | the device or key | the hook's name |
-| `screen.held`, `screen.dropped` | the hook | null | the hook's name; `count` in the hour starting at `at` |
+| `screen.held`, `screen.dropped` | the hook | null | the hook's name; `count` in the hour starting at `at` (`screen.dropped` is counted at the edge, like `verify.failed`) |
 | `held.released`, `held.dropped` | the event | the device or key | null |
 | `phone.pairing` | the pairing id | the node device | null |
 | `phone.confirmed` | the phone | its node | the phone's name |

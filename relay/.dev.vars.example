@@ -13,6 +13,8 @@ HASH_PEPPER=REPLACE_WITH_A_LONG_RANDOM_STRING
 #   openssl rand -base64 32
 RELAY_SIGNING_KEY=REPLACE_WITH_32_RANDOM_BYTES_BASE64
 
-# Optional. When set, creating an account needs `Authorization: Bearer <SIGNUP_TOKEN>`.
-# Leave it unset only for local development: signups are then open to anyone.
-# SIGNUP_TOKEN=REPLACE_WITH_A_LONG_RANDOM_STRING
+# Signups. With SIGNUP_TOKEN set, creating an account needs `Authorization: Bearer <SIGNUP_TOKEN>`.
+# Without it, signups are refused unless OPEN_SIGNUP=1 says, explicitly, that anyone may sign up
+# (for local development, or a relay meant to be open).
+SIGNUP_TOKEN=REPLACE_WITH_A_LONG_RANDOM_STRING
+# OPEN_SIGNUP=1
