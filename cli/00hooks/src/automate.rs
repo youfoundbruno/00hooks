@@ -340,7 +340,8 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
                 ));
             }
             StreamEvent::Quarantined { seq, path, error } => err(format!(
-                "Event{} arrived but couldn't be read ({}); its raw message is kept in {}.",
+                "Event{} arrived but couldn't be read ({}); it is noted in {} (`00hooks quarantine \
+                 list`).",
                 seq.map(|n| format!(" {n}")).unwrap_or_default(),
                 sanitize(&error, false),
                 path.display()
