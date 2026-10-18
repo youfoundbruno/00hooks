@@ -956,6 +956,8 @@ impl Runner {
                 env,
                 event,
                 timeout,
+                raw,
+                options_end,
                 ..
             } => {
                 // Checked when the file was read; checked again here, where it matters.
@@ -965,9 +967,10 @@ impl Runner {
                         command.display()
                     )));
                 }
+                let args = actions::command::render_args(args, ctx, *raw, options_end.as_deref())?;
                 let run = actions::command::Run {
                     program: command,
-                    args: args.iter().map(|t| t.render(ctx)).collect(),
+                    args,
                     env: env
                         .iter()
                         .map(|(k, t)| (k.clone(), t.render(ctx)))

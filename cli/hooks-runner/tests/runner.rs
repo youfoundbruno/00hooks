@@ -456,6 +456,49 @@ automations:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_can_not_pass_a_command_an_option() {
+    let yaml = r#"
+automations:
+  - name: Plain
+    when: { hook: github, kinds: [push] }
+    allow_commands: [/bin/echo]
+    then:
+      - run: { command: echo, args: ["{{payload.repo}}"], event: none }
+  - name: Ended
+    when: { hook: github, kinds: [push] }
+    allow_commands: [/bin/echo]
+    then:
+      - run: { command: echo, args: [-n, "{{payload.repo}}"], options_end: "--", event: none }
+"#;
+    let mut s = setup("options", yaml);
+    let rec = s
+        .runner
+        .handle(&event(
+            1,
+            "push",
+            &json!({"repo": "--upload-pack=touch /tmp/pwned"}),
+        ))
+        .await;
+    let plain = &rec.automations[0].actions[0];
+    assert!(!plain.ok && plain.attempts == 1, "{plain:#?}");
+    let msg = plain.error.as_deref().unwrap();
+    assert!(
+        msg.contains("argument 1") && !msg.contains("upload-pack"),
+        "{msg}"
+    );
+    let ended = &rec.automations[1].actions[0];
+    assert!(ended.ok, "{ended:#?}");
+    assert!(
+        ended
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("-- --upload-pack=touch /tmp/pwned"),
+        "{ended:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn safe_actions_are_retried_and_commands_are_not() {
     let server = Server::start().await;
     server.state.lock().unwrap().script = VecDeque::from([503, 503]);

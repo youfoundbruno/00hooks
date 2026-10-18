@@ -99,6 +99,13 @@ impl Template {
         self.parts.iter().all(|p| matches!(p, Part::Text(_)))
     }
 
+    /// Its first characters come from the event: it starts with a slot (`"{{payload.x}}"`,
+    /// `"{{payload.x}}.txt"`), not with text you wrote (`"--title={{payload.x}}"`). A command's
+    /// argument like this could be made to start with `-` by whoever sent the event.
+    pub fn starts_with_slot(&self) -> bool {
+        matches!(self.parts.first(), Some(Part::Slot(_)))
+    }
+
     /// Render to text. `encode` is applied to every value put into a slot (URLs percent-encode).
     pub fn render_with(&self, ctx: &Value, encode: &dyn Fn(&str) -> String) -> String {
         let mut out = String::new();
