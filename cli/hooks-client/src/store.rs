@@ -470,7 +470,14 @@ impl EventStore {
         self.seen_file.sync_data()?;
         if self.inbox_ids.remove(id) {
             self.inbox.retain(|_, e| e.id != id);
-            if self.inbox.is_empty() || self.inbox_bytes > INBOX_COMPACT_BYTES {
+            if self.inbox.is_empty() {
+                // Everything in the file is handed over: empty it. No fsync: if the truncation
+                // is lost in a crash, the lines come back and are all in the seen set.
+                if self.inbox_bytes > 0 {
+                    self.inbox_file.set_len(0)?;
+                    self.inbox_bytes = 0;
+                }
+            } else if self.inbox_bytes > INBOX_COMPACT_BYTES {
                 self.compact_inbox()?;
             }
         }
