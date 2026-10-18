@@ -80,6 +80,8 @@ pub struct Runner {
     names: BTreeMap<String, String>,
     catch_up: Option<CatchUp>,
     log: Vec<String>,
+    /// Hooks whose kinds reached the catalogue's cap, already said.
+    capped_hooks: HashSet<String>,
 }
 
 fn stamp(p: &Path) -> Option<SystemTime> {
@@ -130,6 +132,7 @@ impl Runner {
             names: load_names(&opts.dir),
             catch_up: None,
             log: Vec::new(),
+            capped_hooks: HashSet::new(),
             config,
             opts,
         };
@@ -514,6 +517,7 @@ impl Runner {
                 key: crate::catalogue::key(&e.hook_id, &kind),
                 new_kind: false,
                 change: None,
+                capped: false,
             }
         } else {
             let so = self.config.structure_only(&e.hook_id, &self.names);
@@ -533,6 +537,7 @@ impl Runner {
                         key: crate::catalogue::key(&e.hook_id, &kind),
                         new_kind: false,
                         change: None,
+                        capped: false,
                     }
                 }
             }
@@ -540,6 +545,19 @@ impl Runner {
         let label = format!("{}/{}", hook_name.as_deref().unwrap_or(&e.hook_id), kind);
         if observation.new_kind {
             self.say(format!("New kind: {label}"));
+        }
+        let capped = observation.capped.then(|| {
+            format!(
+                "the catalogue already keeps {} kinds for this hook, so this kind wasn't recorded",
+                crate::catalogue::MAX_KINDS_PER_HOOK
+            )
+        });
+        if let Some(c) = &capped
+            && self.capped_hooks.insert(e.hook_id.clone())
+        {
+            self.say(format!(
+                "{label}: {c} (said once per hook while the runner runs)."
+            ));
         }
         if let Some(c) = &observation.change {
             self.say(format!(
@@ -657,7 +675,11 @@ impl Runner {
             finished_at: now_ms(),
             replay,
             status,
-            note: released.then(|| "released from the screen's quarantine list".to_string()),
+            note: match (released, capped) {
+                (true, Some(c)) => Some(format!("released from the screen's quarantine list; {c}")),
+                (true, None) => Some("released from the screen's quarantine list".to_string()),
+                (false, c) => c,
+            },
             new_kind: observation.new_kind,
             shape_change: observation.change,
             automations: autos,
