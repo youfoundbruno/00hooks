@@ -436,15 +436,11 @@ automations:
         "{a:#?}"
     );
     assert!(started.elapsed() < Duration::from_secs(10));
-    // The event file is gone afterwards.
+    // The run's folder, and the event file in it, are gone afterwards.
     let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("00hooks-event-")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("00hooks-run-"))
         .collect();
     assert!(
         left.is_empty()
@@ -453,6 +449,124 @@ automations:
                 .map(|m| m.modified().unwrap().elapsed().unwrap() > Duration::from_secs(60))
                 .unwrap_or(true))
     );
+}
+
+/// Whether a process is still there (a zombie waiting for its parent counts as gone).
+#[cfg(unix)]
+fn alive(pid: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    out.status.success() && !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_child_can_not_keep_the_runner_waiting() {
+    // `sleep 30 &` keeps stdout and stderr open after the shell exits: the run must still finish
+    // now, keep what the shell printed, and kill the sleep.
+    let yaml = r#"
+automations:
+  - name: Background
+    when: { hook: github, kinds: [push] }
+    allow_commands: [/bin/sh]
+    then:
+      - run: { command: sh, args: [-c, "sleep 30 & echo $! > $DIR/bg.pid; echo started"], event: none, timeout: 20s }
+"#;
+    let mut s = setup("background", yaml);
+    let started = std::time::Instant::now();
+    let rec = s.runner.handle(&event(1, "push", &json!({}))).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "took {:?}",
+        started.elapsed()
+    );
+    let a = &rec.automations[0].actions[0];
+    assert!(a.ok, "{a:#?}");
+    assert!(a.detail.as_deref().unwrap().ends_with("started"), "{a:#?}");
+    let pid = std::fs::read_to_string(s.dir.0.join("bg.pid")).unwrap();
+    let pid = pid.trim();
+    let mut gone = false;
+    for _ in 0..50 {
+        if !alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the background sleep {pid} is still running");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_run_kills_what_it_started() {
+    let dir = Temp::new("dropped");
+    let pidfile = dir.0.join("bg.pid");
+    let run = hooks_runner::actions::command::Run {
+        program: Path::new("/bin/sh"),
+        args: vec![
+            "-c".into(),
+            format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
+        ],
+        env: Vec::new(),
+        event: hooks_runner::config::EventInput::None,
+        timeout: Duration::from_secs(30),
+    };
+    let ctx = json!({});
+    let fut = hooks_runner::actions::command::run(run, &ctx);
+    // Dropped half-way, as a signal or a host shutting down would.
+    let _ = tokio::time::timeout(Duration::from_millis(700), fut).await;
+    let pid = std::fs::read_to_string(&pidfile).unwrap();
+    let pid = pid.trim();
+    let mut gone = false;
+    for _ in 0..50 {
+        if !alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the background sleep {pid} is still running");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_run_has_its_own_private_folder() {
+    let yaml = r#"
+automations:
+  - name: Where
+    when: { hook: github, kinds: [push] }
+    allow_commands: [/bin/sh]
+    then:
+      - run: { command: sh, args: [-c, "echo \"$(pwd -P)|$(ls -ld . | cut -c1-10)|$(dirname \"$HOOKS_EVENT_FILE\")\""], event: file }
+"#;
+    let mut s = setup("cwd", yaml);
+    let mut seen = Vec::new();
+    for seq in 1..=2 {
+        let rec = s.runner.handle(&event(seq, "push", &json!({}))).await;
+        let a = &rec.automations[0].actions[0];
+        assert!(a.ok, "{a:#?}");
+        let out = a.detail.as_deref().unwrap().split(": ").nth(1).unwrap();
+        let parts: Vec<&str> = out.split('|').collect();
+        assert_eq!(parts[1], "drwx------", "{out}");
+        assert_eq!(
+            Path::new(parts[0]).file_name(),
+            Path::new(parts[2]).file_name(),
+            "the event file is in the run's folder: {out}"
+        );
+        assert!(
+            Path::new(parts[0])
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("00hooks-run-")
+        );
+        assert!(!Path::new(parts[0]).exists(), "removed afterwards");
+        seen.push(parts[0].to_string());
+    }
+    assert_ne!(seen[0], seen[1], "a fresh folder per run");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
