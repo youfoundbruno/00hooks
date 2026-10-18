@@ -1370,3 +1370,71 @@ automations:
     assert_eq!(runner.handle(&released).await.status, RunStatus::Ok);
     assert_eq!(agents.asked.lock().unwrap().len(), 3);
 }
+
+/// An evaluator that never answers in time, the way an attacker who forces time-outs (or spends the
+/// daily cap) would like it.
+struct Silent;
+
+impl hooks_runner::hooks_screen::Decider for Silent {
+    fn name(&self) -> String {
+        "silent".into()
+    }
+    fn retention(&self) -> hooks_runner::hooks_screen::Retention {
+        hooks_runner::hooks_screen::Retention::Local
+    }
+    fn decide<'a>(
+        &'a self,
+        _: &'a hooks_runner::hooks_screen::evaluator::Request,
+    ) -> hooks_runner::hooks_screen::evaluator::DecideFuture<'a> {
+        Box::pin(async { Err("no answer".to_string()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn when_the_evaluator_can_not_answer_only_notifications_pass() {
+    use hooks_runner::hooks_screen::{Screen, SourceSettings};
+    let dir = Temp::new("fallback");
+    let yaml = format!(
+        r#"
+automations:
+  - name: Write
+    when: {{ hook: hk_gh, kinds: [push] }}
+    then:
+      - notify: "a push"
+      - write: {{ append: {}/pushes.jsonl }}
+  - name: Tell
+    when: {{ hook: hk_gh, kinds: [star] }}
+    then:
+      - notify: "a star"
+"#,
+        dir.0.display()
+    );
+    let given = hooks_runner::config::parse(&yaml, &dir.0.join("x.yaml")).expect("valid");
+    let screen = Arc::new(Screen::open(dir.0.join("screen")).unwrap());
+    let mut settings = screen.settings();
+    settings.sources.insert(
+        "webhook".into(),
+        SourceSettings {
+            enabled: true,
+            evaluate: true,
+            ..SourceSettings::default()
+        },
+    );
+    screen.set_settings(settings).unwrap();
+    screen.set_decider(Some(Arc::new(Silent)));
+    let notifier = Arc::new(RecordingNotifier::default());
+    let mut opts = RunnerOptions::new(dir.0.join("runner"), dir.0.join("x.yaml"), "dev_me");
+    opts.notifier = Some(notifier.clone());
+    opts.screen = Some(screen.clone());
+    let mut runner = Runner::open_with(opts, given).unwrap();
+
+    // A file write (or a command, or a call) would act on it: held, not passed.
+    let held = runner.handle(&event(1, "push", &json!({"x": 1}))).await;
+    assert_eq!(held.status, RunStatus::Held, "{held:?}");
+    assert!(screen.held()[0].item.agent_bound);
+    assert!(!dir.0.join("pushes.jsonl").exists());
+    // Only a notification would: it passes.
+    let passed = runner.handle(&event(2, "star", &json!({"x": 2}))).await;
+    assert_eq!(passed.status, RunStatus::Ok, "{passed:?}");
+    assert_eq!(notifier.shown.lock().unwrap().len(), 1);
+}

@@ -375,7 +375,8 @@ impl Runner {
     }
 
     /// The screen's view of an event (PLAN §6a): its payload and headers, where the edge saw it come
-    /// from, and whether an agent (or anything) would act on it.
+    /// from, whether anything beyond a notification would act on it (`agent_bound`) and whether
+    /// anything would at all (`consequential`).
     fn screen_item(
         &self,
         e: &Event,
@@ -408,11 +409,10 @@ impl Runner {
             },
             size: e.body_len(),
             received_at: e.received_at,
-            agent_bound: triggered.iter().any(|a| {
-                a.actions
-                    .iter()
-                    .any(|x| matches!(x.kind, ActionKind::Ask { .. }))
-            }),
+            // Anything beyond a notification (an agent, a command, a call, a file) would act on
+            // it: when the evaluator can't answer, it is held rather than passed, so exhausting
+            // the daily cap or forcing a time-out doesn't let it through.
+            agent_bound: acts_beyond_notifying(triggered),
             consequential: !triggered.is_empty(),
             purpose: (!names.is_empty())
                 .then(|| format!("events for these automations: {}", names.join("; "))),
@@ -997,6 +997,15 @@ impl Runner {
         self.states.save()?;
         Ok(r)
     }
+}
+
+/// Whether any action of these automations does more than show a notification.
+fn acts_beyond_notifying(triggered: &[&Automation]) -> bool {
+    triggered.iter().any(|a| {
+        a.actions
+            .iter()
+            .any(|x| !matches!(x.kind, ActionKind::Notify { .. }))
+    })
 }
 
 fn list_or_none(v: &[String]) -> String {

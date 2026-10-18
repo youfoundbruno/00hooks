@@ -4,8 +4,9 @@
 //! then learned rules, newest first; then, only for an item something would act on, the evaluator
 //! (from its cache when the same item was evaluated before, within the source's daily cap, never for
 //! a sensitive source with a decider that can't promise zero retention). When the evaluator fails,
-//! times out or is over its cap, the item gets the source's fallback: **quarantine** when an agent
-//! would read it, **pass** for plain notifications, never a silent pass for an agent.
+//! times out or is over its cap, the item gets the source's fallback: **quarantine** when anything
+//! beyond a notification would act on it (`Item::agent_bound`: an agent, a command, a call, a
+//! file), **pass** only when nothing but a notification would; never a silent pass for an action.
 //!
 //! Kept in a private folder: `settings.json`, `rules.json` (rules and learned rules: field values
 //! you chose, fingerprints, never an item), `held.json` (the quarantine list: held items with their
@@ -44,8 +45,8 @@ pub struct SourceSettings {
     pub enabled: bool,
     /// Ask the evaluator about what rules didn't settle.
     pub evaluate: bool,
-    /// What an item gets when the evaluator can't answer; `None`: quarantine for an agent, pass
-    /// for plain notifications.
+    /// What an item gets when the evaluator can't answer; `None`: quarantine when anything beyond
+    /// a notification would act on it (`Item::agent_bound`), pass when only a notification would.
     pub fallback: Option<Verdict>,
     /// Its content may only go to a decider that keeps nothing (local, or zero retention).
     pub sensitive: bool,
