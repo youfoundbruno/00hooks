@@ -2,14 +2,16 @@
 
 Webhooks from anywhere, delivered to your own computer in real time, safely.
 
-Point any service that sends webhooks (GitHub, Stripe, Shopify, Slack, your own app) at a hook URL.
-A small relay on Cloudflare checks the event is genuine, seals it so only your devices can read it,
-and streams it to the `00hooks` CLI on your Mac or Linux machine, where it runs your automations:
-notify you, call a URL, run an allowed command, or hand it to an AI agent that can only do what you
-allowed.
+Point any service that sends webhooks (GitHub, Stripe, Shopify, Slack, Meta, your own app) at a
+hook URL. A small relay on Cloudflare, which you run on your own account, checks the event is
+genuine, seals it so only your devices can read it, and streams it to the `00hooks` CLI on your Mac
+or Linux machine. There it runs your automations: notify you, call a URL, run an allowed command or
+write to a file.
 
-> Status: the relay, the CLI and the automation runner work (phases 0–2); the design and security
-> model are in [`docs/PLAN.md`](docs/PLAN.md), the wire contract in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+> Status: built are the relay (hooks, presets, sealing, device pairing, API keys, the audit, the
+> screen and phone links), the CLI and its automation runner: phases 0, 1, 2 and 5 of
+> [`docs/PLAN.md`](docs/PLAN.md) §7. PLAN marks what is not built. The wire contract is
+> [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ## Why
 
@@ -19,16 +21,32 @@ allowed.
 - **Sealed to your devices.** Events are stored and streamed as ciphertext only your devices can open.
 - **Nothing is lost.** An ordered log with resume and acknowledgements: if your laptop sleeps, events
   wait and run when it's back, once.
-- **Safe to act on.** Webhook content is data: never interpolated into a shell, and AI agents get it
-  as quoted, untrusted input under an access profile.
-- **Yours to run.** Self-host the relay on your own Cloudflare account, or use a hosted one.
+- **Safe to act on.** Webhook content is data: it is never interpolated into a shell command or a
+  file path.
+- **Yours to run.** You deploy the relay on your own Cloudflare account; there is no hosted relay.
 
 ## Components
 
-- `relay/`: the Cloudflare Worker and Durable Object (TypeScript). How to run, test and self-host
-  it: [`relay/README.md`](relay/README.md).
-- `cli/`: the `00hooks` CLI, the `hooks-client` library and the `hooks-runner` automation runner
-  (Rust), also embedded by [00next](https://github.com/youfoundbruno/00next).
+- `relay/`: the Cloudflare Worker and its two Durable Object classes (TypeScript). How to run,
+  test and self-host it: [`relay/README.md`](relay/README.md).
+- `cli/`: the `00hooks` CLI (the `hooks-cli` crate), the `hooks-client` library, the `hooks-runner`
+  automation runner and the `hooks-screen` library (Rust). The libraries can be embedded by other
+  programs.
+
+## Install the CLI
+
+You need a Rust toolchain (`rustup`; `rust-toolchain.toml` picks the stable channel). From the
+repository root:
+
+```sh
+cargo install --locked --path cli/00hooks    # installs the `00hooks` binary into ~/.cargo/bin
+00hooks --help
+```
+
+The crates are not published to crates.io. To build without installing, run
+`cargo build --release -p hooks-cli`; the binary is `target/release/00hooks`.
+
+Then deploy your relay ([`relay/README.md`](relay/README.md), "Self-hosting") and log in to it.
 
 ## Hooks, keys and the audit
 
@@ -45,7 +63,7 @@ allowed.
 ```
 
 Presets: `github`, `standard-webhooks`, `standard-webhooks-ed25519`, `stripe`, `slack`, `linear`,
-`shopify`, `twilio`, `hmac`, `token`, `unverified` (PROTOCOL §3 says what each one signs).
+`shopify`, `twilio`, `meta`, `hmac`, `token`, `unverified` (PROTOCOL §3 says what each one signs).
 
 ## Automations
 
@@ -85,9 +103,12 @@ automations:
 - `00hooks kinds` lists the kinds of events seen and `00hooks kinds show <hook/kind>` their fields;
   `00hooks automations check` validates the file against them; `00hooks runs` and
   `00hooks replay <event>` show and repeat runs.
+- **Agent actions** (`ask`) run only in a program that embeds the runner and supplies an agent
+  (the `ask::Asker` trait). The `00hooks` CLI runs plain actions only.
 - **The screen** (optional, `00hooks screen on`) decides before any automation whether an event
   passes, is held for you or is dropped: rules on origin, headers, size and fields, similarity to
-  what you dropped, and an optional AI evaluator that only answers typed questions.
+  what you dropped, and an optional AI evaluator that only answers typed questions (it has no tools
+  and starts no action).
   `00hooks screen held`, `release`, `drop --always` and `sync` (the rules that can run at the relay,
   with field values as keyed hashes). See PLAN §6a and PROTOCOL §4b.
 
