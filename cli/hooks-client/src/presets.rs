@@ -560,12 +560,53 @@ fn timestamp_ms(
     Some(Some(if t.millis { n } else { n.saturating_mul(1000) }))
 }
 
+/// Whether a preset proves anything in strict mode. `unverified` proves nothing, and a `token`
+/// crosses the relay in the clear with every delivery, so a relay that saw one can mint more: in
+/// strict mode (the relay is not trusted to vouch) both are refused.
+pub fn strict_capable(verify: &Value) -> bool {
+    spec(verify).is_some_and(|s| !matches!(s.mac, Mac_::None | Mac_::Token))
+}
+
+/// The headers that carry a preset's signature (or token), lowercased: what is dropped from an
+/// event once it has been verified, so a stored or forwarded event is never a ready-made replay.
+pub fn signature_headers(verify: &Value) -> Vec<String> {
+    let Some(spec) = spec(verify) else {
+        return Vec::new();
+    };
+    match (spec.mac, &spec.sig) {
+        (Mac_::Token, _) => vec![
+            verify
+                .get("header")
+                .and_then(Value::as_str)
+                .unwrap_or("authorization")
+                .to_ascii_lowercase(),
+        ],
+        (_, Some((header, ..))) => vec![header.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Verifies one delivery for a strict hook (PROTOCOL §3): as [`verify`], but a preset that isn't
+/// [`strict_capable`] is refused whatever the delivery says.
+pub fn verify_strict(spec_value: &Value, secrets: &[String], d: &Delivery) -> Verdict {
+    if !strict_capable(spec_value) {
+        return REFUSED;
+    }
+    verify(spec_value, secrets, d)
+}
+
 /// Verifies one delivery with the hook's `verify` object and every currently valid secret (for
-/// `standard-webhooks-ed25519`, the sender's `whpk_` public key, from `secrets` or `verify`).
+/// `standard-webhooks-ed25519`, the sender's `whpk_` public key, from `secrets` or `verify`). A
+/// `verify` object marked `"strict": true` is held to [`verify_strict`].
 pub fn verify(verify: &Value, secrets: &[String], d: &Delivery) -> Verdict {
     let Some(spec) = spec(verify) else {
         return REFUSED;
     };
+    if verify.get("strict") == Some(&Value::Bool(true))
+        && matches!(spec.mac, Mac_::None | Mac_::Token)
+    {
+        return REFUSED;
+    }
     match spec.mac {
         Mac_::None => {
             return Verdict {
@@ -747,6 +788,48 @@ mod tests {
         assert!(!verify(&json!({"preset": "github"}), &["s".into()], &d).ok);
         assert!(!verify(&json!({"preset": "hmac"}), &["s".into()], &d).ok);
         assert!(verify(&json!({"preset": "unverified"}), &[], &d).ok);
+    }
+
+    #[test]
+    fn strict_mode_refuses_presets_that_prove_nothing_the_relay_could_not_mint() {
+        // A relay that rewrote a strict hook's spec to `unverified`, or to a `token` it has seen in
+        // the clear, gets nothing past the device.
+        let h = BTreeMap::from([("authorization".to_string(), "Bearer tok".to_string())]);
+        let d = Delivery {
+            headers: &h,
+            body: b"{}",
+            now_ms: 0,
+            url: None,
+        };
+        let tok = json!({"preset": "token", "header": "Authorization"});
+        assert!(
+            verify(&tok, &["tok".into()], &d).ok,
+            "token still works when the relay verifies"
+        );
+        assert!(!verify_strict(&tok, &["tok".into()], &d).ok);
+        assert!(!verify_strict(&json!({"preset": "unverified"}), &[], &d).ok);
+        let marked = json!({"preset": "token", "header": "Authorization", "strict": true});
+        assert!(!verify(&marked, &["tok".into()], &d).ok);
+        assert!(!verify(&json!({"preset": "unverified", "strict": true}), &[], &d).ok);
+        assert!(!strict_capable(&json!({"preset": "nope"})));
+        assert!(strict_capable(&json!({"preset": "stripe"})));
+    }
+
+    #[test]
+    fn signature_headers_name_what_carries_the_proof() {
+        assert_eq!(
+            signature_headers(&json!({"preset": "stripe"})),
+            ["stripe-signature"]
+        );
+        assert_eq!(
+            signature_headers(&json!({"preset": "hmac", "header": "X-Sig"})),
+            ["x-sig"]
+        );
+        assert_eq!(
+            signature_headers(&json!({"preset": "token"})),
+            ["authorization"]
+        );
+        assert!(signature_headers(&json!({"preset": "unverified"})).is_empty());
     }
 
     #[test]
