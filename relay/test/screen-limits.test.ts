@@ -1,8 +1,8 @@
 // The screen's bounds (PROTOCOL §4b): what one delivery can make the edge do is capped whatever the
 // screen and the payload. Domains are read up to 253 bytes and 127 labels; patterns run in linear
 // time from a checked subset; a path reads at most 64 values; a delivery hashes at most 256 KiB and
-// takes a bounded number of pattern steps, past which it is held (`~over-budget`); and a screen is
-// compiled once per isolate.
+// takes a bounded number of pattern steps, past which it is held (`~over-budget`); and header
+// values travel as keyed hashes like fields', `contains` only with consent.
 
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
@@ -210,6 +210,13 @@ describe("the compiled screen", () => {
     ...init,
   });
 
+  it("a header value stored in plain text before the change still holds, until the screen is pushed again", async () => {
+    const legacy = { rules: [{ id: "old", verdict: "drop", conditions: [{ on: "header", name: "x-kind", op: "is", value: "promo" }] }], consent: { words: false } } as unknown as EdgeScreen;
+    const screen = compileScreen(legacy);
+    expect(await decide(screen, await delivery({ headers: new Headers({ "X-Kind": " Promo" }) }))).toEqual({ verdict: "drop", rule: "old" });
+    expect(await decide(screen, await delivery({ headers: new Headers({ "X-Kind": "other" }) }))).toBeNull();
+  });
+
   it("a pattern stored before the subset that isn't in it never holds", async () => {
     const legacy = { rules: [{ id: "old", verdict: "drop", conditions: [{ on: "field", path: "payload.t", op: "pattern", pattern: "(\\w)\\1" }] }], consent: { words: true } } as unknown as EdgeScreen;
     const body = new TextEncoder().encode(JSON.stringify({ t: "aa" }));
@@ -222,5 +229,39 @@ describe("the compiled screen", () => {
     const body = new TextEncoder().encode(JSON.stringify({ l: Array.from({ length: 64 }, (_, i) => `${i} ${"a ".repeat(5000)}`) }));
     expect(400 * 5000 * 64).toBeGreaterThan(MAX_SCREEN_STEPS);
     expect(await decide(screen, await delivery({ body }))).toEqual({ verdict: "quarantine", rule: OVER_BUDGET_RULE });
+  });
+});
+
+describe("header rules", () => {
+  it("is travels as keyed hashes, a plaintext value is refused, and contains needs consent", async () => {
+    const dev = await newAccount();
+    const { hook } = await createHook(dev, { preset: "unverified" });
+    const k = await key(dev);
+    const plain = await setScreen(dev, hook.id, { rules: [{ id: "h", verdict: "drop", conditions: [{ on: "header", name: "X-Kind", op: "is", value: "promo" }] }] });
+    expect(plain.status).toBe(400);
+    expect(await plain.json()).toMatchObject({ field: "screen.rules[0].conditions[0].value" });
+    const words = await setScreen(dev, hook.id, { rules: [{ id: "h", verdict: "drop", conditions: [{ on: "header", name: "X-Kind", op: "contains", value: "promo" }] }] });
+    expect(words.status).toBe(400);
+    expect(await words.json()).toMatchObject({ field: "screen.consent" });
+
+    const hashes = [await keyedHash(k, "headers.x-kind", "promo")];
+    const ok = await setScreen(dev, hook.id, { rules: [{ id: "h", verdict: "drop", conditions: [{ on: "header", name: "X-Kind", op: "is", hashes }] }] });
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { screen: { rules: { conditions: unknown[] }[] } }).screen.rules[0]!.conditions[0]).toEqual({ on: "header", name: "x-kind", op: "is", hashes });
+    const kept = await env.DB.prepare("SELECT screen FROM hooks WHERE id = ?").bind(hook.id).first<{ screen: string }>();
+    expect(kept!.screen).not.toContain("promo");
+    await post(hook.id, { a: 1 }, { "X-Kind": " PROMO " });
+    expect((await stats(dev)).events).toBe(0);
+    await post(hook.id, { a: 1 }, { "X-Kind": "promotion" });
+    expect((await stats(dev)).events).toBe(1);
+
+    const consented = await setScreen(dev, hook.id, {
+      consent: { words: true },
+      rules: [{ id: "c", verdict: "drop", conditions: [{ on: "header", name: "X-Kind", op: "contains", value: "Promo" }] }],
+    });
+    expect(consented.status).toBe(200);
+    expect(((await consented.json()) as { screen: { consent: { words: boolean } } }).screen.consent.words).toBe(true);
+    await post(hook.id, { a: 1 }, { "X-Kind": "a promotion" });
+    expect((await stats(dev)).events).toBe(1);
   });
 });

@@ -5,9 +5,9 @@
 //
 // What it reads: the sender's address, network (ASN) and country from Cloudflare (`request.cf`),
 // headers, the size, and, unless the hook is strict, the body: its shape hash, a MinHash of its
-// text, and fields whose values the rules hold only as keyed hashes. `contains`, `pattern` and
-// `similar text` read the words, so a device may push them only with `consent.words`. Nothing read
-// here is stored: a decision keeps the rule's id and a count.
+// text, and fields and headers whose values the rules hold only as keyed hashes. `contains` (on a
+// field or a header), `pattern` and `similar text` read the words, so a device may push them only
+// with `consent.words`. Nothing read here is stored: a decision keeps the rule's id and a count.
 //
 // What one delivery can cost is bounded whatever the screen and the payload: a screen is compiled
 // once per isolate; patterns run on a linear-time matcher (`screen-pattern.ts`); a path reads at
@@ -44,7 +44,9 @@ export type Condition =
   | { on: "ip"; in: string[]; not?: boolean; preset?: string }
   | { on: "asn"; in: number[]; not?: boolean }
   | { on: "country"; in: string[]; not?: boolean }
-  | { on: "header"; name: string; op: "present" | "absent" | "is" | "contains"; value?: string }
+  | { on: "header"; name: string; op: "present" | "absent" }
+  | { on: "header"; name: string; op: "is"; hashes: string[] }
+  | { on: "header"; name: string; op: "contains"; value: string }
   | { on: "size"; op: "gt" | "lt"; bytes: number }
   | { on: "field"; path: string; op: "is" | "domain_is" | "one_of"; hashes: string[]; not?: boolean }
   | { on: "field"; path: string; op: "contains"; words: string; not?: boolean }
@@ -504,12 +506,17 @@ function parseCondition(raw: unknown, field: string): Condition {
     case "header": {
       const name = typeof raw.name === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(raw.name) ? raw.name.toLowerCase() : bad(`${field}.name`, "A header name is letters, digits, - or _.");
       const op = raw.op;
-      if (op !== "present" && op !== "absent" && op !== "is" && op !== "contains") return bad(`${field}.op`, "A header's op is present, absent, is or contains.");
-      if (op === "is" || op === "contains") {
+      if (op === "is") {
+        // Held as keyed hashes, as a field's `is` is (path `headers.<name>`): never the value.
+        if (raw.value !== undefined) return bad(`${field}.value`, "A header's is travels as keyed hashes (hashes over headers.<name>), as a field's does; the relay keeps no header value.");
+        return { on: "header", name, op, hashes: hashList(raw.hashes, `${field}.hashes`) };
+      }
+      if (op === "contains") {
         const value = typeof raw.value === "string" && raw.value.trim().length > 0 && raw.value.length <= 1000 ? raw.value.trim().toLowerCase() : bad(`${field}.value`, "A header condition needs a value.");
         return { on: "header", name, op, value };
       }
-      return { on: "header", name, op };
+      if (op === "present" || op === "absent") return { on: "header", name, op };
+      return bad(`${field}.op`, "A header's op is present, absent, is or contains.");
     }
     case "size": {
       if (raw.op !== "gt" && raw.op !== "lt") return bad(`${field}.op`, "A size's op is gt or lt.");
@@ -558,7 +565,8 @@ function parseCondition(raw: unknown, field: string): Condition {
   }
 }
 
-const needsWords = (c: Condition) => c.on === "field" && (c.op === "contains" || c.op === "pattern" || c.op === "similar_text");
+const needsWords = (c: Condition) =>
+  (c.on === "field" && (c.op === "contains" || c.op === "pattern" || c.op === "similar_text")) || (c.on === "header" && c.op === "contains");
 
 /** Reads a hook's screen as a device pushed it (`PUT /v1/hooks/<id>/screen`); throws `invalid`. */
 export function parseScreen(raw: unknown): EdgeScreen | null {
@@ -578,7 +586,7 @@ export function parseScreen(raw: unknown): EdgeScreen | null {
     }
     const conditions = r.conditions.map((c, j) => parseCondition(c, `${f}.conditions[${j}]`));
     if (!consent && conditions.some(needsWords)) {
-      return bad("screen.consent", "contains, pattern and similar_text rules make the relay read words; send consent.words to allow it.");
+      return bad("screen.consent", "contains (on a field or a header), pattern and similar_text rules make the relay read words; send consent.words to allow it.");
     }
     return { id, verdict, ...(r.any === true ? { any: true } : {}), conditions };
   });
@@ -597,6 +605,7 @@ type Check =
   | { on: "asn"; in: Set<number>; not: boolean }
   | { on: "country"; in: Set<string>; not: boolean }
   | { on: "header"; name: string; op: "present" | "absent" }
+  /** `plain`: a value stored before header values became hashes, until the screen is pushed again. */
   | { on: "header"; name: string; op: "is"; path: string; hashes: Set<string>; plain: string | null }
   | { on: "header"; name: string; op: "contains"; value: string }
   | { on: "size"; op: "gt" | "lt"; bytes: number }
@@ -636,8 +645,11 @@ export function compileScreen(screen: EdgeScreen): CompiledScreen {
       case "country":
         return { on: "country", in: new Set(c.in.map((x) => x.toUpperCase())), not };
       case "header":
-        if (c.op === "is") return { on: "header", name: c.name, op: "is", path: `headers.${c.name}`, hashes: new Set(), plain: c.value ?? null };
-        if (c.op === "contains") return { on: "header", name: c.name, op: "contains", value: c.value ?? "" };
+        if (c.op === "is") {
+          const legacy = (c as { value?: unknown }).value;
+          return { on: "header", name: c.name, op: "is", path: `headers.${c.name}`, hashes: new Set(c.hashes ?? []), plain: typeof legacy === "string" ? legacy : null };
+        }
+        if (c.op === "contains") return { on: "header", name: c.name, op: "contains", value: c.value };
         return { on: "header", name: c.name, op: c.op };
       case "size":
         return { on: "size", op: c.op, bytes: c.bytes };

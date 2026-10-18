@@ -191,11 +191,12 @@ describe("edge rules", () => {
   it("drop by address, network, country, header and size: 200 to the sender, nothing stored", async () => {
     const dev = await newAccount();
     const { hook } = await createHook(dev, { preset: "unverified" });
+    const k = await key(dev);
     const rules = [
       { id: "addr", verdict: "drop", conditions: [{ on: "ip", in: ["198.51.100.0/24"] }] },
       { id: "asn", verdict: "drop", conditions: [{ on: "asn", in: [64500] }] },
       { id: "country", verdict: "drop", conditions: [{ on: "country", in: ["xx"] }] },
-      { id: "header", verdict: "drop", conditions: [{ on: "header", name: "X-Kind", op: "is", value: "PROMO" }] },
+      { id: "header", verdict: "drop", conditions: [{ on: "header", name: "X-Kind", op: "is", hashes: [await keyedHash(k, "headers.x-kind", "promo")] }] },
       { id: "size", verdict: "drop", conditions: [{ on: "size", op: "gt", bytes: 2000 }] },
     ];
     expect((await setScreen(dev, hook.id, { rules })).status).toBe(200);
@@ -339,8 +340,9 @@ describe("the hold", () => {
   it("keeps a quarantined event aside, unstreamed, until it is released once", async () => {
     const dev = await newAccount();
     const { hook } = await createHook(dev, { preset: "unverified" });
+    const k = await key(dev);
     await setScreen(dev, hook.id, {
-      rules: [{ id: "doubtful", verdict: "quarantine", conditions: [{ on: "header", name: "x-kind", op: "is", value: "doubtful" }] }],
+      rules: [{ id: "doubtful", verdict: "quarantine", conditions: [{ on: "header", name: "x-kind", op: "is", hashes: [await keyedHash(k, "headers.x-kind", "doubtful")] }] }],
     });
     const { sse } = await openStream(dev);
     await sse.nextEvent(); // ready
@@ -442,11 +444,13 @@ describe("what /v1/info announces", () => {
 
 describe("parseScreen", () => {
   it("normalises what it keeps", () => {
-    const s = parseScreen({ rules: [{ id: "a", verdict: "drop", conditions: [{ on: "country", in: ["pt"] }, { on: "header", name: "X-A", op: "contains", value: " Foo " }] }] });
+    const s = parseScreen({ rules: [{ id: "a", verdict: "drop", conditions: [{ on: "country", in: ["pt"] }, { on: "header", name: "X-A", op: "contains", value: " Foo " }] }], consent: { words: true } });
     expect(s!.rules[0]!.conditions).toEqual([
       { on: "country", in: ["PT"] },
       { on: "header", name: "x-a", op: "contains", value: "foo" },
     ]);
-    expect(s!.consent.words).toBe(false);
+    // A header's contains reads words too.
+    expect(s!.consent.words).toBe(true);
+    expect(parseScreen({ rules: [{ id: "a", verdict: "drop", conditions: [{ on: "country", in: ["pt"] }] }], consent: { words: true } })!.consent.words).toBe(false);
   });
 });
