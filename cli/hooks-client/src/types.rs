@@ -332,6 +332,10 @@ pub struct Closed {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HookChange {
+    /// The account's change number: it only grows. The relay may send a change twice (at least
+    /// once), so a client hands over each `n` once; 0 (absent) is never deduplicated.
+    #[serde(default)]
+    pub n: u64,
     /// `hook.created`, `hook.rotated`, `hook.renamed` or `hook.deleted`; see [`HookChange::change`].
     pub kind: String,
     pub hook_id: String,
@@ -482,10 +486,11 @@ mod tests {
 
     #[test]
     fn hook_changes_read_every_kind_and_tolerate_new_ones() {
-        let raw = r#"{"kind":"hook.renamed","hookId":"hk_1","name":"billing",
+        let raw = r#"{"n":7,"kind":"hook.renamed","hookId":"hk_1","name":"billing",
             "previousName":"payments","actor":"key_9","at":1760000000000,"future":1}"#;
         let c: HookChange = serde_json::from_str(raw).unwrap();
         assert_eq!(c.change(), HookChangeKind::Renamed);
+        assert_eq!(c.n, 7);
         assert_eq!(c.previous_name.as_deref(), Some("payments"));
         assert_eq!(c.actor_words(), "API key key_9");
         assert!(!c.by_device("dev_1"));
@@ -502,6 +507,7 @@ mod tests {
             assert_eq!(c.change(), want);
             assert_eq!(c.actor_words(), "someone unknown");
             assert_eq!(c.name, None);
+            assert_eq!(c.n, 0, "no number: never deduplicated");
         }
         let c: HookChange = serde_json::from_str(
             r#"{"kind":"hook.rotated","hookId":"hk_1","name":"x","actor":"dev_1","at":1}"#,

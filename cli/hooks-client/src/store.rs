@@ -1,6 +1,7 @@
 //! The local state directory: the config, the stream cursor, the events recorded but not yet handed
-//! over (the inbox), the ids already handed over (the seen set), and the quarantine: `hook` messages
-//! that couldn't be read, kept raw so nothing the relay sent is silently lost.
+//! over (the inbox), the ids already handed over (the seen set), the quarantine: `hook` messages
+//! that couldn't be read, kept raw so nothing the relay sent is silently lost; and the highest hook
+//! change number handed over (`hook-changes.json`), since the relay may send a change twice.
 //!
 //! Every file is either replaced atomically (config, cursor) or appended and fsynced (inbox, seen).
 //! A crash can leave a torn last line in an append-only file; it is skipped on the next start, when
@@ -25,6 +26,8 @@ const CONFIG: &str = "config.json";
 const CURSOR: &str = "cursor.json";
 const INBOX: &str = "inbox.jsonl";
 const SEEN: &str = "seen.jsonl";
+/// `{"n": <the highest hook change number handed over>}`.
+const HOOK_CHANGES: &str = "hook-changes.json";
 /// Raw `hook` messages that couldn't be read. Append-only; never compacted or reset.
 pub const QUARANTINE: &str = "quarantine.jsonl";
 const LOCK: &str = "listen.lock";
@@ -110,7 +113,7 @@ impl StateDir {
 
     /// Forget the device and everything recorded (used when logging in again).
     pub fn reset(&self) -> Result<()> {
-        for name in [CONFIG, CURSOR, INBOX, SEEN] {
+        for name in [CONFIG, CURSOR, INBOX, SEEN, HOOK_CHANGES] {
             match std::fs::remove_file(self.dir.join(name)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
                 _ => {}
@@ -146,6 +149,11 @@ impl StateDir {
 #[derive(Debug)]
 pub struct ListenerLock {
     _file: File,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HookChangesFile {
+    n: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,6 +195,8 @@ pub struct EventStore {
     inbox_ids: HashSet<String>,
     inbox_file: File,
     seen_file: File,
+    /// The highest hook change number handed over.
+    hook_changes: u64,
 }
 
 /// Read a JSONL file, skipping lines that don't parse (a torn write at the end, after a crash).
@@ -223,7 +233,7 @@ fn sweep_temp_files(dir: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let ours = [CURSOR, INBOX, SEEN]
+        let ours = [CURSOR, INBOX, SEEN, HOOK_CHANGES]
             .iter()
             .any(|f| name.starts_with(&format!(".{f}.")) && name.ends_with(".tmp"));
         if ours && entry.file_type().is_ok_and(|t| t.is_file()) {
@@ -272,6 +282,13 @@ impl EventStore {
             Err(e) => return Err(e.into()),
         };
         let cursor = cursor_from_file.max(inbox.keys().next_back().copied().unwrap_or(0));
+        let hook_changes = match std::fs::read(dir.join(HOOK_CHANGES)) {
+            Ok(b) => serde_json::from_slice::<HookChangesFile>(&b)
+                .map(|c| c.n)
+                .unwrap_or(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
 
         Ok(EventStore {
             dir: dir.to_path_buf(),
@@ -281,7 +298,25 @@ impl EventStore {
             inbox_ids,
             inbox_file: fsutil::open_append(&dir.join(INBOX))?,
             seen_file: fsutil::open_append(&dir.join(SEEN))?,
+            hook_changes,
         })
+    }
+
+    /// The highest hook change number (`hook-change`'s `n`, PROTOCOL §6) handed over.
+    pub fn hook_changes_handled(&self) -> u64 {
+        self.hook_changes
+    }
+
+    /// Hook change `n` was handed over: a change numbered `n` or lower is a repeat. Never moves
+    /// back; written atomically.
+    pub fn mark_hook_change(&mut self, n: u64) -> Result<()> {
+        if n <= self.hook_changes {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&HookChangesFile { n }).expect("json");
+        fsutil::write_atomic(&self.dir.join(HOOK_CHANGES), &bytes, true)?;
+        self.hook_changes = n;
+        Ok(())
     }
 
     /// The highest seq recorded (or skipped by a gap): what `Last-Event-ID` resumes from.
@@ -382,6 +417,22 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hook_change_number_only_grows_survives_a_restart_and_is_reset_at_login() {
+        let dir = temp_dir("hookchanges");
+        let state = StateDir::open(&dir).unwrap();
+        let mut s = state.open_events().unwrap();
+        assert_eq!(s.hook_changes_handled(), 0);
+        s.mark_hook_change(7).unwrap();
+        s.mark_hook_change(3).unwrap();
+        assert_eq!(s.hook_changes_handled(), 7);
+        drop(s);
+        assert_eq!(state.open_events().unwrap().hook_changes_handled(), 7);
+        state.reset().unwrap();
+        assert_eq!(state.open_events().unwrap().hook_changes_handled(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use crate::fsutil::temp_dir;
 
     pub(crate) fn event(seq: u64) -> Event {

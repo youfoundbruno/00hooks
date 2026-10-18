@@ -18,6 +18,10 @@
 //!
 //! A `hook-change` message (a hook created, rotated, renamed or deleted) is handed over in stream
 //! order as [`StreamEvent::HookChange`]; it has no seq, so it is neither recorded nor acknowledged.
+//! The relay sends each change at least once (again after a reconnect), so each change number `n`
+//! is handed over once: the highest one handed over is kept in the store, and a repeat is skipped.
+//! It is marked as it is handed over (with [`SubscribeOptions::confirm`] too): a crash in between
+//! loses that one warning, never repeats it.
 //!
 //! An acknowledgement that fails is kept and retried with backoff while newer events keep flowing
 //! (acks are cumulative, so the next one covers it too). A `hook` message that can't be read is
@@ -282,6 +286,16 @@ impl Subscription {
         loop {
             // 1. Hand over what is ready, skipping ids handed over before.
             if let Some(ev) = self.out.pop_front() {
+                if let StreamEvent::HookChange(c) = &ev
+                    && c.n > 0
+                {
+                    if c.n <= self.store.hook_changes_handled() {
+                        continue;
+                    }
+                    if let Err(err) = self.store.mark_hook_change(c.n) {
+                        return self.fail(err);
+                    }
+                }
                 if let StreamEvent::Hook(e) = &ev {
                     if self.store.is_seen(&e.id) {
                         continue;

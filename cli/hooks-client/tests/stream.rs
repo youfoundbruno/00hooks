@@ -700,19 +700,24 @@ async fn a_next_cancelled_during_an_ack_loses_neither_the_ack_nor_the_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hook_changes_are_handed_over_in_order_and_never_recorded_or_acknowledged() {
+async fn hook_changes_are_handed_over_in_order_once_each_and_never_recorded_or_acknowledged() {
     let relay = MockRelay::start().await;
     relay.push_events(1..=2);
     relay.with(|s| {
         s.hook_changes.push(serde_json::json!({
-            "kind": "hook.created", "hookId": "hk_2", "name": "payments",
+            "n": 1, "kind": "hook.created", "hookId": "hk_2", "name": "payments",
             "actor": "key_1", "at": 1760000000000i64
         }));
         // Unreadable data is reported, never fatal.
         s.hook_changes
             .push(serde_json::json!({ "kind": "hook.created" }));
         s.hook_changes.push(serde_json::json!({
-            "kind": "hook.future", "hookId": "hk_2", "name": "payments", "at": 1
+            "n": 3, "kind": "hook.future", "hookId": "hk_2", "name": "payments", "at": 1
+        }));
+        // The same change again (delivery is at least once): handed over once.
+        s.hook_changes.push(serde_json::json!({
+            "n": 1, "kind": "hook.created", "hookId": "hk_2", "name": "payments",
+            "actor": "key_1", "at": 1760000000000i64
         }));
     });
     let (client, state, _home, _) = sealed_device(&relay, "hookchange").await;
@@ -749,7 +754,7 @@ async fn hook_changes_are_handed_over_in_order_and_never_recorded_or_acknowledge
     // A live one, while events flow on.
     relay.with(|s| {
         s.hook_changes.push(serde_json::json!({
-            "kind": "hook.rotated", "hookId": "hk_1", "name": "github",
+            "n": 4, "kind": "hook.rotated", "hookId": "hk_1", "name": "github",
             "actor": "dev_9", "at": 1760000000001i64
         }))
     });
@@ -775,13 +780,26 @@ async fn hook_changes_are_handed_over_in_order_and_never_recorded_or_acknowledge
         assert!(s.violations.is_empty(), "{:?}", s.violations);
     });
 
-    // Sent at most once per device: a new stream doesn't repeat them.
+    assert_eq!(sub.store().hook_changes_handled(), 4);
+
+    // The relay sends every change again on the next stream (as it may after a stream that went
+    // away unnoticed): the numbers handed over, kept in the state dir, skip them. A change without
+    // a number is never skipped.
     drop(sub);
     relay.push_events(3..=3);
+    relay.with(|s| {
+        s.hook_changes_sent.clear();
+        s.hook_changes
+            .push(serde_json::json!({ "kind": "hook.deleted", "hookId": "hk_2" }));
+    });
     let mut sub = subscribe(client, state.open_events().unwrap(), fast());
     let evs = read_hooks(&mut sub, 1).await;
-    assert!(
-        !evs.iter().any(|e| matches!(e, StreamEvent::HookChange(_))),
-        "{evs:?}"
-    );
+    let again: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::HookChange(c) => Some(c.kind.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(again, vec!["hook.deleted"], "{evs:?}");
 }

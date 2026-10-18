@@ -428,7 +428,7 @@ automations:
     // The runner resolves the name, pins it, and says a secret rotated by an API key.
     relay.with(|s| {
         s.hook_changes.push(serde_json::json!({
-            "kind": "hook.rotated", "hookId": "hk_1", "name": "ci", "actor": "key_1",
+            "n": 1, "kind": "hook.rotated", "hookId": "hk_1", "name": "ci", "actor": "key_1",
             "at": 1792233600000i64
         }))
     });

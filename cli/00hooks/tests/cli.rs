@@ -193,7 +193,7 @@ async fn login_create_a_hook_listen_and_doctor() {
     // A hook change (PROTOCOL §6) is a line on stderr, before the backlog.
     relay.with(|s| {
         s.hook_changes.push(serde_json::json!({
-            "kind": "hook.rotated", "hookId": "hk_1", "name": "ci", "actor": "key_1",
+            "n": 1, "kind": "hook.rotated", "hookId": "hk_1", "name": "ci", "actor": "key_1",
             "at": 1792233600000i64
         }))
     });

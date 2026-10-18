@@ -99,7 +99,8 @@ pub struct State {
     /// signups are open, as a relay that misreports would).
     pub signup_token: Option<String>,
     /// `hook-change` messages (PROTOCOL §6), in order: each device's stream sends the ones it
-    /// hasn't been sent yet after `ready`, then live ones, without an `id:`.
+    /// hasn't been sent yet after `ready`, then live ones, without an `id:`. Clearing
+    /// `hook_changes_sent` sends them all again, as the relay may (delivery is at least once).
     pub hook_changes: Vec<Value>,
     /// How many of `hook_changes` each device has been sent.
     pub hook_changes_sent: HashMap<String, usize>,
