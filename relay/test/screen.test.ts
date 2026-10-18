@@ -10,7 +10,9 @@ import screenVectors from "../../fixtures/screen.v1.json";
 import type { AccountObject } from "../src/account-object.ts";
 import { fromBase64, hmac, toHex, utf8 } from "../src/encoding.ts";
 import { hostedExtras } from "../src/held.ts";
+import { codePoints, compilePattern, patternWeight } from "../src/screen-pattern.ts";
 import {
+  EDGE_PATTERN_INPUT,
   decodeSignature,
   domainOf,
   domainSuffixes,
@@ -122,7 +124,16 @@ describe("the shared vectors", () => {
       expect(n).toBe(h.normalised);
       expect(await keyedHash(k, h.path, n)).toBe(h.hash);
     }
-    for (const p of screenVectors.edgePatterns) expect(edgeSafePattern(p.pattern), p.pattern).toBe(p.edge);
+    for (const p of screenVectors.edgePatterns) {
+      expect(edgeSafePattern(p.pattern), p.pattern).toBe(p.edge);
+      if (p.edge) expect(patternWeight(p.pattern), p.pattern).toBe(p.weight);
+    }
+    // What the harness's regex crate says an edge pattern matches (over the first 2,048
+    // characters), the relay's linear-time matcher says too.
+    const steps = { step: () => {} };
+    for (const m of screenVectors.edgeMatches) {
+      expect(compilePattern(m.pattern).test(codePoints(m.value, EDGE_PATTERN_INPUT), steps), `${m.pattern} on ${m.value.slice(0, 40)}`).toBe(m.matches);
+    }
   });
 });
 
@@ -135,7 +146,7 @@ describe("pushing a screen", () => {
     const refused = await setScreen(dev, hook.id, { rules: [words] });
     expect(refused.status).toBe(400);
     expect(await refused.json()).toMatchObject({ field: "screen.consent" });
-    expect((await setScreen(dev, hook.id, { rules: [{ id: "p", verdict: "drop", conditions: [{ on: "field", path: "payload.t", op: "pattern", pattern: "(a+)+$" }] }], consent: { words: true } })).status).toBe(400);
+    expect((await setScreen(dev, hook.id, { rules: [{ id: "p", verdict: "drop", conditions: [{ on: "field", path: "payload.t", op: "pattern", pattern: "(\\w)\\1" }] }], consent: { words: true } })).status).toBe(400);
     expect((await setScreen(dev, hook.id, { rules: [{ id: "x", verdict: "maybe", conditions: [{ on: "size", op: "gt", bytes: 1 }] }] })).status).toBe(400);
     expect((await setScreen(dev, hook.id, { rules: [{ id: "x", verdict: "drop", conditions: [{ on: "ip", in: ["10.0.0.0/33"] }] }] })).status).toBe(400);
     const tooMany = Array.from({ length: 201 }, (_, i) => ({ id: `r${i}`, verdict: "drop", conditions: [{ on: "size", op: "gt", bytes: 1 }] }));

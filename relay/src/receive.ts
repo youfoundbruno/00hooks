@@ -5,8 +5,8 @@ import { accountStub } from "./auth.ts";
 import { isId, newId } from "./encoding.ts";
 import { error, json, notFound, readLimited, tooLarge, unavailable } from "./http.ts";
 import { constantTimeEqualStrings } from "./encoding.ts";
-import { currentSecrets, offlineNoticeOf, screenOf, verifyTokenHash, type HookRow } from "./hooks.ts";
-import { decide, screenKey } from "./screen.ts";
+import { currentSecrets, offlineNoticeOf, verifyTokenHash, type HookRow } from "./hooks.ts";
+import { decide, screenCryptoKey, screenFor } from "./screen.ts";
 import type { Origin } from "./envelope.ts";
 import { clientKey } from "./ip.ts";
 import { pepperedHash } from "./seal.ts";
@@ -75,7 +75,8 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   // The screen (PROTOCOL §4b), after the signature (a forgery keeps its 401) and before anything is
   // stored. A drop is answered as a delivery would be, with an id that names nothing, so a sender
   // can't tell; a hold is stored aside and not streamed until a device releases it.
-  const screen = screenOf(hook);
+  // Compiled once per isolate, keyed by the hook and its screen's JSON; the key is imported once.
+  const screen = await screenFor(hook.id, hook.screen);
   let held: string | undefined;
   if (screen && screen.rules.length > 0) {
     const verdict = await decide(screen, {
@@ -86,7 +87,7 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
       body,
       contentType: request.headers.get("content-type"),
       strict,
-      key: await screenKey(env.HASH_PEPPER, hook.account_id),
+      key: await screenCryptoKey(env.HASH_PEPPER, hook.account_id),
     });
     if (verdict?.verdict === "drop") {
       ctx.waitUntil(stub.countAudit("screen.dropped", hookId, hook.name).catch(() => {}));

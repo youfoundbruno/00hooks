@@ -8,12 +8,16 @@
 //!   value.
 //! - `contains`, `pattern` and `similar text` need the relay to read the words: they go only when
 //!   the person agreed (`words`), and the payload says so (`consent.words`). A pattern must also be
-//!   one the relay's engine runs safely ([`crate::fields::edge_safe_pattern`]).
+//!   in the subset the relay's linear-time matcher takes ([`crate::fields::edge_pattern_weight`]),
+//!   and the different patterns of one hook weigh at most [`crate::fields::EDGE_MAX_SCREEN_WEIGHT`]
+//!   together.
 //! - Whether the sender is known is the harness's alone: a rule using it stays home.
 
 use serde_json::{Value, json};
 
-use crate::fields::{self, domain_of, fold, keyed_hash};
+use std::collections::BTreeMap;
+
+use crate::fields::{self, EDGE_MAX_SCREEN_WEIGHT, domain_of, fold, keyed_hash};
 use crate::rules::{Condition, FieldOp, Rule};
 use crate::{SourceKind, now_ms};
 
@@ -96,6 +100,8 @@ pub fn export(rules: &[Rule], hook_id: &str, key: &[u8], words: bool, expiry_day
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     let mut needs_words = false;
+    // The different patterns sent so far, and what they weigh together.
+    let mut patterns: BTreeMap<String, u32> = BTreeMap::new();
     for r in rules {
         if !r.edge
             || !r.enabled
@@ -118,6 +124,28 @@ pub fn export(rules: &[Rule], hook_id: &str, key: &[u8], words: bool, expiry_day
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(conds) => {
+                let mut more = patterns.clone();
+                for c in &r.conditions {
+                    if let Condition::Field {
+                        op: FieldOp::Pattern,
+                        value: Some(p),
+                        ..
+                    } = c
+                        && let Ok(w) = fields::edge_pattern_weight(p)
+                    {
+                        more.insert(p.clone(), w);
+                    }
+                }
+                if more.values().sum::<u32>() > EDGE_MAX_SCREEN_WEIGHT {
+                    skipped.push((
+                        r.name.clone(),
+                        format!(
+                            "the relay takes patterns weighing at most {EDGE_MAX_SCREEN_WEIGHT} a hook together"
+                        ),
+                    ));
+                    continue;
+                }
+                patterns = more;
                 needs_words |= r.needs_words();
                 let mut v = json!({"id": r.id, "verdict": r.verdict, "conditions": conds});
                 if r.any {
@@ -131,5 +159,46 @@ pub fn export(rules: &[Rule], hook_id: &str, key: &[u8], words: bool, expiry_day
     Export {
         screen: json!({"rules": out, "consent": {"words": needs_words}}),
         skipped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rule(id: &str, conditions: Value) -> Rule {
+        serde_json::from_value(json!({
+            "id": id, "name": id, "verdict": "drop", "conditions": conditions, "edge": true
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn patterns_go_within_the_subset_and_the_screens_weight() {
+        let key = [7u8; 32];
+        let pattern = |id: &str, p: &str| {
+            rule(
+                id,
+                json!([{"on": "field", "path": "payload.t", "op": "pattern", "value": p}]),
+            )
+        };
+        let mut rules: Vec<Rule> = (0..20)
+            .map(|i| pattern(&format!("p{i}"), &format!(r"\w{{200}}{i}")))
+            .collect();
+        // The same pattern again costs nothing more.
+        rules.push(pattern("again", r"\w{200}0"));
+        rules.push(pattern("backref", r"(\w)\1"));
+        let out = export(&rules, "hk_x", &key, true, 90);
+        let sent: Vec<&str> = out.screen["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(sent.len(), 20);
+        assert!(sent.contains(&"again") && !sent.contains(&"p19"));
+        let skipped: Vec<&str> = out.skipped.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(skipped, ["p19", "backref"]);
     }
 }
