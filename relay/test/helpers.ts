@@ -247,7 +247,7 @@ export function phoneObject(accountId: string): DurableObjectStub<PhoneObject> {
 
 const sha256 = async (b: Uint8Array<ArrayBuffer>) => new Uint8Array(await crypto.subtle.digest("SHA-256", b));
 
-/** What a node makes for "Add a phone" (00next docs/phone.md §3.1): the secret never reaches the relay. */
+/** What a node makes for "Add a phone" (PROTOCOL §10.1): the secret never reaches the relay. */
 export interface TestPairing {
   secret: Uint8Array;
   pairingId: string;
@@ -437,7 +437,7 @@ export async function openPhoneSocket(dev: DeviceKey): Promise<PhoneSocket> {
   return new PhoneSocket(res.webSocket!);
 }
 
-/** A phone envelope (00next docs/phone.md §4.1), sealed to `to`'s key and signed by `from`. */
+/** A phone envelope (PROTOCOL §10.4), sealed to `to`'s key and signed by `from`. */
 export async function makeEnvelope(
   from: DeviceKey,
   to: { deviceId: string; sealKey: SealPair },
