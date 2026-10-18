@@ -32,56 +32,117 @@ From the repository root (a pnpm workspace; `pnpm install` once):
 
 ```sh
 cp relay/.dev.vars.example relay/.dev.vars    # then fill in the three secrets
-pnpm --filter ./relay exec wrangler d1 migrations apply 00hooks --local
-pnpm --filter ./relay dev                     # http://localhost:8787, all local
+pnpm --filter ./relay dev                     # applies the D1 migrations locally, then serves
+                                              # http://localhost:8787, all local
 pnpm --filter ./relay test                    # vitest inside workerd (Miniflare)
 pnpm --filter ./relay typecheck
 pnpm check                                    # everything a change must pass
 ```
 
-The tests run the real Worker, Durable Object (SQLite storage, alarms, hibernatable WebSockets), D1
-and Rate Limiting binding in workerd. After changing `wrangler.jsonc`, regenerate the binding types
-with `pnpm --filter ./relay types`.
+To create accounts on a local relay, put `SIGNUP_TOKEN` (or `OPEN_SIGNUP=1`) in `.dev.vars`
+(see "Settings" below).
+
+The tests run the real Worker, Durable Objects (SQLite storage, alarms, hibernatable WebSockets),
+D1 and Rate Limiting bindings in workerd. After changing `wrangler.jsonc`, regenerate the binding
+types with `pnpm --filter ./relay types`.
 
 ## Self-hosting
 
 You need a Cloudflare account on the Workers Paid plan (Durable Objects with SQLite storage and the
-Rate Limiting binding). In `relay/`:
+Rate Limiting binding) and `wrangler` (a dev dependency of `relay/`: run it with
+`pnpm --filter ./relay exec wrangler …`, or from `relay/` with `pnpm exec wrangler …`).
 
-1. `wrangler d1 create 00hooks`, and put the database id in `wrangler.jsonc`.
-2. `wrangler d1 migrations apply 00hooks --remote`.
-3. Set the secrets with `wrangler secret put <NAME>`:
+The tracked `wrangler.jsonc` holds placeholder ids for development and tests. Don't edit it for a
+deployment. Keep your account's ids in a copy that git ignores:
+
+1. In `relay/`, copy the config: `cp wrangler.jsonc wrangler.deploy.jsonc`
+   (`relay/wrangler.deploy.jsonc` is in `.gitignore`).
+2. Create the database, `wrangler d1 create 00hooks`, and put its id in `wrangler.deploy.jsonc`
+   (`d1_databases[0].database_id`).
+3. Give each Rate Limiting binding a `namespace_id` of your own (a positive integer, as a string).
+   Each `namespace_id` must be unique within your Cloudflare account: two Workers, or two bindings,
+   that share one share its counters.
+4. Set your variables in its `vars` (see "Settings").
+5. Set the secrets with `wrangler secret put <NAME> -c wrangler.deploy.jsonc`:
 
    | Name | What | Example |
    |---|---|---|
    | `SECRETS_KEY` | AES-256-GCM key sealing hook signing secrets at rest: 32 random bytes, base64 | `openssl rand -base64 32` |
    | `HASH_PEPPER` | HMAC key for enrolment-code, client-IP, dedupe-mark and API-key hashes | `openssl rand -base64 32` |
    | `RELAY_SIGNING_KEY` | Ed25519 seed (32 bytes, base64) signing every sealed envelope. Its public half is `/v1/info`'s `relayKey`, which clients pin at login: changing it makes every device log in again. Without it the relay takes no deliveries | `openssl rand -base64 32` |
-   | `SIGNUP_TOKEN` | Optional. When set, creating an account needs `Authorization: Bearer <token>`. Without it, anyone can sign up: development only (`/v1/info` reports `signupOpen`) | `openssl rand -base64 24` |
+   | `SIGNUP_TOKEN` | Creating an account needs `Authorization: Bearer <token>`. The relay refuses every signup unless this is set or `OPEN_SIGNUP=1` is (`/v1/info` reports `signupOpen`) | `openssl rand -base64 24` |
 
-4. `wrangler deploy`.
+6. Apply the migrations, then deploy:
 
-Bindings (all in `wrangler.jsonc`): `ACCOUNT` (the `AccountObject` Durable Object, SQLite-backed),
-`PHONE` (the `PhoneObject` Durable Object, SQLite-backed, added by the migration tag `v2`: the phone
-links' queue and sockets, one per account),
-`DB` (D1: accounts, devices, hooks with their sealed secrets, enrolments, and the routing from a
-hook id to its account), and four Rate Limiting bindings: `HOOK_LIMIT` (60 deliveries per 10 s per
-hook), `RECEIVE_IP_LIMIT` (600 deliveries per 10 s per client address, checked before the hook
-lookup), `REDEEM_IP_LIMIT` and `REDEEM_GLOBAL_LIMIT` (enrolment redemptions: 10 a minute per address,
-300 a minute in all), and `PAIR_IP_LIMIT` (phone pairing attempts: 10 a minute per address). The
-relay answers `503` rather than run without them. Variables:
-`RETENTION_DAYS` (default 7), how long unacknowledged events are kept; `ACCOUNT_MAX_EVENTS` (10,000)
-and `ACCOUNT_MAX_BYTES` (256 MiB), how much one account's log may hold before deliveries get `429`
-`quota`; `PHONE_NODE_QUEUE_MAX` (1,000), `PHONE_PHONE_QUEUE_MAX` (500) and `PHONE_QUEUE_MAX_BYTES`
-(16 MiB), optional, how much a phone link's queue may hold (PROTOCOL §10.5).
+   ```sh
+   wrangler d1 migrations apply DB --remote -c wrangler.deploy.jsonc
+   wrangler deploy -c wrangler.deploy.jsonc
+   ```
 
-**Upgrading a relay deployed before phone links**: apply the D1 migration `0005_phone.sql`
-(`wrangler d1 migrations apply 00hooks --remote`) before deploying, and copy into your own deploy
-config the `PHONE` Durable Object binding, the `v2` migration (`new_sqlite_classes: ["PhoneObject"]`)
-and the `PAIR_IP_LIMIT` rate limit from `wrangler.jsonc`. Without the binding, pairing answers
-`503`.
+**Upgrading**: before each deploy, compare your `wrangler.deploy.jsonc` with `wrangler.jsonc` and
+copy in what is new (bindings, Durable Object migrations, rate limits, the cron trigger), keeping
+your own ids. Then apply the D1 migrations (`wrangler d1 migrations apply DB --remote -c
+wrangler.deploy.jsonc`), and only then deploy: new code may need the new tables. The migrations:
+
+| Migration | What |
+|---|---|
+| `0001_init.sql` | accounts, devices, hooks, enrolments |
+| `0002_phase1.sql` | sealing keys, API keys |
+| `0003_channels.sql` | Meta's verify token, offline notices |
+| `0004_screen.sql` | the screen's rules |
+| `0005_phone.sql` | phone links; needs the `PHONE` Durable Object binding, its `v2` migration and `PAIR_IP_LIMIT` |
+| `0006_…` | hook names unique within an account |
+| `0007_…` (when present) | phone hardening |
 
 Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
+
+### Bindings
+
+All in `wrangler.jsonc`:
+
+- `ACCOUNT`: the `AccountObject` Durable Object, SQLite-backed, one per account: the event log,
+  cursors, nonces and dedupe marks.
+- `PHONE`: the `PhoneObject` Durable Object, SQLite-backed, one per account, added by the migration
+  tag `v2`: the phone links' queue and sockets.
+- `DB`: D1. Accounts, devices, hooks with their sealed secrets, enrolments, API keys, the audit, and
+  the routing from a hook id to its account.
+- Eight Rate Limiting bindings. The relay answers `503` rather than run without them.
+
+  | Binding | `namespace_id` in `wrangler.jsonc` | Limits |
+  |---|---|---|
+  | `HOOK_LIMIT` | 1001 | deliveries per hook: 60 per 10 s |
+  | `RECEIVE_IP_LIMIT` | 1002 | deliveries per client address: 600 per 10 s, checked before the hook lookup |
+  | `REDEEM_IP_LIMIT` | 1003 | enrolment redemptions per address: 10 a minute |
+  | `REDEEM_GLOBAL_LIMIT` | 1004 | enrolment redemptions in all: 300 a minute |
+  | `PAIR_IP_LIMIT` | 1005 | phone pairing attempts per address: 10 a minute |
+  | `SIGNUP_IP_LIMIT` | 1006 | account creations per address, per minute |
+  | `API_IP_LIMIT` | 1007 | management requests (`/v1/*`) per address, per 10 s, checked before any database read |
+  | `PAIR_GLOBAL_LIMIT` | 1008 | phone pairing attempts in all, per minute |
+
+  Addresses are counted by IPv4 address or IPv6 /64. Cloudflare counts Rate Limiting per location
+  (data centre), and the counts are eventually consistent: a limit "in all" is per location, not
+  for the whole relay. The exact quotas below are counted in the Durable Object.
+- A daily cron trigger (`triggers.crons`) prunes expired D1 rows.
+- `observability`: invocation logs are off, so request URLs and their query strings (Meta's
+  `hub.verify_token`, for one) are not logged.
+
+### Settings
+
+Variables (`vars`), all optional unless noted:
+
+| Name | Default | What |
+|---|---|---|
+| `OPEN_SIGNUP` | unset | `1` lets anyone create an account without `SIGNUP_TOKEN`. Set it only on purpose: for local development, or a relay meant to be open |
+| `RETENTION_DAYS` | 7 | how long unacknowledged events are kept |
+| `ACCOUNT_MAX_EVENTS`, `ACCOUNT_MAX_BYTES` | 10,000, 256 MiB | how much one account's log may hold before deliveries get `429` `quota` (events waiting for an acknowledgement; bytes of bodies and headers) |
+| `HOOK_MAX_EVENTS`, `HOOK_MAX_BYTES` | half the account's | how much of the account's log one hook may hold |
+| `UNCHECKED_HOOK_MAX_EVENTS`, `UNCHECKED_HOOK_MAX_BYTES` | 1/16 of the account's | the same for strict and unverified hooks, whose deliveries the relay can't fully check |
+| `HELD_MAX_EVENTS`, `HELD_MAX_BYTES` | 200, 16 MiB per hook | how many events the screen may hold for review (quarantine). Held events have this quota of their own and don't count against the log's |
+| `SCREEN_HELD_DAYS` | 7 | how long the screen holds an event before dropping it (PROTOCOL §4b) |
+| `REPLAY_MARK_DAYS` | 180 | how long body-hash replay marks are kept for presets that sign no timestamp. After that, a captured body is accepted again as a new event (see PLAN §3.1) |
+| `ACCOUNT_MAX_DEVICES` | 10 | node devices per account |
+| `PHONE_NODE_QUEUE_MAX`, `PHONE_PHONE_QUEUE_MAX`, `PHONE_QUEUE_MAX_BYTES` | 1,000, 500, 16 MiB | how much a phone link's queue may hold (PROTOCOL §10.5) |
+| `HOSTED_EXTRAS` | unset | extras the operator offers, as JSON, announced as data in `/v1/info` `extras` (PROTOCOL §2). A self-hosted relay leaves it unset |
 
 ## Security notes
 
@@ -98,19 +159,23 @@ Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](do
   Rate Limiting bindings cap attempts per address and in all.
 - **Hook secrets** are generated from 32 random bytes, shown once (create or rotate), and stored
   sealed with AES-256-GCM under `SECRETS_KEY`, with the hook id as associated data. Rotation keeps
-  the previous secret valid for 24 hours. A secret you supply is never echoed back.
+  the previous secret valid for 24 hours. A secret you supply is never echoed back. Creating a hook
+  with a relay-generated secret, or rotating one, needs a device signature or an API key with the
+  `hooks:secrets` scope: `hooks:write` alone can't obtain a secret.
 - **Verification** runs over the raw bytes before anything is parsed, with constant-time
   comparisons, and checks every valid secret, not just until one matches. Failures answer `401`
   `signature` and are counted, never stored.
 - **Replays**: GitHub deliveries dedupe on `X-GitHub-Delivery` and, since that header isn't signed,
   always on the body hash too (so a captured body can't come back under a new delivery id);
   Standard Webhooks on `webhook-id` within a 300 s timestamp window, generic HMAC on the body hash.
+  Marks for presets that sign no timestamp are kept `REPLAY_MARK_DAYS` (180 days by default).
   The dedupe marks are written in the same Durable Object transaction as the event, so a crash
   can't lose an event that was marked. GitHub's `eventType` (`X-GitHub-Event`) is the sender's
   claim: PROTOCOL §3 lists what each preset signs.
 - **Limits**: bodies are checked against the hook's limit (1 MiB by default) from `Content-Length`
-  and again while streaming; each client address and each hook is rate limited at the edge; each
-  account's log has a quota.
+  and again while streaming; each client address and each hook is rate limited at the edge, and so
+  are signups, management requests and pairing attempts; each account's log has a quota, each hook
+  a share of it, and held events a quota of their own.
 - **What's kept**: only an allowlist of headers per preset (event and delivery headers,
   `content-type`, `user-agent`), never `cookie`, `authorization` or a signature or token header.
   Enrolment codes, client IPs, dedupe marks and API keys are stored only as HMACs under
@@ -123,7 +188,8 @@ Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](do
 - **Strict hooks** keep the provider's secret on the devices: the relay checks only the header's
   shape and timestamp, and the devices verify the signature (PROTOCOL §3).
 - **API keys** (`hk_…`) are scoped, expire, are shown once, and can never stream, acknowledge,
-  enrol a device, set a sealing key or create keys. The audit log records hooks, devices and keys,
+  enrol a device, set a sealing key or create keys. Only the `hooks:secrets` scope lets one obtain a
+  hook secret. The audit log records hooks, devices and keys,
   and counts key uses and verification failures per hour.
 - **Phone links** (PROTOCOL §10): the relay routes sealed envelopes between a node and its phones
   and never opens them; it keeps a pairing only as a verifier of its proof (spent once, atomically),

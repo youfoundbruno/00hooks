@@ -15,8 +15,13 @@ We aim to acknowledge reports within three working days and to share a fix timel
 
 Of particular interest:
 - getting an event accepted for a hook without its signing secret;
-- reading another account's events, or any event payload as the relay operator when end-to-end
-  sealing is on;
+- reading another account's events, or any event payload as the relay operator (events are always
+  sealed to the account's devices);
 - replaying an old event so it runs again;
 - making the CLI run something an automation didn't allow, from a payload;
-- reading an API key, hook secret or device key from storage, logs or errors.
+- reading an API key, hook secret or device key from storage, logs or errors;
+- obtaining a hook secret with an API key that lacks the `hooks:secrets` scope (`hooks:write` alone
+  can't create a hook with a relay-generated secret or rotate one; a device signature or
+  `hooks:secrets` is needed).
+
+The security model is [`docs/PLAN.md`](docs/PLAN.md) §4.
