@@ -1,11 +1,11 @@
 //! The runner: one event in, a run record out. See the crate docs for the steps.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use hooks_client::Event;
+use hooks_client::{Event, HookChange, HookChangeKind};
 use hooks_screen::{Screen, SourceKind, Verdict};
 use serde_json::{Value, json};
 
@@ -13,11 +13,13 @@ use crate::actions::{self, Failure, Notifier, NullNotifier, SystemNotifier};
 use crate::ask::{AskRequest, Asker};
 use crate::catalogue::{Catalogue, Observation};
 use crate::config::{
-    Action, ActionKind, Automation, Automations, NotifyMode, Trigger, describe_rate, hook_matches,
+    Action, ActionKind, Automation, Automations, NotifyMode, Trigger, describe_rate,
 };
+use crate::hookrefs::{self, HookRefs, Pin, Pins};
 use crate::runs::{ActionResult, AutomationRun, RunLog, RunRecord, RunStatus};
 use crate::secrets::SecretStore;
 use crate::state::{Admit, Breaker, States};
+use crate::text::sanitize;
 use crate::{Error, HOP_HEADER, ORIGIN_HEADER, Result, context, now_ms};
 
 /// Events beyond this many hops are dropped as a loop.
@@ -77,7 +79,14 @@ pub struct Runner {
     runs: RunLog,
     states: States,
     http: reqwest::Client,
+    /// Hook names by id, from the relay (cached in `hooks.json`).
     names: BTreeMap<String, String>,
+    /// The automations' hook references, resolved to ids: matching is by id only.
+    refs: HookRefs,
+    /// Names pinned to ids (`hook-pins.json`).
+    pins: Pins,
+    /// What resolving the references last reported, so each problem is said once.
+    told: BTreeSet<String>,
     catch_up: Option<CatchUp>,
     log: Vec<String>,
 }
@@ -128,6 +137,9 @@ impl Runner {
             states: States::open(&opts.dir)?,
             http: actions::call::http_client(),
             names: load_names(&opts.dir),
+            refs: HookRefs::default(),
+            pins: Pins::new(),
+            told: BTreeSet::new(),
             catch_up: None,
             log: Vec::new(),
             config,
@@ -140,6 +152,7 @@ impl Runner {
                 rec.run, rec.event_id, rec.event_id
             ));
         }
+        r.resolve_hooks();
         r.apply_structure_only()?;
         Ok(r)
     }
@@ -151,6 +164,7 @@ impl Runner {
     /// Replace the automations (a host that keeps them as data).
     pub fn set_automations(&mut self, automations: Automations) {
         self.config = automations;
+        self.resolve_hooks();
         if let Err(e) = self.apply_structure_only() {
             self.say(format!("Couldn't apply structure_only: {e}"));
         }
@@ -203,13 +217,15 @@ impl Runner {
         let _ = tokio::task::spawn_blocking(move || n.notify(&title, &body)).await;
     }
 
-    /// Hook names by id (from the relay); cached on disk.
+    /// Hook names by id (from the relay); cached on disk. The automations' hook names are resolved
+    /// again: a name not pinned yet may resolve now; a pinned one keeps its id ([`hookrefs`]).
     pub fn set_hook_names(&mut self, names: BTreeMap<String, String>) -> Result<()> {
         if names != self.names {
             let bytes = serde_json::to_vec_pretty(&names).expect("json");
             hooks_client::fsutil::write_atomic(&self.opts.dir.join("hooks.json"), &bytes, true)
                 .map_err(Error::from_client)?;
             self.names = names;
+            self.resolve_hooks();
             self.apply_structure_only()?;
         }
         Ok(())
@@ -219,12 +235,75 @@ impl Runner {
         &self.names
     }
 
+    /// The automations' hook references, resolved to ids.
+    pub fn hook_refs(&self) -> &HookRefs {
+        &self.refs
+    }
+
+    /// Resolve the automations' hook references against the names and the pins, pin the names
+    /// resolved for the first time, and say what doesn't resolve (once each).
+    fn resolve_hooks(&mut self) {
+        let mut messages: Vec<String> = Vec::new();
+        let pins_ok = match hookrefs::load_pins(&self.opts.dir) {
+            Ok(p) => {
+                self.pins = p;
+                true
+            }
+            Err(e) => {
+                messages.push(format!(
+                    "{e}. Until it is fixed or removed, hook names in the automations resolve \
+                     only to the ids pinned before, and nothing new is pinned (ids still match)."
+                ));
+                false
+            }
+        };
+        let mut r = hookrefs::resolve(&self.config, &self.names, &self.pins);
+        if pins_ok && !r.new_pins.is_empty() {
+            let at = now_ms();
+            for (name, id) in &r.new_pins {
+                self.pins.insert(name.clone(), Pin { id: id.clone(), at });
+            }
+            match hookrefs::save_pins(&self.opts.dir, &self.pins) {
+                Ok(()) => {
+                    for (name, id) in &r.new_pins {
+                        self.say(format!(
+                            "Pinned the hook name {:?} to {id}: the automations follow this hook \
+                             by its id, whatever it is called later.",
+                            sanitize(name)
+                        ));
+                    }
+                }
+                Err(e) => messages.push(format!(
+                    "Couldn't record the hook names' ids ({e}); they are used for now and \
+                     resolved again on the next start."
+                )),
+            }
+        } else if !pins_ok {
+            // Fail closed: a name the pins can't vouch for doesn't resolve.
+            for (name, _) in &r.new_pins {
+                r.refs.remove(name);
+            }
+        }
+        let path = self.config.path.display().to_string();
+        for p in r.problems.iter().chain(&r.warnings) {
+            messages.push(format!("{path}: line {}: {}", p.line, sanitize(&p.message)));
+        }
+        let now: BTreeSet<String> = messages.iter().cloned().collect();
+        for m in messages {
+            if !self.told.contains(&m) {
+                self.say(m);
+            }
+        }
+        self.told = now;
+        self.refs = r.refs;
+    }
+
     fn apply_structure_only(&mut self) -> Result<()> {
         let ids: HashSet<String> = self
             .catalogue
             .kinds()
             .map(|k| k.hook_id.clone())
-            .filter(|id| self.config.structure_only(id, &self.names))
+            .filter(|id| self.config.structure_only(id, &self.refs))
             .collect();
         if !ids.is_empty() {
             self.catalogue.enforce_structure_only(&ids)?;
@@ -251,6 +330,7 @@ impl Runner {
                     c.automations.len()
                 ));
                 self.config = c;
+                self.resolve_hooks();
                 if let Err(e) = self.apply_structure_only() {
                     self.say(format!("Couldn't apply structure_only: {e}"));
                 }
@@ -516,7 +596,7 @@ impl Runner {
                 change: None,
             }
         } else {
-            let so = self.config.structure_only(&e.hook_id, &self.names);
+            let so = self.config.structure_only(&e.hook_id, &self.refs);
             match self.catalogue.observe(
                 &e.hook_id,
                 &kind,
@@ -677,8 +757,9 @@ impl Runner {
         if !a.enabled {
             return None;
         }
+        // By id only: a name was resolved to its id (and pinned) when the file was read.
         if let Some(h) = &a.when.hook
-            && !hook_matches(h, &e.hook_id, &self.names)
+            && !self.refs.matches(h, &e.hook_id)
         {
             return None;
         }
@@ -985,6 +1066,104 @@ impl Runner {
             } => actions::write::write_file(folder, &name.render(ctx), &content.render(ctx)),
             // Handled before the retry loop (`run_action`).
             ActionKind::Ask { .. } => Err(Failure::fatal("an ask action can't run here")),
+        }
+    }
+
+    /// A hook changed (the stream's `hook-change`, PROTOCOL §6). Tells the person when a hook's
+    /// secret was rotated by anyone but this device, or when a hook is created or renamed to a name
+    /// the automations use; then keeps the hook names current (a pinned name keeps its id).
+    pub async fn on_hook_change(&mut self, c: &HookChange) {
+        let id = sanitize(&c.hook_id);
+        let known = self.names.get(&c.hook_id).cloned();
+        let label = match c.name.as_deref().or(known.as_deref()) {
+            Some(n) => format!("{} ({id})", sanitize(n)),
+            None => id.clone(),
+        };
+        let who = sanitize(&c.actor_words());
+        let aliases = hookrefs::aliases(&self.config, &self.names);
+        let taken = c
+            .name
+            .as_deref()
+            .filter(|n| aliases.contains(*n))
+            .map(str::to_string);
+        match (c.change(), taken) {
+            (HookChangeKind::Rotated, _) if c.by_device(&self.opts.origin) => {
+                self.say(format!(
+                    "Hook {label} had its secret rotated by this device."
+                ));
+            }
+            (HookChangeKind::Rotated, _) => {
+                self.tell(
+                    "00hooks: a hook's secret was rotated",
+                    format!(
+                        "Hook {label} had its secret rotated by {who}. If that wasn't you, revoke \
+                         it (`00hooks keys list`, `00hooks devices list`) and rotate the secret \
+                         again."
+                    ),
+                )
+                .await;
+            }
+            (kind @ (HookChangeKind::Created | HookChangeKind::Renamed), Some(name)) => {
+                let shown = sanitize(&name);
+                let what = match (kind, c.previous_name.as_deref()) {
+                    (HookChangeKind::Created, _) => format!("Hook {id} was created as {shown:?}"),
+                    (_, Some(prev)) => format!(
+                        "Hook {id} was renamed from {:?} to {shown:?}",
+                        sanitize(prev)
+                    ),
+                    _ => format!("Hook {id} was renamed to {shown:?}"),
+                };
+                let then = match self.pins.get(&name) {
+                    Some(p) if p.id != c.hook_id => format!(
+                        "The automations that use the name {shown:?} keep using {}, the hook it \
+                         was pinned to; if {id} is the one you mean, write its id in the \
+                         automations file.",
+                        sanitize(&p.id)
+                    ),
+                    Some(_) => format!(
+                        "It is the hook the automations that use the name {shown:?} already use."
+                    ),
+                    None => format!("The automations that use the name {shown:?} now use it."),
+                };
+                self.tell(
+                    "00hooks: a hook took a name your automations use",
+                    format!("{what} by {who}. {then}"),
+                )
+                .await;
+            }
+            (HookChangeKind::Created, None) => {
+                self.say(format!("Hook {label} was created by {who}."))
+            }
+            (HookChangeKind::Renamed, None) => self.say(format!(
+                "Hook {id} was renamed from {:?} to {:?} by {who}.",
+                sanitize(
+                    c.previous_name
+                        .as_deref()
+                        .or(known.as_deref())
+                        .unwrap_or("?")
+                ),
+                sanitize(c.name.as_deref().unwrap_or("?"))
+            )),
+            (HookChangeKind::Deleted, _) => self.say(format!("Hook {label} was deleted by {who}.")),
+            (HookChangeKind::Other, _) => self.say(format!(
+                "Hook {label} changed ({}) by {who}.",
+                sanitize(&c.kind)
+            )),
+        }
+        let mut names = self.names.clone();
+        match c.change() {
+            HookChangeKind::Created | HookChangeKind::Renamed | HookChangeKind::Rotated => {
+                if let Some(n) = &c.name {
+                    names.insert(c.hook_id.clone(), n.clone());
+                }
+            }
+            HookChangeKind::Deleted => {
+                names.remove(&c.hook_id);
+            }
+            HookChangeKind::Other => {}
+        }
+        if let Err(e) = self.set_hook_names(names) {
+            self.say(format!("Couldn't save the hook names: {e}"));
         }
     }
 

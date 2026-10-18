@@ -5,11 +5,20 @@
 //! 2. records the event and the start of its run, durably, before acting;
 //! 3. adds it to the [`catalogue`] (field tree, sample, values seen), noticing new kinds and
 //!    shape changes;
-//! 4. matches the automations of `automations.yaml` ([`config`]) on kinds, the catalogue's own
+//! 4. matches the automations of `automations.yaml` ([`config`]) on the hook (by id only: a hook
+//!    named by name is resolved to an id and pinned, [`hookrefs`]), kinds, the catalogue's own
 //!    triggers, an [`expr`] filter and the verified flag;
 //! 5. runs their plain [`actions`] (notify, call a URL, run an allowed command, write a file), with
 //!    retries for what's safe to repeat, per-automation rate limits and a circuit breaker;
 //! 6. records the result ([`runs`]), so any event can be replayed.
+//!
+//! Duplicates are dropped by event id (at least once from the relay, at most once here). The
+//! runner should also drop a delivery whose content it has already run under another id (a dedupe
+//! by content hash); that is not built here yet.
+//!
+//! The stream's hook changes ([`Runner::on_hook_change`]) keep the hook names current and warn the
+//! person when a hook's secret is rotated by someone else, or a hook takes a name the automations
+//! use.
 //!
 //! A host that embeds the runner (00next) gives it automations as data ([`Runner::open_with`],
 //! [`Runner::set_automations`]) instead of the file, and runs "ask an agent" actions for it
@@ -25,6 +34,7 @@ pub mod check;
 pub mod config;
 pub mod context;
 pub mod expr;
+pub mod hookrefs;
 pub mod jsonl;
 pub mod mailbox;
 pub mod path;

@@ -4,13 +4,13 @@
 //! ```yaml
 //! version: 1
 //! notify: system              # or `none`: notifications are only recorded in the run log
-//! hooks:                      # optional per-hook settings, by name or id
+//! hooks:                      # optional per-hook settings, by id or name
 //!   payments:
 //!     structure_only: true    # the catalogue keeps no sample and no values for this hook
 //! automations:
 //!   - name: Triage new issues
 //!     when:
-//!       hook: github          # a hook's name or id
+//!       hook: github          # a hook's id, or its name (resolved to its id and pinned)
 //!       kinds: [issues]       # or `any`; or `new_kind: true` / `shape_changed: true`
 //!     only_if: payload.action == "opened" and payload.issue.comments < 5
 //!     verified_only: true     # the default
@@ -26,8 +26,12 @@
 //!       - run: { command: /usr/bin/say, args: ["New issue {{payload.issue.number}}"] }
 //!       - write: { append: ~/hooks/issues.jsonl }
 //! ```
+//!
+//! A hook may be named by id or by name, but events are matched **by id only**: a name is an alias
+//! that [`crate::hookrefs`] resolves to an id against the relay's hook list and pins, so a hook that
+//! is later renamed, or a new hook given the same name, never takes over an automation.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,6 +39,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::expr::Filter;
+use crate::hookrefs::HookRefs;
 use crate::path::{self as fpath};
 use crate::template::{JsonTemplate, Scope, Template};
 use crate::yaml::{self, Kind, Node};
@@ -90,7 +95,8 @@ pub enum Trigger {
 
 #[derive(Debug, Clone)]
 pub struct When {
-    /// A hook's name or id; `None` for any hook.
+    /// A hook's id, or its name (an alias resolved to an id, [`crate::hookrefs`]); `None` for any
+    /// hook.
     pub hook: Option<String>,
     pub trigger: Trigger,
     pub line: usize,
@@ -222,16 +228,12 @@ impl Automations {
         }
     }
 
-    pub fn structure_only(&self, hook_id: &str, names: &BTreeMap<String, String>) -> bool {
+    /// Whether the hook `hook_id` is `structure_only`, by the resolved references (by id only).
+    pub fn structure_only(&self, hook_id: &str, refs: &HookRefs) -> bool {
         self.hooks
             .iter()
-            .any(|h| h.structure_only && hook_matches(&h.hook, hook_id, names))
+            .any(|h| h.structure_only && refs.matches(&h.hook, hook_id))
     }
-}
-
-/// Whether `want` (a name or id) is the hook `hook_id`.
-pub fn hook_matches(want: &str, hook_id: &str, names: &BTreeMap<String, String>) -> bool {
-    want == hook_id || names.get(hook_id).is_some_and(|n| n == want)
 }
 
 /// The default file: `$XDG_CONFIG_HOME/00hooks/automations.yaml`, else
