@@ -1122,7 +1122,7 @@ opaque alert. The relay stores no device token and puts nothing the node wrote i
 ```
 { "device": "dev_…", "token": <the APNs device token: lowercase hex, 32 to 400 characters, an even number>,
   "environment"?: "sandbox" | "production",
-  "kind": "approval" | "ask" | "finished" | "handoff" | "reconnect",
+  "kind": "approval" | "ask" | "finished" | "handoff" | "reconnect" | "task" | "done",
   "ref": <22 characters of unpadded base64url>,
   "preview"?: { "at": <integer ms>, "enc": <43 base64url>, "ct": <standard padded base64, at most 1,400 characters>, "sig": <86 base64url> } }
 ```
@@ -1165,6 +1165,8 @@ can show the real text on the device. The relay reads neither. Checks, in order:
    | `finished` | An agent finished | Open the app to see what it did. | `FINISHED` |
    | `handoff` | Continue on your phone | A conversation was handed to this phone. | `HANDOFF` |
    | `reconnect` | Your Mac is back online | Open the app to reconnect. | `RECONNECT` |
+   | `task` | Something needs you | An agent left you a task. | `TASK` |
+   | `done` | Done | A task from a meeting is done. | `DONE` |
 
    Nothing else from the request goes into the payload: never the token, a device id, or any text
    from the node.

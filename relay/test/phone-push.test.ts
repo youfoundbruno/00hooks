@@ -259,6 +259,8 @@ describe("POST /v1/phone/push", () => {
       finished: ["An agent finished", "Open the app to see what it did.", "FINISHED"],
       handoff: ["Continue on your phone", "A conversation was handed to this phone.", "HANDOFF"],
       reconnect: ["Your Mac is back online", "Open the app to reconnect.", "RECONNECT"],
+      task: ["Something needs you", "An agent left you a task.", "TASK"],
+      done: ["Done", "A task from a meeting is done.", "DONE"],
     });
   });
 
