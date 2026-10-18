@@ -747,7 +747,7 @@ spent in the account's phone object (below).
    base64url: 43 characters>, "expiresAt": <ms> }` → `201` `{ "pairingId", "expiresAt" }`.
    `expiresAt` must be in the future (`400` `invalid` otherwise) and is clamped to at most
    10 minutes from now; the answer says the expiry kept. An account has at most 5 open (unexpired,
-   unused) pairings: a sixth is `429` `rate_limited` with `Retry-After: 60`. A `pairingId` already
+   unused, not burned) pairings: a sixth is `429` `rate_limited` with `Retry-After: 60`. A `pairingId` already
    registered is `409` `conflict`. Audit: `phone.pairing`. The node computes `verifier =
    b64url(SHA-256(UTF-8(proof)))` from the proof it gives the phone out of band (in 00next, a QR
    code); the relay never sees the proof until the phone shows it, nor the secret it comes from.
@@ -756,21 +756,32 @@ spent in the account's phone object (below).
    phone's Ed25519 key, as §2>, "sealKey": <the phone's X25519 key, as §2: required here>, "hello":
    { "enc": <43 characters>, "ct": <standard base64, 16 to 8,192 bytes decoded> } }` →
    `200` `{ "deviceId", "node" }`. In order:
-   - Rate limit per client address (an IPv4 address or an IPv6 /64; `PAIR_IP_LIMIT`, 10 a minute),
-     before anything else → `429` `rate_limited` with `Retry-After`. Without the binding the relay
-     answers `503` `unavailable`.
-   - The body's fields (`400` `invalid` with `field`); a `publicKey` that already belongs to a
-     device is `409` `conflict`; a `sealKey` is refused as in §2 (malformed or low-order).
-   - The proof: `b64url(SHA-256(UTF-8(proof)))` is compared in constant time with the pairing's
-     verifier. An unknown pairing or a wrong proof → `401` `unauthorized` "That pairing code isn't
-     valid."; the right proof for a used pairing → `409` `conflict` "That pairing code was already
-     used."; for an expired one → `401` `unauthorized` "That pairing code has expired.". A pairing
-     whose node has been revoked since is "isn't valid".
+   - Rate limits, before anything else: per client address (an IPv4 address or an IPv6 /64;
+     `PAIR_IP_LIMIT`, 10 a minute), then for the whole relay (`PAIR_GLOBAL_LIMIT`, 120 a minute; an
+     address past its own limit doesn't spend it) → `429` `rate_limited` with `Retry-After: 60`.
+     Without either binding the relay answers `503` `unavailable`.
+   - `pairingId` and `proof` (`400` `invalid` with `field`).
+   - The proof, before any other field is read: `b64url(SHA-256(UTF-8(proof)))` is compared in
+     constant time with the pairing's verifier. An unknown pairing or a wrong proof → `401`
+     `unauthorized` "That pairing code isn't valid.". Each wrong proof counts against an open
+     pairing; the **5th** burns it, and from then on even the right proof is `401` `unauthorized`
+     "That pairing code was locked after too many wrong attempts; make a new one.". (Only someone
+     who has the pairing code knows its `pairingId`, so only they can burn it.) The right proof for a
+     used pairing → `409` `conflict` "That pairing code was already used."; for an expired one →
+     `401` `unauthorized` "That pairing code has expired.".
+   - The rest of the body (`400` `invalid` with `field`); a `sealKey` is refused as in §2 (malformed
+     or low-order). A `publicKey` that belongs to a device is `409` `conflict` "That public key
+     already belongs to a device.", and the pairing is not spent, so the phone may retry with another
+     key. A key held by a phone that was never confirmed and whose pending time ran out (below) is
+     freed first: that phone's record is deleted, and the key pairs again.
    - The pairing is spent atomically (one conditional update), so of parallel redemptions exactly one
-     wins; the others see "already used".
+     wins; the others see "already used". A pairing whose node has been revoked since is "isn't
+     valid".
    - The phone is created as a **pending** device of the node's account: kind `phone`, `peer` the
      node, pending until the pairing's expiry plus 5 minutes. The node is queued a `pair` sys message
-     (§10.4) carrying `hello` as given. Audit: `device.added`, with the node as actor.
+     (§10.4) carrying `hello` as given. Audit: `device.added`, with the node as actor. If the relay
+     fails part-way here, the phone is removed again and the pairing released, so the phone retries
+     with the same code.
    The relay doesn't open `hello` (it is sealed to the node's key) and the phone checks that `node`
    is the node it expected.
 3. **`POST /v1/phone/devices/<id>/confirm`** (signed by the phone's node) → `200`
@@ -782,7 +793,8 @@ spent in the account's phone object (below).
 A **pending** phone may open its socket (and receive) and unpair itself, nothing else: its sends are
 refused `not_paired`, and nothing may be sent to it. Once its pending time passes unconfirmed, it is
 as good as revoked: its requests are `401`, its socket is closed with `4401`, and it is no longer
-listed.
+listed. Its record is deleted when its account next registers a pairing, or when a phone pairs with
+its public key, so the key is free again.
 
 ### 10.2 Listing and unpairing
 
@@ -809,8 +821,15 @@ not), with `Upgrade: websocket` → `101`. Without the upgrade header the relay 
 A second socket for the same device closes the first with `4409`.
 
 Frames are JSON text frames, one object each, with a `t` field; besides them, the text `ping` is
-answered `pong` at any time (without waking the relay's object). A binary frame, a frame that isn't
-a JSON object, or a frame of an unknown `t` closes the socket with `4400`.
+answered `pong` at any time (without waking the relay's object). A binary frame, a frame over the
+size limit (64 KiB from a phone, 512 KiB from a node; checked before the frame is read), a frame
+that isn't a JSON object, or a frame of an unknown `t` closes the socket with `4400`.
+
+**Every frame** (`hello`, `send`, `ack`, valid or not; `ping` aside) spends a token of the device's
+bucket (phone: 30, refilled 1 a second; node: 200, refilled 20 a second). The bucket belongs to the
+device, not the socket: reconnecting doesn't refill it. With the bucket empty, a `send` is refused
+`rate_limited` (§10.4), an `ack` is ignored (acks are cumulative: the next one, or the next `hello`,
+covers it), and a `hello` closes the socket with `4429`.
 
 Client → relay:
 
@@ -818,10 +837,11 @@ Client → relay:
   first"), and is sent once (a second: `4400`). It also acknowledges every row up to `after` for this
   device (`after` beyond the newest seq is clamped to it; the cursor never goes back). The relay
   answers `{"t":"ready","after":<the device's cursor: max(after, acknowledged)>,"head":<the newest
-  seq queued for this device; 0 when none>,"peers":[{"device","online","since"}]}`, then the backlog
-  for this device in seq order: `{"t":"msg","seq","env"}`, `{"t":"sys","seq","sys"}`, and
-  `{"t":"gap","from","to"}` before the next frame wherever rows after the cursor were dropped (the
-  queue overflowed, or retention); `from` and `to` are inclusive seqs. Then the socket is live.
+  seq queued for this device; 0 when none>,"peers":[{"device","online","since"}]}`, then
+  `{"t":"gap","from","to"}` if rows after the cursor were dropped (the queue overflowed, or
+  retention; at most one, see §10.4; `from` and `to` are inclusive seqs), then the backlog for this
+  device in seq order: `{"t":"msg","seq","env"}` and `{"t":"sys","seq","sys"}`. Then the socket is
+  live.
   `peers` is a phone's node, or each of a node's phones that isn't revoked (pending ones included).
 - `{"t":"send","env":<envelope>}`: answered `{"t":"queued","id","seq"}` or
   `{"t":"refused","id","code","retryAfter"?}` (`id` is the envelope's, or null when it has none).
@@ -842,7 +862,8 @@ Close codes:
 |---|---|---|
 | `4401` | the device was revoked, or a pending phone's time ran out | stop; a phone forgets the pairing |
 | `4409` | a newer socket for this device replaced this one | stop (another process is connected) |
-| `4400` | protocol error (no `hello` first, not JSON, unknown frame) | fix the client; don't loop |
+| `4400` | protocol error (no `hello` first, not JSON, unknown frame, a frame over the size limit) | fix the client; don't loop |
+| `4429` | a `hello` found the device's token bucket empty | reconnect with backoff |
 | `1012` | the relay is restarting (a deploy) | reconnect with jitter |
 
 After any other drop, reconnect with backoff (1 s doubling to 30 s, with jitter; re-sign every
@@ -869,18 +890,26 @@ Checks on a `send`, in order, each refusing with its `code`:
 
 | code | when |
 |---|---|
-| `too_large` | the frame is over 64 KiB from a phone, or 512 KiB from a node |
-| `rate_limited` | the socket's token bucket is empty (phone: 30, refilled 1 a second; node: 200, refilled 20 a second); `retryAfter` in seconds. Every send spends a token, refused or not |
+| `rate_limited` | the device's token bucket is empty (§10.3); `retryAfter` in seconds. Every frame spends a token, refused or not |
 | `invalid` | the envelope's shape, or `push` from a phone |
 | `forbidden` | `from` isn't the socket's device |
 | `not_paired` | the sending phone is still pending |
 | `forbidden` | from a phone, `to` isn't its node; from a node, `to` isn't one of its own phones that is confirmed and not revoked |
 | `queue_full` | to a node: its queue already holds 1,000 rows or would pass 16 MiB |
 
-A resent `id` from the same sender that is still queued is answered `queued` with the seq it has
-and isn't stored again. A phone's queue holds at most 500 rows and 16 MiB: past either, its
-**oldest** rows are dropped to make room and the phone sees a `gap`. Rows are kept until the
-recipient acknowledges them, or 7 days (`RETENTION_DAYS`), after which they are dropped (a `gap`).
+A frame over the size limit is not refused but closes the socket (`4400`, §10.3); `too_large` is no
+longer sent. A resent `id` from the same sender to the same recipient that is still queued is
+answered `queued` with the seq it has and isn't stored again (the same `id` to another recipient is
+another envelope). A phone's queue holds at most 500 rows and 16 MiB: past either, its **oldest**
+rows are dropped to make room and the phone sees a `gap`. Rows are kept until the recipient
+acknowledges them, or 7 days (`RETENTION_DAYS`), after which they are dropped (a `gap`).
+
+**Gaps.** Rows are only ever dropped from the oldest end of a device's queue, so the relay keeps one
+loss record per device, widened by each loss: `hello` sends at most one `gap`, before the backlog,
+from the first seq lost after the cursor to the last seq lost. Seqs inside it that weren't the
+device's are other devices' (seqs are per account); no row still queued is inside it. The record is
+kept until the device acknowledges past it (or is revoked), however long that takes: a loss is never
+itself lost.
 
 **Sys messages** are the relay's own notices to a node, never content:
 
@@ -894,10 +923,11 @@ recipient acknowledges them, or 7 days (`RETENTION_DAYS`), after which they are 
 | | |
 |---|---|
 | pairings | at most 5 open per account; valid at most 10 minutes; one use |
-| pairing attempts | 10 a minute per client address (`PAIR_IP_LIMIT`) |
+| pairing attempts | 10 a minute per client address (`PAIR_IP_LIMIT`), 120 a minute for the relay (`PAIR_GLOBAL_LIMIT`) |
+| wrong proofs | 5 per pairing, then it is burned |
 | pending | the pairing's expiry plus 5 minutes |
 | frame | 64 KiB from a phone, 512 KiB from a node |
-| sends | phone: 30 at once, 1 a second; node: 200 at once, 20 a second |
+| frames (every one) | per device, across reconnects: phone 30 at once, 1 a second; node 200 at once, 20 a second |
 | queue to a node | 1,000 rows or 16 MiB, then `queue_full` |
 | queue to a phone | 500 rows or 16 MiB, then the oldest are dropped (`gap`) |
 | retention | 7 days (`RETENTION_DAYS`) |
@@ -909,12 +939,14 @@ A relay operator may lower the queue limits with `PHONE_NODE_QUEUE_MAX`, `PHONE_
 ### 10.6 How the relay serves it (informative)
 
 One Durable Object per account (`PhoneObject`), separate from the account's event log, holds the
-queue (seq, recipient, sender, `msg` or `sys`, id, the envelope text, size, time), each device's
-cursor and gap records, the account's phones (peer, pending, revoked: so a socket's sends are
-checked without D1), the phones' request nonces and when each device was last seen. Its sockets use
-the hibernation API: per-socket state (role, peer, `hello` time, token bucket) is the socket's
-attachment, `ping` is auto-answered, and an alarm prunes rows past retention, nonces and pending
-phones whose time ran out, so an idle account costs nothing. The Worker authenticates the upgrade
+queue (seq, recipient, sender, `msg` or `sys`, id, the envelope text, size, time), each recipient's
+row and byte counts (kept by triggers on the queue, so a send never scans it), each device's cursor,
+gap record and token bucket, the account's phones (peer, pending, revoked: so a socket's sends are
+checked without D1), the nodes revoked there (so a socket or pairing already past the Worker is
+refused), the phones' request nonces and when each device was last seen. Its sockets use the
+hibernation API: per-socket state (role, peer, `hello` time) is the socket's attachment, `ping` is
+auto-answered, and an alarm prunes rows past retention, nonces and pending phones whose time ran
+out, so an idle account costs nothing. The Worker authenticates the upgrade
 request, then hands it to the object, whose `101` goes back to the client.
 
 ### 10.7 The push hook (designed, not built)
