@@ -399,7 +399,15 @@ automations:
 async fn commands_get_the_event_in_a_file_and_are_stopped_at_their_limit() {
     let dir = Temp::new("script");
     let script = dir.0.join("tool.sh");
-    std::fs::write(&script, "#!/bin/sh\ncat \"$HOOKS_EVENT_FILE\"\n").unwrap();
+    let seen = dir.0.join("event-file.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$HOOKS_EVENT_FILE\" > '{}'\ncat \"$HOOKS_EVENT_FILE\"\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
     let sleeper = dir.0.join("sleep.sh");
     std::fs::write(&sleeper, "#!/bin/sh\nsleep 30 &\nsleep 30\n").unwrap();
     #[cfg(unix)]
@@ -437,18 +445,9 @@ automations:
     );
     assert!(started.elapsed() < Duration::from_secs(10));
     // The run's folder, and the event file in it, are gone afterwards.
-    let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("00hooks-run-"))
-        .collect();
-    assert!(
-        left.is_empty()
-            || left.iter().all(|e| e
-                .metadata()
-                .map(|m| m.modified().unwrap().elapsed().unwrap() > Duration::from_secs(60))
-                .unwrap_or(true))
-    );
+    let file = PathBuf::from(std::fs::read_to_string(&seen).unwrap().trim());
+    assert!(file.is_absolute(), "{}", file.display());
+    assert!(!file.exists() && !file.parent().unwrap().exists());
 }
 
 /// Whether a process is still there (a zombie waiting for its parent counts as gone).
