@@ -125,11 +125,22 @@ pub enum ActionKind {
     },
     Run {
         command: PathBuf,
+        /// Each renders to exactly one argument. An argument whose first characters come from
+        /// the event ([`Template::starts_with_slot`]) and render to `-…` is refused at run time,
+        /// so a payload can't pass the program an option (`--upload-pack=…`, `-oProxyCommand=…`),
+        /// unless `options_end` or `raw` says otherwise.
         args: Vec<Template>,
         env: Vec<(String, Template)>,
         event: EventInput,
         timeout: Duration,
         idempotent: bool,
+        /// `raw: true`: event values may start with `-`; the program is trusted to read them as
+        /// it should.
+        raw: bool,
+        /// `options_end: "--"`: this literal argument goes right before the first argument that
+        /// starts with an event value; what follows it may start with `-`, because the program
+        /// reads it as operands. Options you write go before those arguments.
+        options_end: Option<String>,
     },
     Append {
         path: PathBuf,
@@ -1203,6 +1214,24 @@ fn parse_run(node: &Node, what: &str, commands: &[PathBuf], cx: &mut Ctx) -> Opt
         .get("idempotent")
         .and_then(|n| boolean(n, &format!("{what}: idempotent"), cx))
         .unwrap_or(false);
+    let raw = f
+        .get("raw")
+        .and_then(|n| boolean(n, &format!("{what}: raw"), cx))
+        .unwrap_or(false);
+    let options_end = f.get("options_end").and_then(|n| {
+        let s = string(n, &format!("{what}: options_end"), cx)?;
+        if s.is_empty() || s.contains('\0') || s.chars().count() > 64 {
+            cx.err(
+                n.line,
+                format!(
+                    "{what}: options_end is the literal argument that ends the program's options, \
+                     usually \"--\" (1 to 64 characters)"
+                ),
+            );
+            return None;
+        }
+        Some(s)
+    });
     let retries = match f.get("retries") {
         Some(n) => {
             let r = count(n, &format!("{what}: retries"), MAX_RETRIES, cx).unwrap_or(0);
@@ -1223,6 +1252,8 @@ fn parse_run(node: &Node, what: &str, commands: &[PathBuf], cx: &mut Ctx) -> Opt
             "timeout",
             "idempotent",
             "retries",
+            "raw",
+            "options_end",
         ],
         what,
         cx,
@@ -1235,6 +1266,8 @@ fn parse_run(node: &Node, what: &str, commands: &[PathBuf], cx: &mut Ctx) -> Opt
             event,
             timeout,
             idempotent,
+            raw,
+            options_end,
         },
         retries,
         line: node.line,
@@ -1554,6 +1587,38 @@ automations:
             "automations:\n  - name: x\n    when: { kinds: [a] }\n    allow_commands: [/bin/echo]\n    then:\n      - run: { command: echo, env: { PATH: x, LD_PRELOAD: y } }\n",
         );
         assert_eq!(e.len(), 2, "{e:?}");
+    }
+
+    #[test]
+    fn a_command_can_say_where_its_options_end() {
+        let a = p(
+            "automations:\n  - name: x\n    when: { kinds: [a] }\n    allow_commands: [/usr/bin/git]\n    then:\n      - run: { command: git, args: [clone, \"{{payload.url}}\"], options_end: \"--\" }\n      - run: { command: git, args: [\"{{payload.x}}\"], raw: true }\n      - run: { command: git }\n",
+        )
+        .unwrap();
+        let kinds: Vec<(bool, Option<String>)> = a.automations[0]
+            .actions
+            .iter()
+            .map(|x| match &x.kind {
+                ActionKind::Run {
+                    raw, options_end, ..
+                } => (*raw, options_end.clone()),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [(false, Some("--".into())), (true, None), (false, None)]
+        );
+        for bad in ["\"\"", "[--]"] {
+            let e = errs(&format!(
+                "automations:\n  - name: x\n    when: {{ kinds: [a] }}\n    allow_commands: [/usr/bin/git]\n    then:\n      - run: {{ command: git, options_end: {bad} }}\n"
+            ));
+            assert!(e[0].contains("options_end"), "{e:?}");
+        }
+        let e = errs(
+            "automations:\n  - name: x\n    when: { kinds: [a] }\n    allow_commands: [/usr/bin/git]\n    then:\n      - run: { command: git, raw: maybe }\n",
+        );
+        assert!(e[0].contains("raw"), "{e:?}");
     }
 
     #[test]

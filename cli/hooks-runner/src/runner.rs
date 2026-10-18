@@ -89,6 +89,8 @@ pub struct Runner {
     told: BTreeSet<String>,
     catch_up: Option<CatchUp>,
     log: Vec<String>,
+    /// Hooks whose kinds reached the catalogue's cap, already said.
+    capped_hooks: HashSet<String>,
 }
 
 fn stamp(p: &Path) -> Option<SystemTime> {
@@ -142,6 +144,7 @@ impl Runner {
             told: BTreeSet::new(),
             catch_up: None,
             log: Vec::new(),
+            capped_hooks: HashSet::new(),
             config,
             opts,
         };
@@ -455,7 +458,8 @@ impl Runner {
     }
 
     /// The screen's view of an event (PLAN §6a): its payload and headers, where the edge saw it come
-    /// from, and whether an agent (or anything) would act on it.
+    /// from, whether anything beyond a notification would act on it (`agent_bound`) and whether
+    /// anything would at all (`consequential`).
     fn screen_item(
         &self,
         e: &Event,
@@ -488,11 +492,10 @@ impl Runner {
             },
             size: e.body_len(),
             received_at: e.received_at,
-            agent_bound: triggered.iter().any(|a| {
-                a.actions
-                    .iter()
-                    .any(|x| matches!(x.kind, ActionKind::Ask { .. }))
-            }),
+            // Anything beyond a notification (an agent, a command, a call, a file) would act on
+            // it: when the evaluator can't answer, it is held rather than passed, so exhausting
+            // the daily cap or forcing a time-out doesn't let it through.
+            agent_bound: acts_beyond_notifying(triggered),
             consequential: !triggered.is_empty(),
             purpose: (!names.is_empty())
                 .then(|| format!("events for these automations: {}", names.join("; "))),
@@ -594,6 +597,7 @@ impl Runner {
                 key: crate::catalogue::key(&e.hook_id, &kind),
                 new_kind: false,
                 change: None,
+                capped: false,
             }
         } else {
             let so = self.config.structure_only(&e.hook_id, &self.refs);
@@ -613,6 +617,7 @@ impl Runner {
                         key: crate::catalogue::key(&e.hook_id, &kind),
                         new_kind: false,
                         change: None,
+                        capped: false,
                     }
                 }
             }
@@ -620,6 +625,19 @@ impl Runner {
         let label = format!("{}/{}", hook_name.as_deref().unwrap_or(&e.hook_id), kind);
         if observation.new_kind {
             self.say(format!("New kind: {label}"));
+        }
+        let capped = observation.capped.then(|| {
+            format!(
+                "the catalogue already keeps {} kinds for this hook, so this kind wasn't recorded",
+                crate::catalogue::MAX_KINDS_PER_HOOK
+            )
+        });
+        if let Some(c) = &capped
+            && self.capped_hooks.insert(e.hook_id.clone())
+        {
+            self.say(format!(
+                "{label}: {c} (said once per hook while the runner runs)."
+            ));
         }
         if let Some(c) = &observation.change {
             self.say(format!(
@@ -737,7 +755,11 @@ impl Runner {
             finished_at: now_ms(),
             replay,
             status,
-            note: released.then(|| "released from the screen's quarantine list".to_string()),
+            note: match (released, capped) {
+                (true, Some(c)) => Some(format!("released from the screen's quarantine list; {c}")),
+                (true, None) => Some("released from the screen's quarantine list".to_string()),
+                (false, c) => c,
+            },
             new_kind: observation.new_kind,
             shape_change: observation.change,
             automations: autos,
@@ -1037,6 +1059,8 @@ impl Runner {
                 env,
                 event,
                 timeout,
+                raw,
+                options_end,
                 ..
             } => {
                 // Checked when the file was read; checked again here, where it matters.
@@ -1046,9 +1070,10 @@ impl Runner {
                         command.display()
                     )));
                 }
+                let args = actions::command::render_args(args, ctx, *raw, options_end.as_deref())?;
                 let run = actions::command::Run {
                     program: command,
-                    args: args.iter().map(|t| t.render(ctx)).collect(),
+                    args,
                     env: env
                         .iter()
                         .map(|(k, t)| (k.clone(), t.render(ctx)))
@@ -1173,6 +1198,15 @@ impl Runner {
         self.states.save()?;
         Ok(r)
     }
+}
+
+/// Whether any action of these automations does more than show a notification.
+fn acts_beyond_notifying(triggered: &[&Automation]) -> bool {
+    triggered.iter().any(|a| {
+        a.actions
+            .iter()
+            .any(|x| !matches!(x.kind, ActionKind::Notify { .. }))
+    })
 }
 
 fn list_or_none(v: &[String]) -> String {

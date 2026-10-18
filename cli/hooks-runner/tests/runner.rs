@@ -399,7 +399,15 @@ automations:
 async fn commands_get_the_event_in_a_file_and_are_stopped_at_their_limit() {
     let dir = Temp::new("script");
     let script = dir.0.join("tool.sh");
-    std::fs::write(&script, "#!/bin/sh\ncat \"$HOOKS_EVENT_FILE\"\n").unwrap();
+    let seen = dir.0.join("event-file.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$HOOKS_EVENT_FILE\" > '{}'\ncat \"$HOOKS_EVENT_FILE\"\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
     let sleeper = dir.0.join("sleep.sh");
     std::fs::write(&sleeper, "#!/bin/sh\nsleep 30 &\nsleep 30\n").unwrap();
     #[cfg(unix)]
@@ -436,22 +444,170 @@ automations:
         "{a:#?}"
     );
     assert!(started.elapsed() < Duration::from_secs(10));
-    // The event file is gone afterwards.
-    let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("00hooks-event-")
-        })
-        .collect();
+    // The run's folder, and the event file in it, are gone afterwards.
+    let file = PathBuf::from(std::fs::read_to_string(&seen).unwrap().trim());
+    assert!(file.is_absolute(), "{}", file.display());
+    assert!(!file.exists() && !file.parent().unwrap().exists());
+}
+
+/// Whether a process is still there (a zombie waiting for its parent counts as gone).
+#[cfg(unix)]
+fn alive(pid: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    out.status.success() && !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_child_can_not_keep_the_runner_waiting() {
+    // `sleep 30 &` keeps stdout and stderr open after the shell exits: the run must still finish
+    // now, keep what the shell printed, and kill the sleep.
+    let yaml = r#"
+automations:
+  - name: Background
+    when: { hook: github, kinds: [push] }
+    allow_commands: [/bin/sh]
+    then:
+      - run: { command: sh, args: [-c, "sleep 30 & echo $! > $DIR/bg.pid; echo started"], event: none, timeout: 20s }
+"#;
+    let mut s = setup("background", yaml);
+    let started = std::time::Instant::now();
+    let rec = s.runner.handle(&event(1, "push", &json!({}))).await;
     assert!(
-        left.is_empty()
-            || left.iter().all(|e| e
-                .metadata()
-                .map(|m| m.modified().unwrap().elapsed().unwrap() > Duration::from_secs(60))
-                .unwrap_or(true))
+        started.elapsed() < Duration::from_secs(6),
+        "took {:?}",
+        started.elapsed()
+    );
+    let a = &rec.automations[0].actions[0];
+    assert!(a.ok, "{a:#?}");
+    assert!(a.detail.as_deref().unwrap().ends_with("started"), "{a:#?}");
+    let pid = std::fs::read_to_string(s.dir.0.join("bg.pid")).unwrap();
+    let pid = pid.trim();
+    let mut gone = false;
+    for _ in 0..50 {
+        if !alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the background sleep {pid} is still running");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_run_kills_what_it_started() {
+    let dir = Temp::new("dropped");
+    let pidfile = dir.0.join("bg.pid");
+    let run = hooks_runner::actions::command::Run {
+        program: Path::new("/bin/sh"),
+        args: vec![
+            "-c".into(),
+            format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
+        ],
+        env: Vec::new(),
+        event: hooks_runner::config::EventInput::None,
+        timeout: Duration::from_secs(30),
+    };
+    let ctx = json!({});
+    let fut = hooks_runner::actions::command::run(run, &ctx);
+    // Dropped half-way, as a signal or a host shutting down would.
+    let _ = tokio::time::timeout(Duration::from_millis(700), fut).await;
+    let pid = std::fs::read_to_string(&pidfile).unwrap();
+    let pid = pid.trim();
+    let mut gone = false;
+    for _ in 0..50 {
+        if !alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the background sleep {pid} is still running");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_run_has_its_own_private_folder() {
+    let yaml = r#"
+automations:
+  - name: Where
+    when: { hook: github, kinds: [push] }
+    allow_commands: [/bin/sh]
+    then:
+      - run: { command: sh, args: [-c, "echo \"$(pwd -P)|$(ls -ld . | cut -c1-10)|$(dirname \"$HOOKS_EVENT_FILE\")\""], event: file }
+"#;
+    let mut s = setup("cwd", yaml);
+    let mut seen = Vec::new();
+    for seq in 1..=2 {
+        let rec = s.runner.handle(&event(seq, "push", &json!({}))).await;
+        let a = &rec.automations[0].actions[0];
+        assert!(a.ok, "{a:#?}");
+        let out = a.detail.as_deref().unwrap().split(": ").nth(1).unwrap();
+        let parts: Vec<&str> = out.split('|').collect();
+        assert_eq!(parts[1], "drwx------", "{out}");
+        assert_eq!(
+            Path::new(parts[0]).file_name(),
+            Path::new(parts[2]).file_name(),
+            "the event file is in the run's folder: {out}"
+        );
+        assert!(
+            Path::new(parts[0])
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("00hooks-run-")
+        );
+        assert!(!Path::new(parts[0]).exists(), "removed afterwards");
+        seen.push(parts[0].to_string());
+    }
+    assert_ne!(seen[0], seen[1], "a fresh folder per run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_can_not_pass_a_command_an_option() {
+    let yaml = r#"
+automations:
+  - name: Plain
+    when: { hook: github, kinds: [push] }
+    allow_commands: [/bin/echo]
+    then:
+      - run: { command: echo, args: ["{{payload.repo}}"], event: none }
+  - name: Ended
+    when: { hook: github, kinds: [push] }
+    allow_commands: [/bin/echo]
+    then:
+      - run: { command: echo, args: [-n, "{{payload.repo}}"], options_end: "--", event: none }
+"#;
+    let mut s = setup("options", yaml);
+    let rec = s
+        .runner
+        .handle(&event(
+            1,
+            "push",
+            &json!({"repo": "--upload-pack=touch /tmp/pwned"}),
+        ))
+        .await;
+    let plain = &rec.automations[0].actions[0];
+    assert!(!plain.ok && plain.attempts == 1, "{plain:#?}");
+    let msg = plain.error.as_deref().unwrap();
+    assert!(
+        msg.contains("argument 1") && !msg.contains("upload-pack"),
+        "{msg}"
+    );
+    let ended = &rec.automations[1].actions[0];
+    assert!(ended.ok, "{ended:#?}");
+    assert!(
+        ended
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("-- --upload-pack=touch /tmp/pwned"),
+        "{ended:#?}"
     );
 }
 
@@ -1538,4 +1694,72 @@ automations:
     );
     // The pin still holds the renamed hook.
     assert_eq!(ran(&mut s.runner, &from_hook("hk_gh", 3)).await, ["Pushes"]);
+}
+
+/// An evaluator that never answers in time, the way an attacker who forces time-outs (or spends the
+/// daily cap) would like it.
+struct Silent;
+
+impl hooks_runner::hooks_screen::Decider for Silent {
+    fn name(&self) -> String {
+        "silent".into()
+    }
+    fn retention(&self) -> hooks_runner::hooks_screen::Retention {
+        hooks_runner::hooks_screen::Retention::Local
+    }
+    fn decide<'a>(
+        &'a self,
+        _: &'a hooks_runner::hooks_screen::evaluator::Request,
+    ) -> hooks_runner::hooks_screen::evaluator::DecideFuture<'a> {
+        Box::pin(async { Err("no answer".to_string()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn when_the_evaluator_can_not_answer_only_notifications_pass() {
+    use hooks_runner::hooks_screen::{Screen, SourceSettings};
+    let dir = Temp::new("fallback");
+    let yaml = format!(
+        r#"
+automations:
+  - name: Write
+    when: {{ hook: hk_gh, kinds: [push] }}
+    then:
+      - notify: "a push"
+      - write: {{ append: {}/pushes.jsonl }}
+  - name: Tell
+    when: {{ hook: hk_gh, kinds: [star] }}
+    then:
+      - notify: "a star"
+"#,
+        dir.0.display()
+    );
+    let given = hooks_runner::config::parse(&yaml, &dir.0.join("x.yaml")).expect("valid");
+    let screen = Arc::new(Screen::open(dir.0.join("screen")).unwrap());
+    let mut settings = screen.settings();
+    settings.sources.insert(
+        "webhook".into(),
+        SourceSettings {
+            enabled: true,
+            evaluate: true,
+            ..SourceSettings::default()
+        },
+    );
+    screen.set_settings(settings).unwrap();
+    screen.set_decider(Some(Arc::new(Silent)));
+    let notifier = Arc::new(RecordingNotifier::default());
+    let mut opts = RunnerOptions::new(dir.0.join("runner"), dir.0.join("x.yaml"), "dev_me");
+    opts.notifier = Some(notifier.clone());
+    opts.screen = Some(screen.clone());
+    let mut runner = Runner::open_with(opts, given).unwrap();
+
+    // A file write (or a command, or a call) would act on it: held, not passed.
+    let held = runner.handle(&event(1, "push", &json!({"x": 1}))).await;
+    assert_eq!(held.status, RunStatus::Held, "{held:?}");
+    assert!(screen.held()[0].item.agent_bound);
+    assert!(!dir.0.join("pushes.jsonl").exists());
+    // Only a notification would: it passes.
+    let passed = runner.handle(&event(2, "star", &json!({"x": 2}))).await;
+    assert_eq!(passed.status, RunStatus::Ok, "{passed:?}");
+    assert_eq!(notifier.shown.lock().unwrap().len(), 1);
 }

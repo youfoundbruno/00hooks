@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use crate::keys::FileKeyStore;
 use crate::types::Event;
@@ -28,8 +29,18 @@ const INBOX: &str = "inbox.jsonl";
 const SEEN: &str = "seen.jsonl";
 /// `{"n": <the highest hook change number handed over>}`.
 const HOOK_CHANGES: &str = "hook-changes.json";
-/// Raw `hook` messages that couldn't be read. Append-only; never compacted or reset.
+/// `hook` messages that couldn't be read or opened. Appended to; rotated to [`QUARANTINE_OLD`] past
+/// [`QUARANTINE_MAX_BYTES`]; never reset.
 pub const QUARANTINE: &str = "quarantine.jsonl";
+/// The previous quarantine file, kept once rotated (the one before it is dropped).
+pub const QUARANTINE_OLD: &str = "quarantine.1.jsonl";
+/// The quarantine file is rotated once it passes this size: at most about twice this is kept.
+pub const QUARANTINE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// The largest raw message kept whole when it can't be read; a larger one is kept as its hash.
+pub const QUARANTINE_RAW_MAX: usize = 2 * 1024 * 1024;
+/// The inbox file is rewritten with only what is still waiting once it grows past this, and
+/// whenever it empties, so opened payloads don't build up on disk after they're handed over.
+pub const INBOX_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
 const LOCK: &str = "listen.lock";
 const KEYS: &str = "keys";
 
@@ -123,6 +134,14 @@ impl StateDir {
         Ok(())
     }
 
+    /// What the quarantine holds, oldest first, read without opening the event store (so it can be
+    /// listed while a listener runs).
+    pub fn quarantined(&self) -> Result<Vec<Quarantined>> {
+        let mut all = read_lines(&self.dir.join(QUARANTINE_OLD))?;
+        all.extend(read_lines(&self.dir.join(QUARANTINE))?);
+        Ok(all)
+    }
+
     /// The fallback key store, `<dir>/keys`.
     pub fn file_keys(&self) -> FileKeyStore {
         FileKeyStore::new(self.dir.join(KEYS))
@@ -166,7 +185,31 @@ struct SeenLine {
     id: String,
 }
 
-/// One quarantined message: what the relay sent, exactly, and why it couldn't be read.
+/// Why a message is in the quarantine, which decides what is kept of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QuarantineKind {
+    /// It couldn't be read, or didn't open and never will (forged, changed, unsealed): kept raw
+    /// up to [`QUARANTINE_RAW_MAX`], for a look.
+    #[default]
+    Refused,
+    /// A strict hook's delivery that didn't verify on this device. Anyone who knows a strict
+    /// hook's URL can send these, so only what identifies it is kept (ids, size, hash), never the
+    /// body.
+    StrictRefused,
+    /// It didn't open for want of something this device can get back (a strict hook's secret, a
+    /// sealing key, a key store that was locked): kept whole, and opened again by
+    /// [`EventStore::retry_quarantined`] (`00hooks quarantine retry`, and every reconnect).
+    Recoverable,
+    /// Larger than the stream allows, again and again: skipped by its seq, nothing kept.
+    Oversize,
+    /// A seq at or below the cursor that this device never recorded: a relay resending an old
+    /// event. Kept as metadata only, never run.
+    Stale,
+}
+
+/// One quarantined message: what the relay sent (or, for some kinds, only its hash), and why it
+/// couldn't be read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Quarantined {
@@ -179,10 +222,85 @@ pub struct Quarantined {
     pub raw_id: Option<String>,
     /// The SSE event type, `hook`.
     pub event: String,
-    /// The `data:` field, exactly as sent.
+    /// The `data:` field, exactly as sent; empty when only its hash is kept ([`QuarantineKind`]).
     pub data: String,
     /// Why it couldn't be read.
     pub error: String,
+    #[serde(default)]
+    pub kind: QuarantineKind,
+    /// The event's id and hook, when the message could be read that far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_id: Option<String>,
+    /// The size and hex SHA-256 of the `data:` field as sent.
+    #[serde(default)]
+    pub size: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
+}
+
+impl Quarantined {
+    /// A record of `data` (the SSE `data:` field) of kind `kind`, keeping the raw text only where
+    /// the kind allows it.
+    pub fn new(
+        kind: QuarantineKind,
+        at: i64,
+        sse_id: Option<&str>,
+        data: &str,
+        error: impl Into<String>,
+    ) -> Quarantined {
+        let seq = sse_id.and_then(|i| i.parse::<u64>().ok());
+        let ids: Option<serde_json::Value> = serde_json::from_str(data).ok();
+        let field = |k: &str| {
+            ids.as_ref()
+                .and_then(|v| v.get(k))
+                .and_then(|v| v.as_str())
+                .filter(|s| s.len() <= 64)
+                .map(str::to_string)
+        };
+        let keep = match kind {
+            QuarantineKind::Recoverable => true,
+            QuarantineKind::Refused => data.len() <= QUARANTINE_RAW_MAX,
+            _ => false,
+        };
+        let sha256: String = sha2::Sha256::digest(data.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Quarantined {
+            at,
+            seq,
+            raw_id: if seq.is_none() {
+                sse_id.map(|s| s.chars().take(64).collect())
+            } else {
+                None
+            },
+            event: "hook".into(),
+            data: if keep {
+                data.to_string()
+            } else {
+                String::new()
+            },
+            error: error.into(),
+            kind,
+            event_id: field("id"),
+            hook_id: field("hookId"),
+            size: data.len(),
+            sha256,
+        }
+    }
+}
+
+/// What [`EventStore::retry_quarantined`] did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Retried {
+    /// Opened and recorded in the inbox, to be handed over.
+    pub opened: Vec<Event>,
+    /// Still waiting for what they lack.
+    pub waiting: usize,
+    /// Opened this time and refused (they will never open): kept as refused.
+    pub refused: usize,
 }
 
 /// The cursor, the inbox and the seen set.
@@ -191,9 +309,12 @@ pub struct EventStore {
     dir: PathBuf,
     cursor: u64,
     seen: HashSet<String>,
-    inbox: BTreeMap<u64, Event>,
+    /// Keyed by seq and id: two events can't share a slot, whatever the relay sends.
+    inbox: BTreeMap<(u64, String), Event>,
     inbox_ids: HashSet<String>,
     inbox_file: File,
+    /// Bytes appended to the inbox file since it was last rewritten.
+    inbox_bytes: u64,
     seen_file: File,
     /// The highest hook change number handed over.
     hook_changes: u64,
@@ -269,10 +390,11 @@ impl EventStore {
         let mut inbox_ids = HashSet::new();
         for event in read_lines::<Event>(&dir.join(INBOX))? {
             if !seen.contains(&event.id) && inbox_ids.insert(event.id.clone()) {
-                inbox.insert(event.seq, event);
+                inbox.insert((event.seq, event.id.clone()), event);
             }
         }
-        fsutil::write_atomic(&dir.join(INBOX), &to_lines(inbox.values()), true)?;
+        let inbox_lines = to_lines(inbox.values());
+        fsutil::write_atomic(&dir.join(INBOX), &inbox_lines, true)?;
 
         let cursor_from_file = match std::fs::read(dir.join(CURSOR)) {
             Ok(b) => serde_json::from_slice::<CursorFile>(&b)
@@ -281,7 +403,7 @@ impl EventStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => return Err(e.into()),
         };
-        let cursor = cursor_from_file.max(inbox.keys().next_back().copied().unwrap_or(0));
+        let cursor = cursor_from_file.max(inbox.keys().next_back().map(|k| k.0).unwrap_or(0));
         let hook_changes = match std::fs::read(dir.join(HOOK_CHANGES)) {
             Ok(b) => serde_json::from_slice::<HookChangesFile>(&b)
                 .map(|c| c.n)
@@ -297,6 +419,7 @@ impl EventStore {
             inbox,
             inbox_ids,
             inbox_file: fsutil::open_append(&dir.join(INBOX))?,
+            inbox_bytes: inbox_lines.len() as u64,
             seen_file: fsutil::open_append(&dir.join(SEEN))?,
             hook_changes,
         })
@@ -357,12 +480,13 @@ impl EventStore {
             serde_json::to_writer(&mut buf, e).expect("json");
             buf.push(b'\n');
             self.inbox_ids.insert(e.id.clone());
-            self.inbox.insert(e.seq, e.clone());
+            self.inbox.insert((e.seq, e.id.clone()), e.clone());
             fresh.push(e.clone());
         }
         if !buf.is_empty() {
             self.inbox_file.write_all(&buf)?;
             self.inbox_file.sync_data()?;
+            self.inbox_bytes += buf.len() as u64;
         }
         if let Some(max) = events.iter().map(|e| e.seq).max() {
             self.advance_cursor(max)?;
@@ -381,16 +505,43 @@ impl EventStore {
         self.seen_file.sync_data()?;
         if self.inbox_ids.remove(id) {
             self.inbox.retain(|_, e| e.id != id);
+            if self.inbox.is_empty() {
+                // Everything in the file is handed over: empty it. No fsync: if the truncation
+                // is lost in a crash, the lines come back and are all in the seen set.
+                if self.inbox_bytes > 0 {
+                    self.inbox_file.set_len(0)?;
+                    self.inbox_bytes = 0;
+                }
+            } else if self.inbox_bytes > INBOX_COMPACT_BYTES {
+                self.compact_inbox()?;
+            }
         }
         Ok(())
     }
 
-    /// Keep an unreadable message raw in `quarantine.jsonl` (appended and fsynced), so that
-    /// acknowledging past it loses nothing. Returns the file's path.
+    /// Rewrite the inbox file with only what is still waiting (atomically), so payloads already
+    /// handed over don't stay on disk.
+    fn compact_inbox(&mut self) -> Result<()> {
+        let path = self.dir.join(INBOX);
+        let lines = to_lines(self.inbox.values());
+        fsutil::write_atomic(&path, &lines, true)?;
+        self.inbox_file = fsutil::open_append(&path)?;
+        self.inbox_bytes = lines.len() as u64;
+        Ok(())
+    }
+
+    /// Keep a message that couldn't be read in `quarantine.jsonl` (appended and fsynced) before
+    /// anything past it is acknowledged; what of it is kept depends on its [`QuarantineKind`]. The
+    /// file is rotated past [`QUARANTINE_MAX_BYTES`], so a flood can't fill the disk. Returns the
+    /// file's path.
     pub fn quarantine(&mut self, q: &Quarantined) -> Result<PathBuf> {
         let path = self.dir.join(QUARANTINE);
         let mut line = serde_json::to_vec(q).expect("json");
         line.push(b'\n');
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size > 0 && size + line.len() as u64 > QUARANTINE_MAX_BYTES {
+            std::fs::rename(&path, self.dir.join(QUARANTINE_OLD))?;
+        }
         let mut f = fsutil::open_append(&path)?;
         f.write_all(&line)?;
         f.sync_data()?;
@@ -398,9 +549,67 @@ impl EventStore {
         Ok(path)
     }
 
-    /// Everything quarantined so far, oldest first.
+    /// Everything quarantined and still kept, oldest first.
     pub fn quarantined(&self) -> Result<Vec<Quarantined>> {
-        read_lines(&self.dir.join(QUARANTINE))
+        let mut all = read_lines(&self.dir.join(QUARANTINE_OLD))?;
+        all.extend(read_lines(&self.dir.join(QUARANTINE))?);
+        Ok(all)
+    }
+
+    /// Open again every [`QuarantineKind::Recoverable`] message with `opener`: what opens now is
+    /// recorded in the inbox (to be handed over, once, like any event) and leaves the quarantine;
+    /// what is refused now stays as refused (metadata only, for a strict hook); the rest waits.
+    pub fn retry_quarantined(&mut self, opener: &crate::Opener) -> Result<Retried> {
+        let all = self.quarantined()?;
+        if !all.iter().any(|q| q.kind == QuarantineKind::Recoverable) {
+            return Ok(Retried::default());
+        }
+        let mut out = Retried::default();
+        let mut keep = Vec::with_capacity(all.len());
+        let mut opened = Vec::new();
+        for q in all {
+            if q.kind != QuarantineKind::Recoverable {
+                keep.push(q);
+                continue;
+            }
+            let event = match serde_json::from_str::<Event>(&q.data) {
+                Ok(e) => e,
+                Err(_) => {
+                    keep.push(q);
+                    out.waiting += 1;
+                    continue;
+                }
+            };
+            match opener.open(event) {
+                Ok(e) => opened.push(e),
+                Err(err) if err.recoverable() => {
+                    out.waiting += 1;
+                    keep.push(q);
+                }
+                Err(err) => {
+                    out.refused += 1;
+                    let kind = if err.strict {
+                        QuarantineKind::StrictRefused
+                    } else {
+                        QuarantineKind::Refused
+                    };
+                    let mut r = Quarantined::new(kind, q.at, None, &q.data, err.message);
+                    r.seq = q.seq;
+                    r.raw_id = q.raw_id;
+                    keep.push(r);
+                }
+            }
+        }
+        // Recorded before the quarantine forgets them: a crash in between leaves both, and the
+        // inbox dedupes by id.
+        // Their seqs are below the cursor, so recording them leaves it where it is.
+        out.opened = self.record(&opened)?;
+        fsutil::write_atomic(&self.dir.join(QUARANTINE), &to_lines(&keep), true)?;
+        match std::fs::remove_file(self.dir.join(QUARANTINE_OLD)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        Ok(out)
     }
 
     /// Recorded events not yet handed over, oldest first.
@@ -410,7 +619,7 @@ impl EventStore {
 
     /// The highest seq waiting in the inbox.
     pub fn pending_through(&self) -> Option<u64> {
-        self.inbox.keys().next_back().copied()
+        self.inbox.keys().next_back().map(|k| k.0)
     }
 }
 
@@ -583,14 +792,15 @@ mod tests {
         let dir = temp_dir("quarantine");
         let s = StateDir::open(&dir).unwrap();
         let mut ev = s.open_events().unwrap();
-        let q = Quarantined {
-            at: 1,
-            seq: Some(7),
-            raw_id: None,
-            event: "hook".into(),
-            data: "{\"seq\":7,\"broken".into(),
-            error: "EOF while parsing".into(),
-        };
+        let q = Quarantined::new(
+            QuarantineKind::Refused,
+            1,
+            Some("7"),
+            "{\"seq\":7,\"broken",
+            "EOF while parsing",
+        );
+        assert_eq!(q.seq, Some(7));
+        assert_eq!(q.data, "{\"seq\":7,\"broken");
         let path = ev.quarantine(&q).unwrap();
         assert_eq!(path, dir.join(QUARANTINE));
         drop(ev);
@@ -603,6 +813,193 @@ mod tests {
             let m = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(m & 0o777, 0o600);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_strict_failure_keeps_metadata_only_and_the_quarantine_is_bounded() {
+        let dir = temp_dir("quarantine-cap");
+        let s = StateDir::open(&dir).unwrap();
+        let mut ev = s.open_events().unwrap();
+        // Anyone with a strict hook's URL can send these: keep who and what, never the body.
+        let body = format!(
+            "{{\"seq\":9,\"id\":\"evt_9\",\"hookId\":\"hk_1\",\"pad\":\"{}\"}}",
+            "x".repeat(100_000)
+        );
+        let q = Quarantined::new(QuarantineKind::StrictRefused, 1, Some("9"), &body, "no");
+        assert!(q.data.is_empty());
+        assert_eq!(q.event_id.as_deref(), Some("evt_9"));
+        assert_eq!(q.hook_id.as_deref(), Some("hk_1"));
+        assert_eq!(q.size, body.len());
+        assert_eq!(q.sha256.len(), 64);
+        // A refused message larger than the raw limit is kept as its hash too.
+        let huge = "y".repeat(QUARANTINE_RAW_MAX + 1);
+        assert!(
+            Quarantined::new(QuarantineKind::Refused, 1, Some("10"), &huge, "x")
+                .data
+                .is_empty()
+        );
+        // A flood rotates the file: at most about twice the limit is ever kept.
+        let big = Quarantined::new(
+            QuarantineKind::Recoverable,
+            1,
+            Some("11"),
+            &"z".repeat(1024 * 1024),
+            "waiting",
+        );
+        for _ in 0..40 {
+            ev.quarantine(&big).unwrap();
+        }
+        let size = |n: &str| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0);
+        assert!(size(QUARANTINE) <= QUARANTINE_MAX_BYTES);
+        assert!(size(QUARANTINE_OLD) <= QUARANTINE_MAX_BYTES);
+        assert!(size(QUARANTINE_OLD) > 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn two_events_with_one_seq_both_stay_in_the_inbox() {
+        let dir = temp_dir("seqid");
+        let s = StateDir::open(&dir).unwrap();
+        let mut ev = s.open_events().unwrap();
+        let mut twin = event(5);
+        twin.id = "evt_5b".into();
+        assert_eq!(ev.record(&[event(5), twin.clone()]).unwrap().len(), 2);
+        assert_eq!(ev.pending().len(), 2);
+        drop(ev);
+        let mut ev = s.open_events().unwrap();
+        assert_eq!(ev.pending().len(), 2);
+        ev.mark_delivered("evt_5").unwrap();
+        assert_eq!(ev.pending(), vec![twin]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_inbox_file_forgets_handed_over_payloads_while_running() {
+        let dir = temp_dir("inbox-compact");
+        let s = StateDir::open(&dir).unwrap();
+        let mut ev = s.open_events().unwrap();
+        ev.record(&[event(1), event(2)]).unwrap();
+        ev.mark_delivered("evt_1").unwrap();
+        assert!(
+            std::fs::read_to_string(dir.join(INBOX))
+                .unwrap()
+                .contains("evt_1")
+        );
+        ev.mark_delivered("evt_2").unwrap();
+        // Empty: rewritten at once, with nothing in it.
+        assert_eq!(std::fs::read(dir.join(INBOX)).unwrap().len(), 0);
+        // Past the size limit it is rewritten with only what still waits.
+        let mut big = event(3);
+        big.body = "A".repeat(INBOX_COMPACT_BYTES as usize + 10);
+        ev.record(&[big, event(4)]).unwrap();
+        ev.mark_delivered("evt_3").unwrap();
+        let text = std::fs::read_to_string(dir.join(INBOX)).unwrap();
+        assert!(!text.contains("evt_3") && text.contains("evt_4"));
+        // Appending after a rewrite still lands in the file.
+        ev.record(&[event(6)]).unwrap();
+        drop(ev);
+        assert_eq!(s.open_events().unwrap().pending().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recoverable_events_open_from_the_quarantine_once_the_secret_is_there() {
+        use crate::seal::{SealedContent, StrictSecrets, seal_event};
+        use base64::Engine;
+        use ed25519_dalek::SigningKey;
+        struct One(Option<crate::StrictHook>);
+        impl StrictSecrets for One {
+            fn get(&self, _: &str) -> Result<Option<crate::StrictHook>> {
+                Ok(self.0.clone())
+            }
+        }
+        let relay = SigningKey::from_bytes(&[8; 32]);
+        let rk = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(relay.verifying_key().as_bytes());
+        let key = crate::SealKey::generate().unwrap();
+        let pk = key.public_bytes();
+        let seed: [u8; 32] = {
+            let store = crate::MemoryKeyStore::new();
+            key.save(&store).unwrap();
+            crate::keys::KeyStore::load(&store, &crate::SealKey::store_name(&key.kid()))
+                .unwrap()
+                .unwrap()
+        };
+        let opener_with = |secret: Option<crate::StrictHook>| {
+            let mut o = crate::Opener::new("dev_1", Some(&rk))
+                .unwrap()
+                .with_strict(Box::new(One(secret)))
+                .with_clock(|| 1_000_000);
+            o.add_key(crate::SealKey::from_bytes(&seed).unwrap());
+            o
+        };
+        let meta = Event {
+            seq: 3,
+            id: "evt_3".into(),
+            hook_id: "hk_1".into(),
+            received_at: 1_000_000,
+            strict: true,
+            preset: "github".into(),
+            ..Event::default()
+        };
+        let body = b"{}";
+        let mac = {
+            use hmac::{KeyInit, Mac};
+            let mut m = <hmac::Hmac<sha2::Sha256>>::new_from_slice(b"gh-secret").unwrap();
+            m.update(body);
+            m.finalize()
+                .into_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let content = SealedContent {
+            headers: BTreeMap::from([("x-hub-signature-256".into(), format!("sha256={mac}"))]),
+            body: body.to_vec(),
+            ..SealedContent::default()
+        };
+        let sealed = seal_event(&relay, "dev_1", &pk, &meta, &content).unwrap();
+        let data = serde_json::to_string(&sealed).unwrap();
+        let dir = temp_dir("retry");
+        let s = StateDir::open(&dir).unwrap();
+        let mut ev = s.open_events().unwrap();
+        ev.advance_cursor(3).unwrap();
+        let q = Quarantined::new(
+            QuarantineKind::Recoverable,
+            1,
+            Some("3"),
+            &data,
+            "no secret",
+        );
+        assert_eq!(q.data, data, "kept whole");
+        ev.quarantine(&q).unwrap();
+        // Still no secret: it waits.
+        let r = ev.retry_quarantined(&opener_with(None)).unwrap();
+        assert_eq!((r.opened.len(), r.waiting), (0, 1));
+        // The secret, now: it opens, is recorded for handover, and leaves the quarantine.
+        let hook = crate::StrictHook {
+            verify: serde_json::json!({"preset": "github", "strict": true}),
+            secrets: vec!["gh-secret".into()],
+        };
+        let r = ev.retry_quarantined(&opener_with(Some(hook))).unwrap();
+        assert_eq!(r.opened.len(), 1);
+        assert!(r.opened[0].verified);
+        assert_eq!(ev.pending().len(), 1);
+        assert!(ev.quarantined().unwrap().is_empty());
+        assert_eq!(ev.cursor(), 3);
+        // A wrong secret instead turns it into a refused record, body dropped.
+        ev.quarantine(&q).unwrap();
+        let wrong = crate::StrictHook {
+            verify: serde_json::json!({"preset": "github", "strict": true}),
+            secrets: vec!["not-it".into()],
+        };
+        let r = ev.retry_quarantined(&opener_with(Some(wrong))).unwrap();
+        assert_eq!(r.refused, 1);
+        let left = ev.quarantined().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].kind, QuarantineKind::StrictRefused);
+        assert!(left[0].data.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

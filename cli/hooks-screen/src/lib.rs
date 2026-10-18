@@ -32,7 +32,7 @@ use serde_json::Value;
 
 pub use evaluator::{Answers, Decider, EvaluatorSettings, Provider, Retention, Thresholds};
 pub use rules::{Condition, FieldOp, Rule};
-pub use screen::{By, Decision, Held, HeldState, Screen, Settings, SourceSettings};
+pub use screen::{By, Decision, Held, HeldState, RuleError, Screen, Settings, SourceSettings};
 
 /// What happens to an item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,7 +134,11 @@ pub struct Item {
     #[serde(default)]
     pub size: usize,
     pub received_at: i64,
-    /// An agent would read it: the fallback when the evaluator can't answer is quarantine.
+    /// Something beyond a notification would act on it: an agent would read it, or a command, a
+    /// call or a file write would use it. The fallback when the evaluator can't answer (failed,
+    /// timed out, over its daily cap, refused for a sensitive source) is then quarantine; pass is
+    /// only for items nothing but a notification would act on. Hosts set it whenever any action
+    /// other than a plain notification is triggered.
     #[serde(default)]
     pub agent_bound: bool,
     /// Something would act on it; when nothing would, the evaluator isn't asked (it would cost

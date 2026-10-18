@@ -46,6 +46,11 @@ pub enum Conn {
     Gap(u64, u64),
     /// `retry` and `ready`, then nothing at all (no heartbeats either).
     Silent,
+    /// `ready` and `n` events, then nothing at all.
+    SilentAfter(usize),
+    /// The response headers never come (until long after any client has given up); the next
+    /// connection is taken from the script as usual.
+    Stall,
 }
 
 #[derive(Default)]
@@ -316,6 +321,13 @@ async fn handle(st: Arc<Mutex<State>>, req: Request<Incoming>) -> Result<Resp, I
         .map(|b| b.to_bytes())
         .unwrap_or_default();
     let route = (parts.method.as_str(), parts.uri.path());
+    if route == ("GET", "/v1/stream") {
+        let stall = matches!(st.lock().unwrap().script.front(), Some(Conn::Stall));
+        if stall {
+            st.lock().unwrap().script.pop_front();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
     if route == ("POST", "/v1/ack") {
         let delay = st.lock().unwrap().ack_delay;
         if !delay.is_zero() {
@@ -727,7 +739,10 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn, device:
                 .collect()
         };
         let limit = match conn {
-            Conn::CutAfter(n) | Conn::CloseAfter(n, _) | Conn::ResyncAfter(n) => n,
+            Conn::CutAfter(n)
+            | Conn::CloseAfter(n, _)
+            | Conn::ResyncAfter(n)
+            | Conn::SilentAfter(n) => n,
             _ => usize::MAX,
         };
         let mut sent = after;
@@ -755,6 +770,10 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn, device:
             }
             Conn::ResyncAfter(_) => {
                 let _ = send(format!("event: resync\ndata: {{\"after\":{sent}}}\n\n")).await;
+                tx.closed().await;
+                return;
+            }
+            Conn::SilentAfter(_) => {
                 tx.closed().await;
                 return;
             }

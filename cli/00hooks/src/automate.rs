@@ -220,17 +220,33 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
     #[cfg(unix)]
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Failure::new(format!("Couldn't listen for SIGTERM: {e}.")))?;
+    // SIGTERM (Unix); never elsewhere.
+    #[cfg(unix)]
+    macro_rules! terminated {
+        () => {
+            term.recv()
+        };
+    }
+    #[cfg(not(unix))]
+    macro_rules! terminated {
+        () => {
+            std::future::pending::<Option<()>>()
+        };
+    }
     let mut connected_before = false;
     let result = loop {
-        #[cfg(unix)]
-        let terminated = term.recv();
-        #[cfg(not(unix))]
-        let terminated = std::future::pending::<Option<()>>();
         let next = tokio::select! {
             _ = &mut ctrl_c => break Ok(()),
-            _ = terminated => break Ok(()),
+            _ = terminated!() => break Ok(()),
             Some((answer_at, event)) = rx.recv() => {
-                let answer = match runner.replay(&event).await {
+                // A signal stops a replay half-way too: its command is killed with the run, and
+                // the run is reported as interrupted on the next start.
+                let replayed = tokio::select! {
+                    r = runner.replay(&event) => r,
+                    _ = &mut ctrl_c => break Ok(()),
+                    _ = terminated!() => break Ok(()),
+                };
+                let answer = match replayed {
                     Ok(record) => {
                         for l in describe_run(&record) { err(l); }
                         mailbox::Answer { record: Some(record), error: None }
@@ -269,14 +285,20 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
             StreamEvent::Hook(e) => {
                 crash_point("after-handover");
                 let mut unconfirmed = None;
-                let record = runner
-                    .handle_confirming(&e, &mut |id| {
-                        crash_point("after-start");
-                        if let Err(e) = sub.confirm(id) {
-                            unconfirmed = Some(e.to_string());
-                        }
-                    })
-                    .await;
+                // A signal stops a run half-way: what it started is killed with it (the
+                // runner's commands die with their run), and the next start reports the run as
+                // interrupted (`00hooks replay` runs it again).
+                let mut confirm = |id: &str| {
+                    crash_point("after-start");
+                    if let Err(e) = sub.confirm(id) {
+                        unconfirmed = Some(e.to_string());
+                    }
+                };
+                let record = tokio::select! {
+                    r = runner.handle_confirming(&e, &mut confirm) => r,
+                    _ = &mut ctrl_c => break Ok(()),
+                    _ = terminated!() => break Ok(()),
+                };
                 if let Some(why) = unconfirmed {
                     err(format!(
                         "Couldn't mark event {} as handled in the stream's inbox ({}); if this \
@@ -319,7 +341,8 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
                 ));
             }
             StreamEvent::Quarantined { seq, path, error } => err(format!(
-                "Event{} arrived but couldn't be read ({}); its raw message is kept in {}.",
+                "Event{} arrived but couldn't be read ({}); it is noted in {} (`00hooks quarantine \
+                 list`).",
                 seq.map(|n| format!(" {n}")).unwrap_or_default(),
                 sanitize(&error, false),
                 path.display()

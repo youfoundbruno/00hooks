@@ -132,10 +132,50 @@ async fn a_strict_hook_keeps_its_secret_here_and_never_sends_it() {
         text(&out.stderr)
     );
 
+    // Both are in this computer's index of strict hooks, so the relay can't switch them off.
+    let index = std::fs::read_to_string(home.0.join("strict-hooks.json")).unwrap();
+    assert!(index.contains("hk_1") && index.contains("hk_2"), "{index}");
+
     // Another computer (here, the same one again) can take the secret over; the previous one stays.
+    // How the hook is signed comes from the person, not the relay: without --preset the relay's
+    // description has to be confirmed, which a script does with --yes.
     let out = run(
         &home.0,
         &["hooks", "secret", "hk_2", "--secret-stdin"],
+        Some("whsec_new_one\n"),
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("--yes"), "{}", text(&out.stderr));
+    let out = run(
+        &home.0,
+        &[
+            "hooks",
+            "secret",
+            "hk_2",
+            "--secret-stdin",
+            "--preset",
+            "github",
+        ],
+        Some("whsec_new_one\n"),
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("you said github"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = run(
+        &home.0,
+        &[
+            "hooks",
+            "secret",
+            "hk_2",
+            "--secret-stdin",
+            "--preset",
+            "stripe",
+        ],
         Some("whsec_new_one\n"),
     )
     .await;

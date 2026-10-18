@@ -28,7 +28,7 @@ pub mod types;
 pub use api::Client;
 pub use error::{Error, Result, Secret, describe_skew};
 pub use keys::{DeviceKey, FileKeyStore, KeyStore, KeychainStore, MemoryKeyStore};
-pub use seal::{Opener, SealKey, StrictHook};
+pub use seal::{OpenError, OpenFailure, Opener, SealKey, StrictHook};
 pub use store::{Config, EventStore, Quarantined, StateDir};
 pub use stream::{StreamEvent, SubscribeOptions, Subscription, subscribe};
 pub use types::*;

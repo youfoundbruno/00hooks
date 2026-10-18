@@ -45,11 +45,12 @@ pub fn status(json: bool) -> CliResult {
     let rules = s.rules();
     let learned = rules.iter().filter(|r| r.learned.is_some()).count();
     let held = s.held().len();
+    let broken = s.rule_errors();
     if json {
         println!(
             "{}",
             json_line(
-                &json!({"on": w.enabled, "evaluate": w.evaluate, "rules": rules.len() - learned, "learned": learned, "held": held})
+                &json!({"on": w.enabled, "evaluate": w.evaluate, "rules": rules.len() - learned, "learned": learned, "held": held, "broken": broken.len()})
             )
         );
         return Ok(());
@@ -67,7 +68,26 @@ pub fn status(json: bool) -> CliResult {
         "{} rules of yours, {learned} learned; {held} held.",
         rules.len() - learned
     );
+    for l in broken_lines(&broken) {
+        eprintln!("{l}");
+    }
     Ok(())
+}
+
+/// What to say about rules that don't compile: each holds what it applies to until it's fixed.
+pub fn broken_lines(errors: &[hooks_runner::hooks_screen::RuleError]) -> Vec<String> {
+    errors
+        .iter()
+        .map(|e| {
+            format!(
+                "Rule {} ({}) doesn't work: {}. Until it's fixed or switched off, what it applies \
+                 to is held.",
+                e.id,
+                sanitize(&e.name, false),
+                sanitize(&e.error, false)
+            )
+        })
+        .collect()
 }
 
 /// `00hooks screen on|off`.
@@ -292,6 +312,9 @@ pub fn rules(json: bool) -> CliResult {
         ]);
     }
     print!("{}", table(&rows));
+    for l in broken_lines(&s.rule_errors()) {
+        eprintln!("{l}");
+    }
     Ok(())
 }
 
@@ -327,4 +350,21 @@ pub async fn sync() -> CliResult {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broken_rules_are_named_and_said_to_hold() {
+        let lines = broken_lines(&[hooks_runner::hooks_screen::RuleError {
+            id: "rul_1".into(),
+            name: "bad\u{1b}[2J".into(),
+            error: "the pattern is empty".into(),
+        }]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("rul_1") && lines[0].contains("held"));
+        assert!(!lines[0].contains('\u{1b}'));
+    }
 }

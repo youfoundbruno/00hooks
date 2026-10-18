@@ -170,7 +170,7 @@ and `/v1/test/<hook_id>` (send a signed sample event).
 | Preset | How it's checked | Strength |
 |---|---|---|
 | Standard Webhooks (Svix, Resend, Clerk, many others) | `webhook-id`, `webhook-timestamp`, HMAC-SHA256 or Ed25519 `webhook-signature` | strong |
-| Standard Webhooks with Ed25519 (`v1a`) | the relay holds only the sender's *public* key | strongest: a relay breach can't forge events |
+| Standard Webhooks with Ed25519 (`v1a`) | the relay holds only the sender's *public* key | strongest: a leak of the relay's stored secrets can't forge events (a compromised relay still can, unless the hook is strict) |
 | Stripe | `Stripe-Signature` (`t=…,v1=…`) within 5 minutes | strong |
 | Slack | `v0:<ts>:<body>` HMAC, timestamp within 5 minutes | strong |
 | Linear | `Linear-Signature` HMAC, `webhookTimestamp` within 60 s | strong |
@@ -202,8 +202,8 @@ time.
   creates the account (with the relay's signup token unless signups are open). Another device needs
   a one-time enrolment code made by an approved device (`00hooks devices add`), redeemed by
   `00hooks login` on the new one. There is no dashboard. Every request is signed with the device
-  key, with the time and a single-use nonce (PROTOCOL §1), so no long-lived secret crosses the
-  network.
+  key (PROTOCOL §1: the device, host, method, path, time, a single-use nonce and the body's hash), so
+  no secret, long-lived or short, crosses the network.
 - **API keys** (`hk_…`) are for management and CI only: shown once, stored as a salted hash keyed
   with `HASH_PEPPER`, scoped (`hooks:read`, `hooks:write`, `hooks:secrets`, `events:read`,
   `devices:write`, and `audit:read`), with an expiry. An API key can never open the stream, enrol a
@@ -223,10 +223,15 @@ the CLI knows it came from your relay. The relay still sees metadata: when, whic
 type when it's in a header, and whether it verified. Trade-off: the payload is briefly in the Worker's
 memory during verification; that is unavoidable for signature checks, and is why §4.2's secrets are
 encrypted and the code is open for inspection. For people who can't accept that, a hook can use
-**verify on your machine** *(strict mode)*: the edge only checks the cheap things (size, rate, a
-header token), seals the raw body and signature headers together, and the CLI verifies the provider's
-signature itself with the secret kept in your keychain. The relay then never sees plaintext, at the
-cost of accepting some junk at the edge. Routing at the relay only ever uses plaintext metadata (hook
+**verify on your machine** *(strict mode)*: the edge only checks the cheap things (size, rate, that
+the signature header is there and well formed, a header timestamp's window), seals the raw body and
+signature headers together, and the CLI verifies the provider's signature itself with the secret kept
+in your keychain. The relay never holds the secret, at the cost of accepting some junk at the edge.
+The device decides on its own terms (PROTOCOL §3): it verifies every event of a hook it keeps a
+strict secret for, whatever the relay's metadata says, with the settings it was given when the secret
+was kept, refuses a preset relabelled by the relay, and keeps its own replay marks for 8 days, so a
+breached relay can't forge, downgrade or replay a strict hook's events. It can still withhold or
+delay them, and it sees each payload in memory while it seals it. Routing at the relay only ever uses plaintext metadata (hook
 id, provider, event type), and that metadata is visible to the operator.
 
 **The local trust boundary.** Sealing ends at the device: once opened, an event is plaintext on your
@@ -274,6 +279,9 @@ automations can be built later by picking real fields instead of typing paths.
   (*shape changed on 14 Oct: added `pull_request.auto_merge`*); the `new_kind` and `shape_changed`
   triggers (§5.1) can turn either into a notification. A program with a user interface can offer
   *Add an automation* and *Add a screen rule* right there.
+- **Bounded**: a hook without event types has a kind per payload shape, which a sender can vary at
+  will, so a hook keeps at most 200 kinds (more aren't recorded, and the run says so), and at most 10
+  new kinds an hour count as *new* (fire `new_kind` triggers); the rest are recorded quietly.
 - **Used everywhere a field is chosen**: filters, the screen's field rules, and templates
   (`{{payload.pull_request.title}}`). `00hooks automations check` flags a filter on a field a kind
   no longer has, instead of it silently never matching.
@@ -308,7 +316,10 @@ Plain actions, no AI:
   The URL's host must be in the automation's allowlist.
 - **Run a command**: an allowed executable and an argument list. Template values are passed as
   separate arguments or environment variables, **never through a shell**; the executable must be on
-  the automation's allowlist; it runs without your shell's environment and with a time limit.
+  the automation's allowlist; it runs without your shell's environment, in a private folder of its
+  own (removed afterwards), with a time limit, and everything it started is killed when it exits.
+  An argument that begins with an event value can't begin with `-` (it would be an option), unless
+  the action puts `options_end: "--"` before such arguments or says `raw: true`.
 - **Write a file**: append a line or write a JSON file in a chosen folder (templated name, sanitised).
 
 AI actions, only in a program that embeds the runner and runs agents:
@@ -340,7 +351,8 @@ AI actions, only in a program that embeds the runner and runs agents:
 - **Rate limits** per automation (default 30 runs an hour) and a **circuit breaker** that pauses an
   automation after repeated failures and tells you.
 - **Loop prevention**: actions that call out carry an `00hooks-origin` header and a hop count; an event
-  arriving with our own origin header and a hop count over the limit is dropped.
+  arriving with our own origin header, **or** with a hop count over the limit (from any origin), is
+  dropped.
 - **Offline**: events wait at the relay (7 days by default) and run when the machine is back, oldest
   first, with a summary notification if many were waiting.
 
@@ -485,8 +497,10 @@ unless they keep matching (default 90 days).
 - It can only **answer typed questions**: it has no tools and no output that becomes an action. The
   worst a manipulated evaluator can do is pass something, and passing never grants anything: the
   item still meets its automation's access profile, approvals and budgets (§6.2).
-- **If it fails or times out**, the screen falls back to a per-source default (quarantine for anything
-  bound for an agent, pass for plain notifications), never to silently passing.
+- **If it fails, times out, or its daily cap is reached**, the screen falls back to a per-source
+  default: quarantine whenever anything beyond a notification would act on the item (an agent, a
+  command, a call, a file written), pass only when every action is a notification. Someone who can
+  exhaust the cap or slow the evaluator gains nothing that way.
 - **Providers**: any Decisions endpoint (OpenRouter's, and others as they appear), any chat model through
   a structured-output adapter, or a **local model** for full privacy. Requests to hosted models ask for
   zero data retention and no training on the data where the provider supports it, and a model that
@@ -523,8 +537,9 @@ implements no extras, and a relay that sets nothing announces none.
   questions, URL configurable), any chat model through structured output, or a local model on
   loopback; thresholds configurable; verdicts cached by fingerprint; no tools; zero retention and no
   training asked for, and a decider that can't promise it refused for a sensitive source; a daily cap
-  and cost per source; it fails closed to the source's fallback (quarantine for an agent, pass for a
-  notification). `fixtures/screen.v1.json` holds both halves to the same words, shapes, signatures,
+  and cost per source; it fails closed to the source's fallback (quarantine when anything beyond a
+  notification would act, pass when only notifications would). A rule that doesn't compile isn't
+  dropped: it is reported, and what it applies to is quarantined until it is fixed. `fixtures/screen.v1.json` holds both halves to the same words, shapes, signatures,
   domains and keyed hashes.
 - **Runner and CLI**: the runner screens every live event before any automation (not replays,
   releases, or events released at the relay); a held event's run is `held`, a dropped one's

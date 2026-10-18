@@ -55,7 +55,7 @@ fn events_sealed_by_the_relays_code_under_node_open_here() {
         let e: Event = serde_json::from_value(item["message"].clone()).unwrap();
         if e.strict {
             // Its provider signature is a placeholder: with no secret here it is refused, as it must be.
-            assert!(opener.open(e).unwrap_err().contains("strict hook"));
+            assert!(opener.open(e).unwrap_err().message.contains("strict hook"));
             continue;
         }
         let o = opener.open(e).unwrap();

@@ -276,8 +276,8 @@ pub async fn run(as_json: bool, filters: Vec<String>) -> CliResult {
             StreamEvent::Quarantined { seq, path, error } => {
                 let which = seq.map(|n| format!(" {n}")).unwrap_or_default();
                 vec![Line::Err(format!(
-                    "Event{which} arrived but couldn't be read ({}). Its raw message is kept in {}, \
-                     and it was acknowledged, so the relay won't send it again.",
+                    "Event{which} arrived but couldn't be read ({}). It is noted in {} (`00hooks \
+                     quarantine list`), and it was acknowledged, so the relay won't send it again.",
                     sanitize(&error, false),
                     path.display()
                 ))]

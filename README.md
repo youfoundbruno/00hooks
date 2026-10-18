@@ -56,7 +56,10 @@ Then deploy your relay ([`relay/README.md`](relay/README.md), "Self-hosting") an
 00hooks hooks create --name pay --preset stripe --secret-stdin   providers that issue their own secret
 00hooks hooks create --name pay --preset stripe --strict --secret-stdin
                                                            verify here: the relay never holds it
-00hooks hooks secret <hook> --secret-stdin                 a strict hook's secret on another computer
+00hooks hooks secret <hook> --preset stripe --secret-stdin
+                                                           a strict hook's secret on another computer
+00hooks quarantine list                                    events that couldn't be read, and why
+00hooks quarantine retry                                   open the ones that waited for a secret or key
 00hooks devices seal-key                                   a sealing key for a login from before sealing
 00hooks keys create --name ci --scope hooks:read           an API key for CI (never the stream)
 00hooks audit                                              hooks, devices and keys changed; failures counted
@@ -64,6 +67,14 @@ Then deploy your relay ([`relay/README.md`](relay/README.md), "Self-hosting") an
 
 Presets: `github`, `standard-webhooks`, `standard-webhooks-ed25519`, `stripe`, `slack`, `linear`,
 `shopify`, `twilio`, `meta`, `hmac`, `token`, `unverified` (PROTOCOL §3 says what each one signs).
+
+**Strict** hooks keep the provider's secret on your computers only. Each computer verifies every
+event of a hook it holds the secret for, with the preset and options you gave it (`hooks secret`
+asks for `--preset`, or shows what the relay says and asks you to confirm; `--yes` for scripts), and
+keeps its own replay marks, so even a compromised relay can't forge, downgrade or replay them; it
+can still withhold them. `token` and `unverified` hooks can't be strict. An event that arrives before
+this computer has the secret is held at the relay, then kept whole in the quarantine, and runs once
+the secret is added.
 
 ## Automations
 
@@ -98,8 +109,21 @@ automations:
   `or`, `not`. They can't run anything.
 - **Templates** fill `{{path}}` slots, with the filters `money`, `truncate`, `json` and `upper`.
 - **Actions** never use a shell: a command gets an argument list and the event on stdin (or in a
-  file named by `HOOKS_EVENT_FILE`), with only `PATH`, `HOME` and `LANG` from your environment; a
-  call's host must be in `allow_hosts`; a file's folder is fixed and its name sanitised.
+  file named by `HOOKS_EVENT_FILE`), with only `PATH`, `HOME` and `LANG` from your environment, in a
+  private working folder of its own that is removed afterwards; a call's host must be in
+  `allow_hosts`; a file's folder is fixed and its name sanitised.
+- **Option injection**: an argument that begins with an event value (`"{{payload.url}}"`) and
+  renders to something starting with `-` would be read by many programs as an option
+  (`git --upload-pack=…`, `ssh -oProxyCommand=…`), so the run is refused. Arguments you write,
+  `--title={{payload.title}}` included, are never refused. Two keys on the `run` action change it:
+
+  ```yaml
+  - run: { command: git, args: [clone, "{{payload.url}}"], options_end: "--" }  # `--` goes before the first event-led argument
+  - run: { command: tool, args: ["{{payload.x}}"], raw: true }                  # pass values starting with `-` as they are
+  ```
+
+  Use `options_end` for programs that honour `--` (arguments after it may start with `-`), and
+  `raw: true` only for a program those values can't mislead.
 - `00hooks kinds` lists the kinds of events seen and `00hooks kinds show <hook/kind>` their fields;
   `00hooks automations check` validates the file against them; `00hooks runs` and
   `00hooks replay <event>` show and repeat runs.

@@ -9,26 +9,20 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
+use base64::Engine;
 use common::{Conn, MockRelay, TempHome};
 use hooks_client::backoff::{Clock, Jitter};
+use hooks_client::seal::StrictSecrets;
+use hooks_client::store::QuarantineKind;
 use hooks_client::{
-    Client, DeviceKey, Error, Opener, SealKey, StateDir, StreamEvent, SubscribeOptions,
+    Client, DeviceKey, Error, Opener, SealKey, StateDir, StreamEvent, StrictHook, SubscribeOptions,
     Subscription, subscribe,
 };
 
-/// A device on the mock relay, with a state directory the relay can inspect on ack.
+/// A device on the mock relay, with a state directory the relay can inspect on ack. Every device
+/// seals: a subscription without an opener refuses to start.
 async fn device(relay: &MockRelay, tag: &str) -> (Client, StateDir, TempHome) {
-    let key = DeviceKey::generate().unwrap();
-    let joined = Client::new(&relay.url)
-        .unwrap()
-        .create_account("test", &key.public_key(), None, None)
-        .await
-        .unwrap();
-    assert_eq!(joined.account_id, "acc_1");
-    let client = Client::with_device(&relay.url, &joined.device_id, key).unwrap();
-    let home = TempHome::new(tag);
-    let state = StateDir::open(&home.0).unwrap();
-    relay.with(|s| s.client_home = Some(home.0.clone()));
+    let (client, state, home, _) = sealed_device(relay, tag).await;
     (client, state, home)
 }
 
@@ -802,4 +796,371 @@ async fn hook_changes_are_handed_over_in_order_once_each_and_never_recorded_or_a
         })
         .collect();
     assert_eq!(again, vec!["hook.deleted"], "{evs:?}");
+}
+
+/// The strict hook of the tests below, and its secret.
+const STRICT_HOOK: &str = "hk_strict";
+const GH_SECRET: &str = "gh-device-secret";
+
+/// The strict secrets a device holds, changed by the test as it goes.
+#[derive(Clone, Default)]
+struct Secrets(Arc<Mutex<Option<StrictHook>>>);
+
+impl StrictSecrets for Secrets {
+    fn get(&self, hook_id: &str) -> hooks_client::Result<Option<StrictHook>> {
+        Ok(if hook_id == STRICT_HOOK {
+            self.0.lock().unwrap().clone()
+        } else {
+            None
+        })
+    }
+}
+
+impl Secrets {
+    fn add(&self) {
+        *self.0.lock().unwrap() = Some(StrictHook {
+            verify: serde_json::json!({"preset": "github", "strict": true}),
+            secrets: vec![GH_SECRET.into()],
+        });
+    }
+}
+
+/// A sealed device whose opener asks `secrets` about strict hooks.
+async fn strict_device(
+    relay: &MockRelay,
+    tag: &str,
+    secrets: Secrets,
+) -> (Client, StateDir, TempHome) {
+    let key = DeviceKey::generate().unwrap();
+    let seal = SealKey::generate().unwrap();
+    let anon = Client::new(&relay.url).unwrap();
+    let info = anon.info().await.unwrap();
+    let joined = anon
+        .create_account("test", &key.public_key(), Some(&seal.public_key()), None)
+        .await
+        .unwrap();
+    let client = Client::with_device(&relay.url, &joined.device_id, key).unwrap();
+    let mut opener = Opener::new(&joined.device_id, info.relay_key.as_deref()).unwrap();
+    opener.add_key(seal);
+    client.set_opener(opener.with_strict(Box::new(secrets)));
+    let home = TempHome::new(tag);
+    let state = StateDir::open(&home.0).unwrap();
+    relay.with(|s| s.client_home = Some(home.0.clone()));
+    (client, state, home)
+}
+
+/// A genuine GitHub delivery to the strict hook, as the relay stores it (`verified: false`).
+fn strict_event(seq: u64) -> serde_json::Value {
+    use hmac::{KeyInit, Mac};
+    let body = format!("{{\"strict\":{seq}}}");
+    let mut m = <hmac::Hmac<sha2::Sha256>>::new_from_slice(GH_SECRET.as_bytes()).unwrap();
+    m.update(body.as_bytes());
+    let sig: String = m
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut e = common::event(seq);
+    e["hookId"] = serde_json::json!(STRICT_HOOK);
+    e["verified"] = serde_json::json!(false);
+    e["strict"] = serde_json::json!(true);
+    e["receivedAt"] = serde_json::json!(common::now_ms());
+    e["headers"] = serde_json::json!({ "x-hub-signature-256": format!("sha256={sig}") });
+    e["body"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(body));
+    e
+}
+
+fn describe(ev: &StreamEvent) -> String {
+    match ev {
+        StreamEvent::Ready(_) => "ready".into(),
+        StreamEvent::Hook(h) => format!("hook {}", h.seq),
+        StreamEvent::Gap(g) => format!("gap {}-{}", g.from, g.to),
+        StreamEvent::Quarantined { seq, error, .. } => format!("quarantined {seq:?}: {error}"),
+        StreamEvent::Reconnecting { reason, .. } => format!("reconnecting: {reason}"),
+        StreamEvent::Warning(w) => format!("warning: {w}"),
+        StreamEvent::Resync(_) => "resync".into(),
+        StreamEvent::HookChange(c) => format!("hook-change {c:?}"),
+        _ => "other".into(),
+    }
+}
+
+/// Read until `pred` holds for an event; returns everything read, described.
+async fn read_until(sub: &mut Subscription, pred: impl Fn(&StreamEvent) -> bool) -> Vec<String> {
+    let mut seen = Vec::new();
+    let fut = async {
+        loop {
+            let ev = sub.next().await.expect("ended").expect("failed");
+            seen.push(describe(&ev));
+            if pred(&ev) {
+                return;
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(10), fut)
+        .await
+        .is_err()
+    {
+        panic!("timed out; read {seen:#?}");
+    }
+    seen
+}
+
+#[tokio::test]
+async fn a_subscription_without_an_opener_refuses_to_start() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=1);
+    let key = DeviceKey::generate().unwrap();
+    let joined = Client::new(&relay.url)
+        .unwrap()
+        .create_account("test", &key.public_key(), None, None)
+        .await
+        .unwrap();
+    let client = Client::with_device(&relay.url, &joined.device_id, key).unwrap();
+    let home = TempHome::new("noopener");
+    let state = StateDir::open(&home.0).unwrap();
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    match sub.next().await {
+        Some(Err(Error::Invalid(m))) => assert!(m.contains("Opener"), "{m}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(sub.next().await.is_none());
+    assert!(
+        relay.with(|s| s.stream_requests.is_empty()),
+        "never connected"
+    );
+}
+
+#[tokio::test]
+async fn a_strict_event_without_its_secret_is_held_unacknowledged_until_the_secret_arrives() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=1);
+    relay.with(|s| s.log.push(strict_event(2)));
+    relay.push_events(3..=3);
+    let secrets = Secrets::default();
+    let (client, state, _home) = strict_device(&relay, "hold", secrets.clone()).await;
+    let opts = SubscribeOptions {
+        hold_attempts: 1000,
+        ..fast()
+    };
+    let mut sub = subscribe(client, state.open_events().unwrap(), opts);
+    let seen = read_until(&mut sub, |e| matches!(e, StreamEvent::Reconnecting { .. })).await;
+    assert!(seen.contains(&"hook 1".to_string()), "{seen:?}");
+    assert!(
+        seen.iter().any(|l| l.contains("event 2 is held")),
+        "{seen:?}"
+    );
+    // Not acknowledged: the relay keeps it (and everything after it).
+    assert_eq!(relay.with(|s| s.acked), 1);
+    secrets.add();
+    let seen = read_until(
+        &mut sub,
+        |e| matches!(e, StreamEvent::Hook(h) if h.seq == 3),
+    )
+    .await;
+    assert!(seen.contains(&"hook 2".to_string()), "{seen:?}");
+    assert!(
+        !seen.iter().any(|l| l.starts_with("quarantined")),
+        "{seen:?}"
+    );
+    assert!(sub.store().quarantined().unwrap().is_empty());
+    assert!(relay.with(|s| s.violations.is_empty()));
+}
+
+#[tokio::test]
+async fn a_strict_event_held_too_long_is_kept_whole_and_opens_on_a_later_reconnect() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=1);
+    relay.with(|s| s.log.push(strict_event(2)));
+    relay.push_events(3..=3);
+    let secrets = Secrets::default();
+    let (client, state, _home) = strict_device(&relay, "holdq", secrets.clone()).await;
+    let opts = SubscribeOptions {
+        hold_attempts: 2,
+        ..fast()
+    };
+    let mut sub = subscribe(client.clone(), state.open_events().unwrap(), opts.clone());
+    let seen = read_until(
+        &mut sub,
+        |e| matches!(e, StreamEvent::Hook(h) if h.seq == 3),
+    )
+    .await;
+    assert_eq!(
+        seen.iter()
+            .filter(|l| l.starts_with("reconnecting: event 2 is held"))
+            .count(),
+        2,
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|l| l.starts_with("quarantined Some(2)")),
+        "{seen:?}"
+    );
+    let q = sub.store().quarantined().unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].kind, QuarantineKind::Recoverable);
+    assert!(!q[0].data.is_empty(), "kept whole");
+    drop(sub);
+    // The secret is added; the next connection's `ready` opens it from the quarantine.
+    secrets.add();
+    let mut sub = subscribe(client, state.open_events().unwrap(), opts);
+    let seen = read_until(&mut sub, |e| matches!(e, StreamEvent::Hook(_))).await;
+    assert!(seen.contains(&"hook 2".to_string()), "{seen:?}");
+    assert!(sub.store().quarantined().unwrap().is_empty());
+    assert!(relay.with(|s| s.violations.is_empty()));
+}
+
+#[tokio::test]
+async fn an_old_seq_sent_again_under_a_new_id_is_quarantined_not_run() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=3);
+    let (client, state, _home) = device(&relay, "stale").await;
+    let mut sub = subscribe(client.clone(), state.open_events().unwrap(), fast());
+    read_hooks(&mut sub, 3).await;
+    drop(sub);
+    // A relay that resends seq 2 (as a new event: its id has long left the seen set, say).
+    relay.with(|s| {
+        s.log[1]["id"] = serde_json::json!("evt_resent");
+        s.script.push_back(Conn::Rewind(2));
+    });
+    relay.push_events(4..=4);
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let seen = read_until(
+        &mut sub,
+        |e| matches!(e, StreamEvent::Hook(h) if h.seq == 4),
+    )
+    .await;
+    assert!(
+        seen.iter()
+            .any(|l| l.starts_with("quarantined Some(2)") && l.contains("cursor")),
+        "{seen:?}"
+    );
+    assert!(!seen.contains(&"hook 2".to_string()), "{seen:?}");
+    let q = sub.store().quarantined().unwrap();
+    assert_eq!(q[0].kind, QuarantineKind::Stale);
+    assert!(q[0].data.is_empty());
+}
+
+#[tokio::test]
+async fn a_gap_past_the_relays_head_never_moves_the_cursor_there() {
+    let relay = MockRelay::start().await;
+    relay.push_events(4..=5);
+    relay.with(|s| {
+        s.script.push_back(Conn::Gap(1, 1_000_000));
+        s.script.push_back(Conn::Gap(900, 1_000_000));
+    });
+    let (client, state, _home) = device(&relay, "gapclamp").await;
+    let mut sub = subscribe(client.clone(), state.open_events().unwrap(), fast());
+    let seen = read_until(&mut sub, |e| matches!(e, StreamEvent::Gap(_))).await;
+    assert_eq!(seen.last().unwrap(), "gap 1-5", "clamped to the head");
+    drop(sub);
+    assert_eq!(state.open_events().unwrap().cursor(), 5);
+    // A gap that starts past the head is ignored outright, and what comes next still arrives.
+    relay.push_events(6..=6);
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let seen = read_until(
+        &mut sub,
+        |e| matches!(e, StreamEvent::Hook(h) if h.seq == 6),
+    )
+    .await;
+    assert!(
+        seen.iter()
+            .any(|l| l.contains("ignored a gap (900 to 1000000)")),
+        "{seen:?}"
+    );
+    assert_eq!(sub.store().cursor(), 6);
+}
+
+#[tokio::test]
+async fn an_event_too_large_for_the_stream_is_skipped_after_a_few_tries() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=1);
+    relay.with(|s| {
+        let mut big = common::event(2);
+        big["body"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode("x".repeat(20_000)));
+        s.log.push(big);
+    });
+    relay.push_events(3..=3);
+    let (client, state, _home) = device(&relay, "oversize").await;
+    let opts = SubscribeOptions {
+        max_event_bytes: 4096,
+        ..fast()
+    };
+    let mut sub = subscribe(client, state.open_events().unwrap(), opts);
+    let seen = read_until(
+        &mut sub,
+        |e| matches!(e, StreamEvent::Hook(h) if h.seq == 3),
+    )
+    .await;
+    assert_eq!(
+        seen.iter()
+            .filter(|l| l.contains("larger than 4096"))
+            .count(),
+        4,
+        "three reconnects and one quarantine: {seen:?}"
+    );
+    let q = sub.store().quarantined().unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!((q[0].kind, q[0].seq), (QuarantineKind::Oversize, Some(2)));
+}
+
+#[tokio::test]
+async fn a_stream_that_never_opens_is_given_up_on_and_retried() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=1);
+    relay.with(|s| s.script.push_back(Conn::Stall));
+    let (client, state, _home) = device(&relay, "stall").await;
+    let opts = SubscribeOptions {
+        open_timeout: Duration::from_millis(300),
+        ..fast()
+    };
+    let mut sub = subscribe(client, state.open_events().unwrap(), opts);
+    let seen = read_until(&mut sub, |e| matches!(e, StreamEvent::Hook(_))).await;
+    assert!(
+        seen[0].contains("didn't open the stream within"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn failing_acks_do_not_keep_a_silent_connection_alive() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=1);
+    relay.with(|s| {
+        s.script.push_back(Conn::SilentAfter(1));
+        s.fail_acks = usize::MAX;
+    });
+    let (client, state, _home) = device(&relay, "idleack").await;
+    let clock = ManualClock::default();
+    let opts = SubscribeOptions {
+        jitter: Jitter::new(3),
+        clock: Arc::new(clock.clone()),
+        ..Default::default()
+    };
+    let mut sub = subscribe(client, state.open_events().unwrap(), opts);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        while let Some(r) = sub.next().await {
+            if tx.send(r).is_err() {
+                return;
+            }
+        }
+    });
+    let mut virtual_now = Duration::ZERO;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Err(_) => virtual_now = clock.advance(),
+            Ok(Some(Ok(StreamEvent::Reconnecting { reason, .. }))) => {
+                assert_eq!(reason, "no data for 70 s");
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    reader.abort();
+    // Ack retries fired at 1, 3, 7, 15, 31 and 61 s; none of them moved the deadline.
+    assert_eq!(virtual_now, Duration::from_secs(70));
+    assert!(relay.with(|s| s.failed_acks) >= 6);
 }
