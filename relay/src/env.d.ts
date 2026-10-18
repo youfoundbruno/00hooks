@@ -40,4 +40,20 @@ interface __BaseEnv_Env {
   PHONE_PHONE_QUEUE_MAX?: string;
   /** Bytes one device's queue may hold, either way; 16 MiB when unset. */
   PHONE_QUEUE_MAX_BYTES?: string;
+  /** Pushes one phone may be sent in a rolling hour (PROTOCOL §10.7); 30 when unset. */
+  PHONE_PUSH_PER_HOUR?: string;
+  /**
+   * The APNs signing key (PROTOCOL §10.7): the contents of the `.p8` file Apple gives, a PKCS#8 PEM of
+   * a P-256 key, BEGIN and END lines included (surrounding whitespace and `\n` escapes are fine).
+   * Push is available only with this, `APNS_KEY_ID`, `APNS_TEAM_ID` and `APNS_TOPIC` all set.
+   */
+  APNS_KEY?: string;
+  /** The APNs key's 10-character key id. */
+  APNS_KEY_ID?: string;
+  /** The Apple developer team's 10-character id. */
+  APNS_TEAM_ID?: string;
+  /** The phone app's bundle id, sent as `apns-topic`. */
+  APNS_TOPIC?: string;
+  /** `sandbox` or `production` (the default when unset): which APNs host pushes go to. */
+  APNS_ENVIRONMENT?: string;
 }

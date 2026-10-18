@@ -195,9 +195,11 @@ characters); both sides compute it.
   older backlog and doesn't hold it back from deletion.
 - `GET /v1/info` (unsigned) → `{ "version", "protocol": 2, "protocols": [2], "signupOpen": bool,
   "relayKey", "serverTime", "screen": { "edge": true, "maxRules": 200, "heldDays" }, "extras": [],
-  "phone": { "protocol": 1 } }`. `signupOpen` is true only when a signup needs no token
+  "phone": { "protocol": 1, "push": { "available": bool, "environment": "sandbox" | "production" |
+  null } } }`. `signupOpen` is true only when a signup needs no token
   (`OPEN_SIGNUP=1` and no `SIGNUP_TOKEN`). `phone` says the relay carries phone links (§10) and the
-  version of their socket protocol.
+  version of their socket protocol; `phone.push` says whether it can wake a phone through APNs
+  (§10.7) and which APNs environment it sends to (null when it can't).
   `screen` says what the edge screen takes (§4b). `extras` lists the optional hosted extras this
   relay offers (fingerprint sync across devices, reputation lists shared as hashes, a longer hold,
   evaluator credits…), each `{ "id", "title", "description"?, "url"? }`, as the operator sets them
@@ -808,7 +810,8 @@ Every error body is `{ "error": "<code>", "message": "<one plain sentence>" }`. 
 `clock_skew`, `not_found`, `too_large`, `rate_limited`, `quota` (a `429`: the account's log is full),
 `signature`, `invalid` (with `field`), `conflict`, `forbidden` (a `403`: an API key without the
 scope, or a route only a device may use), `unavailable` (a `503`: the relay is missing a safety
-binding or its signing key and refuses rather than run without it), `internal` (a `500`; the relay logs the
+binding or its signing key and refuses rather than run without it), `push_failed` (a `502`: Apple's
+push service didn't take a push, §10.7), `internal` (a `500`; the relay logs the
 cause, never the payload). Messages never contain secrets, signatures or payload content.
 
 ## 9. API keys, the audit log and the events list
@@ -1031,7 +1034,9 @@ the same `id`.
   "sig": <86 base64url>, "push"?: "approval" | "message" | "notice" }
 ```
 
-Any other field, or any field of the wrong form, is refused `invalid`; so is `push` from a phone. The
+Any other field, or any field of the wrong form, is refused `invalid`; so is `push` from a phone.
+`push` is still accepted from a node, for older nodes, and carried as sent, but the relay no longer
+acts on it: a node asks for a push with `POST /v1/phone/push` (§10.7). The
 relay doesn't check `sig`, `kid` or `at` (the recipient does) and never opens `ct`. It stores the
 envelope as the JSON text it parsed (`JSON.stringify` of the received object: the same fields and
 values, in the order sent) and forwards it spliced into the `msg` frame without re-encoding, so
@@ -1083,9 +1088,11 @@ itself lost.
 | queue to a phone | 500 rows or 16 MiB, then the oldest are dropped (`gap`) |
 | retention | 7 days (`RETENTION_DAYS`) |
 | hello | 8 KiB of ciphertext |
+| pushes (§10.7) | per phone: one per kind a minute, and 30 in a rolling hour (`PHONE_PUSH_PER_HOUR`); none while its socket is online |
+| push preview | `ct` at most 1,400 base64 characters |
 
 A relay operator may lower the queue limits with `PHONE_NODE_QUEUE_MAX`, `PHONE_PHONE_QUEUE_MAX` and
-`PHONE_QUEUE_MAX_BYTES`.
+`PHONE_QUEUE_MAX_BYTES`, and change the hourly push cap with `PHONE_PUSH_PER_HOUR`.
 
 ### 10.6 How the relay serves it (informative)
 
@@ -1094,19 +1101,97 @@ queue (seq, recipient, sender, `msg` or `sys`, id, the envelope text, size, time
 row and byte counts (kept by triggers on the queue, so a send never scans it), each device's cursor,
 gap record and token bucket, the account's phones (peer, pending, revoked: so a socket's sends are
 checked without D1), the nodes revoked there (so a socket or pairing already past the Worker is
-refused), the phones' request nonces and when each device was last seen. Its sockets use the
+refused), the phones' request nonces, when each device was last seen, and each phone's pushes of
+the last hour (phone, kind and time only). Its sockets use the
 hibernation API: per-socket state (role, peer, `hello` time) is the socket's attachment, `ping` is
-auto-answered, and an alarm prunes rows past retention, nonces and pending phones whose time ran
-out, so an idle account costs nothing. The Worker authenticates the upgrade
+auto-answered, and an alarm prunes rows past retention, nonces, push counts older than an hour and
+pending phones whose time ran out, so an idle account costs nothing. The Worker authenticates the upgrade
 request, then hands it to the object, whose `101` goes back to the client.
 
-### 10.7 The push hook (designed, not built)
+### 10.7 Push
 
-When the relay queues an envelope that carries `push` for a phone whose socket isn't online, it
-calls `pushHook(env, deviceId, category)` (`relay/src/phone-push.ts`), which does nothing yet:
-sending through APNs needs the operator's Apple developer account and key. When it is built, the
-phone registers its APNs device token with the relay (a signed `PUT /v1/phone/push`), never with its
-node; the relay sends a fixed alert text per category with `mutable-content`, so the phone opens the
-sealed envelope itself and shows the real text only on the device; at most one push per category per
-phone per minute, and none while its socket is open. The hook is given the device id and the
-category, never the envelope.
+A node can ask the relay to wake one of its phones through Apple's push service (APNs) when the
+phone's socket isn't online. The **node** keeps each phone's APNs device token (the phone sends it to
+its node, sealed, like everything else) and decides what is worth a push; the **relay** holds only
+the operator's APNs key, checks that the phone is the node's, applies the limits, and sends a fixed,
+opaque alert. The relay stores no device token and puts nothing the node wrote into the alert.
+
+**`POST /v1/phone/push`** (signed by a device of kind `device`; a phone, or an API key, is `403`
+`forbidden` as on the other node-only phone routes):
+
+```
+{ "device": "dev_…", "token": <the APNs device token: lowercase hex, 32 to 400 characters, an even number>,
+  "environment"?: "sandbox" | "production",
+  "kind": "approval" | "ask" | "finished" | "handoff" | "reconnect",
+  "ref": <22 characters of unpadded base64url>,
+  "preview"?: { "at": <integer ms>, "enc": <43 base64url>, "ct": <standard padded base64, at most 1,400 characters>, "sig": <86 base64url> } }
+```
+
+`ref` is the node's own reference (what the phone opens when the alert is tapped); `preview`, when
+given, is sealed to the phone by the node and carried as it is, so the phone's notification extension
+can show the real text on the device. The relay reads neither. Checks, in order:
+
+1. The shape: a missing or malformed field, or any other field (also inside `preview`), is `400`
+   `invalid` with `field`.
+2. `device` must be one of the calling node's own phones, confirmed and not revoked: anything else
+   (a pending phone, a revoked one, another node's, another account's, an unknown id) is `403`
+   `forbidden` "That phone isn't paired with this device.". Nothing is sent.
+3. Push isn't configured on this relay (below): `200` `{ "sent": false, "reason": "unavailable" }`.
+4. `environment` is given and isn't the relay's: `200` `{ "sent": false, "reason": "environment" }`.
+   Without `environment` it isn't checked.
+5. The phone's socket is online (§10.3): `200` `{ "sent": false, "reason": "online" }`. It gets the
+   live message instead.
+6. The phone's limits: one push per phone and kind a minute, and 30 per phone in a rolling hour
+   (`PHONE_PUSH_PER_HOUR`). Past either, `429` `rate_limited` with `Retry-After` and `retryAfter`
+   (seconds). Only a push that passes every check is counted, before it is sent, whatever APNs then
+   answers; the answers above count nothing. The counts are kept in the account's phone object,
+   pruned after an hour, and deleted with the phone when it is revoked.
+7. The relay sends it: `POST https://api.push.apple.com/3/device/<token>` (sandbox:
+   `https://api.sandbox.push.apple.com`), with `authorization: bearer <provider token>`,
+   `apns-topic: <APNS_TOPIC>`, `apns-push-type: alert`, `apns-priority: 10`,
+   `apns-expiration: <now + 86,400, Unix seconds>`, `apns-collapse-id: <kind>` and
+   `content-type: application/json`. The body is built by the relay alone:
+
+   ```
+   { "aps": { "alert": { "title": T, "body": B }, "sound": "default", "category": C,
+              "mutable-content": 1, "thread-id": "<kind>" },
+     "zn": { "v": 1, "kind": "<kind>", "ref": "<ref>", "p": <preview, only when given> } }
+   ```
+
+   | kind | title (T) | body (B) | category (C) |
+   |---|---|---|---|
+   | `approval` | An agent needs you | Approval needed. | `APPROVAL` |
+   | `ask` | An agent needs you | It asked you something. | `ASK` |
+   | `finished` | An agent finished | Open the app to see what it did. | `FINISHED` |
+   | `handoff` | Continue on your phone | A conversation was handed to this phone. | `HANDOFF` |
+   | `reconnect` | Your Mac is back online | Open the app to reconnect. | `RECONNECT` |
+
+   Nothing else from the request goes into the payload: never the token, a device id, or any text
+   from the node.
+8. APNs' answer: `200` → `200` `{ "sent": true }`. `410`, or `400` with reason `BadDeviceToken`,
+   `DeviceTokenNotForTopic` or `Unregistered` → `200` `{ "sent": false, "reason": "unregistered" }`:
+   the node forgets that token. `403` `ExpiredProviderToken` or `InvalidProviderToken` → the relay
+   mints a fresh provider token and tries once more, and answers from that second try. `429` →
+   `429` `rate_limited` with `Retry-After: 60`. Anything else, a network error or a redirect →
+   `502` `push_failed`. The relay logs the kind and APNs' status and reason word, never the token
+   or the payload.
+
+**The provider token** is an ES256 JWT: header `{"alg":"ES256","kid":<APNS_KEY_ID>}`, claims
+`{"iss":<APNS_TEAM_ID>,"iat":<Unix seconds>}`, each unpadded base64url, signed with ECDSA P-256 and
+SHA-256 over `header.claims` (the raw 64-byte r‖s signature, as JOSE writes it). Each Worker or
+object instance reuses its token for 50 minutes (APNs refuses tokens older than an hour and
+refreshes more often than every 20 minutes) and mints a new one when the key, key id or team
+changes. Several instances may each hold their own token.
+
+**Configuration** (Worker secrets): `APNS_KEY`, the contents of the `.p8` file Apple gives (a PKCS#8
+PEM of a P-256 key, BEGIN and END lines included; surrounding whitespace and `\n` escapes are
+fine); `APNS_KEY_ID` and `APNS_TEAM_ID` (10 characters each); `APNS_TOPIC`, the phone app's bundle
+id; `APNS_ENVIRONMENT`, `sandbox` or `production` (the default when unset). Push is available only
+when the first four are set and well formed, `APNS_ENVIRONMENT` is one of the two, and the key
+imports; `/v1/info` says so (§2). The APNs hosts aren't configurable.
+
+The requests were checked against a mock of APNs in the relay's tests, not against Apple's service.
+APNs needs HTTP/2, which the Workers runtime negotiates for outbound HTTPS.
+
+The envelope's `push` field (§10.4) is from an earlier design, in which the relay pushed when it
+queued a tagged envelope. It is still accepted from a node and carried, and ignored.

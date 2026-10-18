@@ -4,6 +4,7 @@
 import { createAccount, createEnrolment, listDevices, putSealKey, redeemEnrolment, revokeDevice, signupOpen } from "./accounts.ts";
 import { listEvents, readAudit } from "./audit.ts";
 import { authenticate, deviceAsPrincipal, type Caller, type Principal } from "./auth.ts";
+import { pushInfo } from "./apns.ts";
 import { importRelayKey } from "./envelope.ts";
 import { describeError } from "./describe-error.ts";
 import { isId } from "./encoding.ts";
@@ -16,6 +17,7 @@ import { dropHeld, dropHeldBulk, listHeld, releaseHeld, screenInfo, screenKeyFor
 import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
 import { confirmPhone, createPairing, listPhones, openPhoneSocket, redeemPairing, unpairSelf } from "./phone.ts";
 import { PHONE_PROTOCOL } from "./phone-object.ts";
+import { pushToPhone } from "./phone-push.ts";
 import { receive, receiveGet } from "./receive.ts";
 import { ack, openStream } from "./stream.ts";
 import { PROTOCOLS, STREAM_PROTOCOL, VERSION } from "./version.ts";
@@ -76,7 +78,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       relayKey,
       serverTime: Date.now(),
       ...screenInfo(env),
-      phone: { protocol: PHONE_PROTOCOL },
+      phone: { protocol: PHONE_PROTOCOL, push: await pushInfo(env) },
     });
   }
 
@@ -126,6 +128,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (path === "/v1/phone/devices" && method === "GET") return listPhones(env, await phoneRoute({ device: true, phone: false }));
     const cf = /^\/v1\/phone\/devices\/([^/]+)\/confirm$/.exec(path);
     if (cf && method === "POST") return confirmPhone(env, await phoneRoute({ device: true, phone: false }), cf[1]!);
+    if (path === "/v1/phone/push" && method === "POST") return pushToPhone(env, await phoneRoute({ device: true, phone: false }), body);
     if (path === "/v1/phone/self" && method === "DELETE") return unpairSelf(env, await phoneRoute({ device: false, phone: true, pending: true }));
     if (path === "/v1/phone/socket" && method === "GET") {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {

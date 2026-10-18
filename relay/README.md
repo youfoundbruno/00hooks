@@ -22,7 +22,7 @@ CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hiber
   envelope signature. `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE
   bridge. `src/audit.ts`: the audit log and events list. `src/account-object.ts`: the Durable
   Object. `src/phone.ts`: the phone routes; `src/phone-object.ts`: their Durable Object (mailbox,
-  cursors, sockets); `src/phone-push.ts`: the push hook (not built). `migrations/`: the D1 schema.
+  cursors, sockets); `src/phone-push.ts` and `src/apns.ts`: waking a phone through APNs. `migrations/`: the D1 schema.
 - `scripts/seal-interop.ts` seals events with `src/envelope.ts` under Node, for the CLI's interop
   tests (`fixtures/seal-interop.v1.json`).
 
@@ -71,6 +71,14 @@ deployment. Keep your account's ids in a copy that git ignores:
    | `HASH_PEPPER` | HMAC key for enrolment-code, client-IP, dedupe-mark and API-key hashes | `openssl rand -base64 32` |
    | `RELAY_SIGNING_KEY` | Ed25519 seed (32 bytes, base64) signing every sealed envelope. Its public half is `/v1/info`'s `relayKey`, which clients pin at login: changing it makes every device log in again. Without it the relay takes no deliveries | `openssl rand -base64 32` |
    | `SIGNUP_TOKEN` | Creating an account needs `Authorization: Bearer <token>`. The relay refuses every signup unless this is set or `OPEN_SIGNUP=1` is (`/v1/info` reports `signupOpen`) | `openssl rand -base64 24` |
+   | `APNS_KEY` | Optional, for push (below): the contents of the `.p8` key file from your Apple developer account, BEGIN and END lines included | `wrangler secret put APNS_KEY -c wrangler.deploy.jsonc < AuthKey_XXXXXXXXXX.p8` |
+   | `APNS_KEY_ID` | That key's 10-character key id | `wrangler secret put APNS_KEY_ID -c wrangler.deploy.jsonc` |
+   | `APNS_TEAM_ID` | Your Apple developer team's 10-character id | `wrangler secret put APNS_TEAM_ID -c wrangler.deploy.jsonc` |
+   | `APNS_TOPIC` | The phone app's bundle id | `wrangler secret put APNS_TOPIC -c wrangler.deploy.jsonc` |
+   | `APNS_ENVIRONMENT` | `sandbox` for development builds of the app, `production` (the default when unset) for TestFlight and the App Store | `wrangler secret put APNS_ENVIRONMENT -c wrangler.deploy.jsonc` |
+
+   With `npx`: `npx wrangler secret put APNS_KEY -c wrangler.deploy.jsonc < AuthKey_XXXXXXXXXX.p8`,
+   and so on for each name.
 
 6. Apply the migrations, then deploy:
 
@@ -142,7 +150,19 @@ Variables (`vars`), all optional unless noted:
 | `REPLAY_MARK_DAYS` | 180 | how long body-hash replay marks are kept for presets that sign no timestamp. After that, a captured body is accepted again as a new event (see PLAN §3.1) |
 | `ACCOUNT_MAX_DEVICES` | 10 | node devices per account |
 | `PHONE_NODE_QUEUE_MAX`, `PHONE_PHONE_QUEUE_MAX`, `PHONE_QUEUE_MAX_BYTES` | 1,000, 500, 16 MiB | how much a phone link's queue may hold (PROTOCOL §10.5) |
+| `PHONE_PUSH_PER_HOUR` | 30 | pushes one phone may be sent in a rolling hour (PROTOCOL §10.7) |
 | `HOSTED_EXTRAS` | unset | extras the operator offers, as JSON, announced as data in `/v1/info` `extras` (PROTOCOL §2). A self-hosted relay leaves it unset |
+
+### Push
+
+Push is off until the APNs secrets above are set: every `POST /v1/phone/push` answers
+`{ "sent": false, "reason": "unavailable" }` and nothing goes to Apple. Once `APNS_KEY`, `APNS_KEY_ID`,
+`APNS_TEAM_ID` and `APNS_TOPIC` are set and the key imports, `/v1/info` says
+`"push": { "available": true, "environment": … }` under `phone`. The node keeps each phone's device
+token and sends it with each request; the relay keeps no token, sends a fixed alert per kind, and
+limits each phone to one push per kind a minute and 30 an hour (PROTOCOL §10.7). The requests to
+Apple were checked against a mock in the tests, not against Apple's service: try one push on a
+sandbox build before relying on it.
 
 ## Security notes
 
@@ -194,6 +214,8 @@ Variables (`vars`), all optional unless noted:
 - **Phone links** (PROTOCOL §10): the relay routes sealed envelopes between a node and its phones
   and never opens them; it keeps a pairing only as a verifier of its proof (spent once, atomically),
   checks only routing (`from` is the signed-in device, `to` its peer), sizes, rates and queues, and
-  stores envelopes as received until acknowledged. A phone may use only the phone routes.
+  stores envelopes as received until acknowledged. A phone may use only the phone routes. Push
+  (PROTOCOL §10.7) sends only fixed alert texts and the node's sealed preview; the device token is
+  never stored or logged.
 - **Errors** are fixed sentences: they never quote a secret, a signature or payload content.
 - **Webhook content is data**: the relay never acts on it.

@@ -11,11 +11,12 @@
 // its routing (`from`, `to`, sizes, rates, queues) and stored as the JSON text it arrived as; logs
 // carry sizes and ids only. As in AccountObject, nothing is kept in memory between calls: per-socket
 // state is the socket's attachment and per-device state (the token bucket, the cursor, the gap
-// record, the queue counters) is in SQLite, so the object hibernates while nothing moves.
+// record, the queue counters, a phone's recent pushes) is in SQLite, so the object hibernates while
+// nothing moves.
 
 import { DurableObject } from "cloudflare:workers";
 import { isId } from "./encoding.ts";
-import { PUSH_CATEGORIES, pushHook, type PushCategory } from "./phone-push.ts";
+import type { PushAdmission, PushKind } from "./phone-push.ts";
 
 /** The phone protocol this relay speaks (`/v1/info`'s `phone.protocol`). */
 export const PHONE_PROTOCOL = 1;
@@ -38,6 +39,17 @@ export const NODE_FRAME_MAX = 512 * 1024;
 /** Token buckets, one per device, spent by every frame: capacity, and tokens added per second. */
 export const PHONE_BUCKET = { capacity: 30, refill: 1 };
 export const NODE_BUCKET = { capacity: 200, refill: 20 };
+
+/** Pushes (PROTOCOL §10.7): one per (phone, kind) a minute, and `PHONE_PUSH_PER_HOUR` per phone an hour. */
+export const PUSH_KIND_INTERVAL_MS = 60_000;
+export const PUSH_WINDOW_MS = 3600_000;
+export const DEFAULT_PUSHES_PER_HOUR = 30;
+
+/**
+ * The envelope's legacy `push` field: still accepted in shape from a node (older nodes set it), and
+ * ignored. Pushes are asked for with `POST /v1/phone/push` (PROTOCOL §10.7).
+ */
+export const ENVELOPE_PUSH_VALUES: readonly string[] = ["approval", "message", "notice"];
 
 /** Queue defaults: `PHONE_NODE_QUEUE_MAX`, `PHONE_PHONE_QUEUE_MAX`, `PHONE_QUEUE_MAX_BYTES`. */
 export const DEFAULT_NODE_QUEUE_ROWS = 1000;
@@ -126,7 +138,7 @@ export function envelopeShapeOk(env: unknown): env is {
   enc: string;
   ct: string;
   sig: string;
-  push?: PushCategory;
+  push?: string;
 } {
   if (typeof env !== "object" || env === null || Array.isArray(env)) return false;
   const e = env as Record<string, unknown>;
@@ -147,7 +159,7 @@ export function envelopeShapeOk(env: unknown): env is {
     isStandardBase64(e.ct) &&
     typeof e.sig === "string" &&
     B64URL_86.test(e.sig) &&
-    (e.push === undefined || (typeof e.push === "string" && (PUSH_CATEGORIES as readonly string[]).includes(e.push)))
+    (e.push === undefined || (typeof e.push === "string" && ENVELOPE_PUSH_VALUES.includes(e.push)))
   );
 }
 
@@ -170,8 +182,6 @@ export class PhoneObject extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   /** Tests lower the queue limits through this; production uses the env and the defaults. */
   limitsOverride: Partial<QueueLimits> | null = null;
-  /** The push hook (PROTOCOL §10.7); tests replace it to see that it is called. */
-  push: (env: Env, deviceId: string, category: PushCategory) => Promise<void> = pushHook;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -470,6 +480,7 @@ export class PhoneObject extends DurableObject<Env> {
     this.sql.exec("DELETE FROM cursors WHERE device = ?", device);
     this.sql.exec("DELETE FROM buckets WHERE device = ?", device);
     this.sql.exec("DELETE FROM nonces WHERE device_id = ?", device);
+    this.sql.exec("DELETE FROM pushes WHERE device = ?", device);
   }
 
   /**
@@ -495,6 +506,72 @@ export class PhoneObject extends DurableObject<Env> {
   async presence(devices: string[]): Promise<PresenceInfo[]> {
     const now = Date.now();
     return devices.map((d) => this.presenceOf(d, now));
+  }
+
+  /**
+   * Decides a push a node asked for (PROTOCOL §10.7), in order: the phone must be the node's own,
+   * confirmed and not revoked (403); push must be configured; the environment, when the node names
+   * one, must be the relay's; the phone's socket must not be online; and the phone's limits must
+   * allow it (429 with the seconds to wait). An admitted push is counted here, before it is sent, so
+   * parallel requests can't pass the limits together.
+   */
+  async admitPush(input: {
+    node: string;
+    phone: string;
+    kind: PushKind;
+    available: boolean;
+    relayEnvironment: string | null;
+    requestedEnvironment: string | null;
+  }): Promise<PushAdmission> {
+    const now = Date.now();
+    const target = this.phone(input.phone);
+    if (!this.phoneLive(target, now) || target.pending_until !== null || target.peer !== input.node) {
+      return { ok: false, status: 403 };
+    }
+    if (!input.available) return { ok: false, status: 200, reason: "unavailable" };
+    if (input.requestedEnvironment !== null && input.requestedEnvironment !== input.relayEnvironment) {
+      return { ok: false, status: 200, reason: "environment" };
+    }
+    if (this.presenceOf(input.phone, now).online) return { ok: false, status: 200, reason: "online" };
+
+    const retryAfter = this.ctx.storage.transactionSync(() => {
+      const wait = this.pushWait(input.phone, input.kind, now);
+      if (wait === null) this.sql.exec("INSERT INTO pushes (device, kind, at) VALUES (?, ?, ?)", input.phone, input.kind, now);
+      return wait;
+    });
+    if (retryAfter !== null) return { ok: false, status: 429, retryAfter };
+    await this.ensureAlarm();
+    return { ok: true };
+  }
+
+  private pushesPerHour(): number {
+    return positiveNumber(this.env.PHONE_PUSH_PER_HOUR, DEFAULT_PUSHES_PER_HOUR);
+  }
+
+  /** Null when a push of `kind` to `phone` is within its limits now; otherwise the seconds to wait. */
+  private pushWait(phone: string, kind: string, now: number): number | null {
+    let until = 0;
+    const last = this.sql
+      .exec<{ t: number | null }>("SELECT max(at) AS t FROM pushes WHERE device = ? AND kind = ?", phone, kind)
+      .one().t;
+    if (last !== null && now - last < PUSH_KIND_INTERVAL_MS) until = last + PUSH_KIND_INTERVAL_MS;
+    const cap = this.pushesPerHour();
+    const inWindow = this.sql
+      .exec<{ n: number }>("SELECT count(*) AS n FROM pushes WHERE device = ? AND at > ?", phone, now - PUSH_WINDOW_MS)
+      .one().n;
+    if (inWindow >= cap) {
+      // A place frees when the push that would bring the count under the cap leaves the window.
+      const freeing = this.sql
+        .exec<{ at: number }>(
+          "SELECT at FROM pushes WHERE device = ? AND at > ? ORDER BY at LIMIT 1 OFFSET ?",
+          phone,
+          now - PUSH_WINDOW_MS,
+          inWindow - cap,
+        )
+        .toArray()[0]?.at;
+      if (freeing !== undefined) until = Math.max(until, freeing + PUSH_WINDOW_MS);
+    }
+    return until > now ? Math.max(1, Math.ceil((until - now) / 1000)) : null;
   }
 
   /**
@@ -698,14 +775,8 @@ export class PhoneObject extends DurableObject<Env> {
     for (const r of this.ready(env.to)) this.trySend(r, frame);
     this.trySend(ws, JSON.stringify({ t: "queued", id: env.id, seq }));
     await this.ensureAlarm();
-
-    if (recipientRole === "phone" && env.push !== undefined && !this.presenceOf(env.to, now).online) {
-      try {
-        await this.push(this.env, env.to, env.push);
-      } catch {
-        console.error("phone push hook failed");
-      }
-    }
+    // An envelope's `push` is carried as sent and acted on by nothing here: a node asks for a push
+    // with `POST /v1/phone/push` (PROTOCOL §10.7).
   }
 
   /** Drops a phone's oldest rows until one more of `size` bytes fits, recording the loss as a gap. */
@@ -796,6 +867,7 @@ export class PhoneObject extends DurableObject<Env> {
         this.recordGap(r.recipient, lo, r.hi);
       }
       this.sql.exec("DELETE FROM nonces WHERE at <= ?", now - NONCE_TTL_MS);
+      this.sql.exec("DELETE FROM pushes WHERE at <= ?", now - PUSH_WINDOW_MS);
     });
     // Pending phones whose pairing ran out: their sockets close with 4401 and their rows go.
     const expired = this.sql
@@ -812,6 +884,7 @@ export class PhoneObject extends DurableObject<Env> {
     const due: (number | null)[] = [
       ((t) => (t === null ? null : t + retention))(q("SELECT min(at) AS t FROM mailbox")),
       ((t) => (t === null ? null : t + NONCE_TTL_MS))(q("SELECT min(at) AS t FROM nonces")),
+      ((t) => (t === null ? null : t + PUSH_WINDOW_MS))(q("SELECT min(at) AS t FROM pushes")),
       q("SELECT min(pending_until) AS t FROM phones WHERE revoked = 0 AND pending_until IS NOT NULL"),
     ];
     let next = Infinity;
@@ -870,4 +943,9 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS nonces (device_id TEXT NOT NULL, nonce TEXT NOT NULL, at INTEGER NOT NULL,
      PRIMARY KEY (device_id, nonce)) WITHOUT ROWID`,
   "CREATE INDEX IF NOT EXISTS nonces_at ON nonces(at)",
+  // The pushes sent (or attempted) to each phone in the last hour, for its limits (PROTOCOL §10.7):
+  // the phone, the kind and the time only. Never the device token or the payload.
+  "CREATE TABLE IF NOT EXISTS pushes (device TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS pushes_device ON pushes(device, kind, at)",
+  "CREATE INDEX IF NOT EXISTS pushes_at ON pushes(at)",
 ];

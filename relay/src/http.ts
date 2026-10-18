@@ -12,7 +12,8 @@ export type ErrorCode =
   | "conflict"
   | "quota"
   | "forbidden"
-  | "unavailable";
+  | "unavailable"
+  | "push_failed";
 
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {

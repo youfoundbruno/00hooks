@@ -18,3 +18,12 @@ RELAY_SIGNING_KEY=REPLACE_WITH_32_RANDOM_BYTES_BASE64
 # (for local development, or a relay meant to be open).
 SIGNUP_TOKEN=REPLACE_WITH_A_LONG_RANDOM_STRING
 # OPEN_SIGNUP=1
+
+# Push (optional, PROTOCOL §10.7): the APNs key from your Apple developer account. Without all four of
+# the first, push is off and /v1/info says `push.available: false`. Paste the .p8 file's contents
+# with its BEGIN and END lines; `\n` escapes are fine.
+# APNS_KEY="-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----"
+# APNS_KEY_ID=XXXXXXXXXX
+# APNS_TEAM_ID=XXXXXXXXXX
+# APNS_TOPIC=com.example.phone
+# APNS_ENVIRONMENT=sandbox

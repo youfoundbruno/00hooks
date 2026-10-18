@@ -3,7 +3,7 @@
 
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AccountObject } from "../src/account-object.ts";
 import { generateDeviceKey } from "../src/canonical.ts";
 import { toBase64Url, utf8 } from "../src/encoding.ts";
@@ -87,7 +87,8 @@ async function d1Tables(): Promise<string> {
 describe("phone pairing", () => {
   it("announces the phone protocol in /v1/info", async () => {
     const info = (await (await fetchRelay("/v1/info")).json()) as { phone: unknown; protocol: number };
-    expect(info.phone).toEqual({ protocol: 1 });
+    // Push isn't configured in the tests' bindings (phone-push.test.ts sets it).
+    expect(info.phone).toEqual({ protocol: 1, push: { available: false, environment: null } });
     expect(info.protocol).toBe(2);
   });
 
@@ -613,27 +614,30 @@ describe("limits", () => {
     sock.close();
   });
 
-  it("calls the push hook for a push-tagged envelope to a phone that isn't connected", async () => {
+  it("carries an envelope's push field as sent and pushes nothing for it (PROTOCOL §10.7)", async () => {
     const node = await newNode();
     const phone = await pairPhone(node);
-    await runInDurableObject(phoneObject(node.accountId), (o: PhoneObject) => {
-      const calls: [string, string][] = [];
-      (o as unknown as { calls: typeof calls }).calls = calls;
-      o.push = async (_env, device, category) => {
-        calls.push([device, category]);
-      };
-    });
-    const nodeSock = await openPhoneSocket(node);
-    await nodeSock.hello(0);
-    await sendEnv(nodeSock, await makeEnvelope(node, phoneKey(phone), "a", { push: "approval" }));
-    await sendEnv(nodeSock, await makeEnvelope(node, phoneKey(phone), "b"));
-    const phoneSock = await openPhoneSocket(phone);
-    await phoneSock.hello(0);
-    await sendEnv(nodeSock, await makeEnvelope(node, phoneKey(phone), "c", { push: "message" }));
-    const calls = await runInDurableObject(phoneObject(node.accountId), (o: PhoneObject) => (o as unknown as { calls: [string, string][] }).calls);
-    expect(calls).toEqual([[phone.deviceId, "approval"]]);
-    phoneSock.close();
-    nodeSock.close();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    try {
+      const nodeSock = await openPhoneSocket(node);
+      await nodeSock.hello(0);
+      // The phone is offline: the old hook would have fired here. Now nothing does.
+      const tagged = await makeEnvelope(node, phoneKey(phone), "a", { push: "approval" });
+      expect(await sendEnv(nodeSock, tagged)).toMatchObject({ t: "queued" });
+      const phoneSock = await openPhoneSocket(phone);
+      await phoneSock.hello(0);
+      const got = await phoneSock.nextOf("msg");
+      expect(JSON.stringify(got.env)).toBe(JSON.stringify(tagged));
+      expect(fetchSpy).not.toHaveBeenCalled();
+      const pushes = await runInDurableObject(phoneObject(node.accountId), (_o: PhoneObject, state) =>
+        state.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM pushes").one().n,
+      );
+      expect(pushes).toBe(0);
+      phoneSock.close();
+      nodeSock.close();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 
