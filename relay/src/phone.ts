@@ -2,8 +2,9 @@
 // unpairing, and the socket. The relay routes sealed envelopes between a node and its phones; it
 // never opens, verifies or logs what is in them.
 
-import { revokePhone, deviceName, publicKey, sealKeyField } from "./accounts.ts";
+import { revokePhone, deviceName, sealKeyField } from "./accounts.ts";
 import { accountStub, phoneStub, type Caller } from "./auth.ts";
+import { importPublicKey } from "./canonical.ts";
 import { constantTimeEqualStrings, fromBase64, isId, newId, toBase64Url, utf8 } from "./encoding.ts";
 import { HttpError, error, invalid, json, notFound, parseJsonObject, unavailable } from "./http.ts";
 import { clientKey } from "./ip.ts";
@@ -20,6 +21,8 @@ export const CONFIRM_GRACE_MS = 5 * 60_000;
 export const HELLO_MAX_BYTES = 8 * 1024;
 /** Pairings, used or not, are forgotten this long after they expire. */
 const PAIRING_KEEP_MS = 24 * 3600_000;
+/** Wrong proofs a pairing takes before it is burned: then not even the right proof redeems it. */
+export const MAX_PROOF_FAILURES = 5;
 
 /** Unpadded base64url of exactly `bytes` bytes, in its one spelling. */
 function canonicalB64Url(v: unknown, bytes: number): v is string {
@@ -47,6 +50,7 @@ export async function createPairing(env: Env, caller: Caller, body: Uint8Array):
   const pairingId = input.pairingId;
 
   await env.DB.prepare("DELETE FROM phone_pairings WHERE account_id = ? AND expires_at < ?").bind(caller.accountId, now - PAIRING_KEEP_MS).run();
+  await freeExpiredPhones(env, "account_id", caller.accountId, now);
   if (await env.DB.prepare("SELECT 1 AS x FROM phone_pairings WHERE id = ?").bind(pairingId).first()) {
     return error(409, "conflict", "That pairing id is already registered.");
   }
@@ -56,9 +60,10 @@ export async function createPairing(env: Env, caller: Caller, body: Uint8Array):
     const r = await env.DB.prepare(
       `INSERT INTO phone_pairings (id, account_id, device_id, verifier, created_at, expires_at)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6
-       WHERE (SELECT count(*) FROM phone_pairings WHERE account_id = ?2 AND used_at IS NULL AND expires_at > ?5) < ?7`,
+       WHERE (SELECT count(*) FROM phone_pairings
+              WHERE account_id = ?2 AND used_at IS NULL AND expires_at > ?5 AND failures < ?8) < ?7`,
     )
-      .bind(pairingId, caller.accountId, caller.deviceId, input.verifier, now, expiresAt, MAX_OPEN_PAIRINGS)
+      .bind(pairingId, caller.accountId, caller.deviceId, input.verifier, now, expiresAt, MAX_OPEN_PAIRINGS, MAX_PROOF_FAILURES)
       .run();
     inserted = r.meta.changes;
   } catch (e) {
@@ -85,49 +90,92 @@ function helloField(v: unknown): { enc: string; ct: string } {
   return { enc: h.enc, ct: h.ct };
 }
 
+/**
+ * Deletes the D1 rows of phones that were never confirmed and whose pending time ran out, so the
+ * public keys they hold (unique across devices) are free again: such a phone never became a device
+ * that could do anything but wait, and the PhoneObject's alarm revokes its side.
+ */
+async function freeExpiredPhones(env: Env, column: "account_id" | "public_key", value: string, now: number): Promise<void> {
+  await env.DB.prepare(
+    `DELETE FROM devices WHERE ${column} = ? AND kind = 'phone' AND pending_until IS NOT NULL AND pending_until <= ?`,
+  )
+    .bind(value, now)
+    .run();
+}
+
 /** `POST /v1/phone/pair` (unsigned): a phone redeems a pairing and becomes a pending device. */
 export async function redeemPairing(request: Request, env: Env, body: Uint8Array): Promise<Response> {
-  // Fail closed: the per-address limit is what makes guessing proofs slow.
-  if (!env.PAIR_IP_LIMIT) return unavailable();
-  if (!(await env.PAIR_IP_LIMIT.limit({ key: clientKey(request) })).success) {
-    return error(429, "rate_limited", "Too many pairing attempts; try again later.", {}, { "Retry-After": "60" });
-  }
+  // Fail closed: these limits are what make guessing proofs slow. The address first, so one address
+  // past its limit doesn't spend the relay-wide budget.
+  if (!env.PAIR_IP_LIMIT || !env.PAIR_GLOBAL_LIMIT) return unavailable();
+  const limited = () => error(429, "rate_limited", "Too many pairing attempts; try again later.", {}, { "Retry-After": "60" });
+  if (!(await env.PAIR_IP_LIMIT.limit({ key: clientKey(request) })).success) return limited();
+  if (!(await env.PAIR_GLOBAL_LIMIT.limit({ key: "global" })).success) return limited();
+
+  // The proof first: nothing costly (key imports, the trial seal, D1 lookups by key) happens, and
+  // nothing about the body's other fields is said, until it holds.
   const input = parseJsonObject(body);
   if (!canonicalB64Url(input.pairingId, 16)) throw new HttpError(invalid("pairingId", "pairingId must be 16 bytes in unpadded base64url (22 characters)."));
   if (!canonicalB64Url(input.proof, 32)) throw new HttpError(invalid("proof", "proof must be 32 bytes in unpadded base64url (43 characters)."));
-  const name = deviceName(input.deviceName);
-  const key = await publicKey(env, input.publicKey);
-  const seal = await sealKeyField(input.sealKey);
-  if (!seal) throw new HttpError(invalid("sealKey", "sealKey must be a raw X25519 public key in base64url."));
-  const hello = helloField(input.hello);
   const pairingId = input.pairingId;
   const proof = input.proof;
 
   const invalidCode = () => error(401, "unauthorized", "That pairing code isn't valid.");
+  const lockedCode = () => error(401, "unauthorized", "That pairing code was locked after too many wrong attempts; make a new one.");
   const usedCode = () => error(409, "conflict", "That pairing code was already used.");
   const expiredCode = () => error(401, "unauthorized", "That pairing code has expired.");
 
   const now = Date.now();
-  const row = await env.DB.prepare("SELECT account_id, device_id, verifier, expires_at, used_at FROM phone_pairings WHERE id = ?")
+  const row = await env.DB.prepare("SELECT account_id, device_id, verifier, expires_at, used_at, failures FROM phone_pairings WHERE id = ?")
     .bind(pairingId)
-    .first<{ account_id: string; device_id: string; verifier: string; expires_at: number; used_at: number | null }>();
+    .first<{ account_id: string; device_id: string; verifier: string; expires_at: number; used_at: number | null; failures: number }>();
   // Hash and compare even when there's no row, so timing doesn't say whether the id exists.
   const got = await pairingVerifier(proof);
   const proofOk = constantTimeEqualStrings(got, row?.verifier ?? "-".repeat(43));
-  if (!row || !proofOk) return invalidCode();
+  if (!row || !proofOk) {
+    // Counted against an open pairing (the same write whether or not the id exists); the
+    // MAX_PROOF_FAILURES-th wrong proof burns it.
+    await env.DB.prepare("UPDATE phone_pairings SET failures = failures + 1 WHERE id = ? AND used_at IS NULL AND failures < ?")
+      .bind(pairingId, MAX_PROOF_FAILURES)
+      .run();
+    return invalidCode();
+  }
+  if (row.failures >= MAX_PROOF_FAILURES) return lockedCode();
   if (row.used_at !== null) return usedCode();
   if (row.expires_at <= now) return expiredCode();
 
+  // The rest of the body, now that the caller has shown it holds the pairing.
+  const name = deviceName(input.deviceName);
+  if (typeof input.publicKey !== "string" || !(await importPublicKey(input.publicKey))) {
+    throw new HttpError(invalid("publicKey", "publicKey must be a raw Ed25519 public key in base64url."));
+  }
+  const key = input.publicKey;
+  const seal = await sealKeyField(input.sealKey);
+  if (!seal) throw new HttpError(invalid("sealKey", "sealKey must be a raw X25519 public key in base64url."));
+  const hello = helloField(input.hello);
+
+  // A key held by a phone that was never confirmed in time is freed; one held by any other device
+  // is refused before the pairing is spent, so the phone can retry with another key.
+  await freeExpiredPhones(env, "public_key", key, now);
+  const keyTaken = () => error(409, "conflict", "That public key already belongs to a device.");
+  if (await env.DB.prepare("SELECT 1 AS x FROM devices WHERE public_key = ?").bind(key).first()) return keyTaken();
+
   // Spent atomically: of two parallel redemptions, exactly one gets the row back.
   const spent = await env.DB.prepare(
-    "UPDATE phone_pairings SET used_at = ? WHERE id = ? AND used_at IS NULL AND expires_at > ? RETURNING account_id, device_id, expires_at",
+    `UPDATE phone_pairings SET used_at = ? WHERE id = ? AND used_at IS NULL AND expires_at > ? AND failures < ?
+     RETURNING account_id, device_id, expires_at`,
   )
-    .bind(now, pairingId, now)
+    .bind(now, pairingId, now, MAX_PROOF_FAILURES)
     .first<{ account_id: string; device_id: string; expires_at: number }>();
   if (!spent) {
-    const after = await env.DB.prepare("SELECT used_at FROM phone_pairings WHERE id = ?").bind(pairingId).first<{ used_at: number | null }>();
-    return after?.used_at != null ? usedCode() : expiredCode();
+    const after = await env.DB.prepare("SELECT used_at, failures FROM phone_pairings WHERE id = ?")
+      .bind(pairingId)
+      .first<{ used_at: number | null; failures: number }>();
+    if (after?.used_at != null) return usedCode();
+    return after && after.failures >= MAX_PROOF_FAILURES ? lockedCode() : expiredCode();
   }
+  // Undoes the spend, so a redemption that failed after it can be retried with the same code.
+  const release = () => env.DB.prepare("UPDATE phone_pairings SET used_at = NULL WHERE id = ? AND used_at = ?").bind(pairingId, now).run();
 
   // The node that registered it must still be a device of the account.
   const node = await env.DB.prepare("SELECT kind, revoked_at FROM devices WHERE id = ? AND account_id = ?")
@@ -135,6 +183,8 @@ export async function redeemPairing(request: Request, env: Env, body: Uint8Array
     .first<{ kind: string; revoked_at: number | null }>();
   if (!node || node.kind !== "device" || node.revoked_at !== null) return invalidCode();
 
+  // D1 first (the unique key decides a race), then the PhoneObject; if the object fails or refuses,
+  // the D1 row is removed and the pairing released, so neither side is left with half a phone.
   const deviceId = newId("dev");
   const pendingUntil = spent.expires_at + CONFIRM_GRACE_MS;
   try {
@@ -145,7 +195,10 @@ export async function redeemPairing(request: Request, env: Env, body: Uint8Array
       .bind(deviceId, spent.account_id, name, key, now, seal.text, seal.kid, spent.device_id, pendingUntil)
       .run();
   } catch (e) {
-    if (String(e).includes("UNIQUE")) return error(409, "conflict", "That public key already belongs to a device.");
+    if (String(e).includes("UNIQUE")) {
+      await release();
+      return keyTaken();
+    }
     throw e;
   }
   const sys: SysMessage = {
@@ -158,7 +211,27 @@ export async function redeemPairing(request: Request, env: Env, body: Uint8Array
     hello,
     at: now,
   };
-  await phoneStub(env, spent.account_id).pair({ phone: deviceId, node: spent.device_id, pendingUntil, sys });
+  const stub = phoneStub(env, spent.account_id);
+  let seq: number | null;
+  try {
+    seq = await stub.pair({ phone: deviceId, node: spent.device_id, pendingUntil, sys });
+  } catch (e) {
+    await env.DB.prepare("DELETE FROM devices WHERE id = ?").bind(deviceId).run();
+    await release();
+    // The object may have stored the phone before failing: revoke it there too (its node, if it
+    // heard of the phone, hears it go). Best effort: the phone's pending time ends it anyway.
+    try {
+      await stub.revokePhone(deviceId, spent.device_id, true);
+    } catch {
+      console.error("phone pairing rollback: the phone object was unreachable");
+    }
+    throw e;
+  }
+  if (seq === null) {
+    // The node was revoked after the D1 check above: the pairing stays spent.
+    await env.DB.prepare("DELETE FROM devices WHERE id = ?").bind(deviceId).run();
+    return invalidCode();
+  }
   await accountStub(env, spent.account_id).audit({ kind: "device.added", actor: spent.device_id, subject: deviceId, name });
   return json({ deviceId, node: spent.device_id });
 }
