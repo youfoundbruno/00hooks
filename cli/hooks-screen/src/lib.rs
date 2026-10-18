@@ -1,5 +1,5 @@
 //! `hooks-screen`: the screen, an optional firewall for everything that comes from outside
-//! (00hooks PLAN §6a). The harness half: the 00hooks runner and the 00next node both use it, so a
+//! (00hooks PLAN §6a). The harness half: the 00hooks runner and the programs that embed it use it, so a
 //! webhook, a message on any channel and what a routine fetches meet the same rules before any
 //! automation or agent sees them.
 //!

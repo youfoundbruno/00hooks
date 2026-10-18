@@ -1214,3 +1214,328 @@ automations:
     assert_eq!(runner.handle(&released).await.status, RunStatus::Ok);
     assert_eq!(agents.asked.lock().unwrap().len(), 3);
 }
+
+fn from_hook(hook: &str, seq: u64) -> Event {
+    let mut e = event(seq, "push", &json!({"n": seq}));
+    e.hook_id = hook.to_string();
+    e
+}
+
+/// The automations that ran for an event, by name.
+async fn ran(runner: &mut Runner, e: &Event) -> Vec<String> {
+    runner
+        .handle(e)
+        .await
+        .automations
+        .iter()
+        .map(|a| a.name.clone())
+        .collect()
+}
+
+fn reopen(dir: &Path, notifier: Arc<RecordingNotifier>) -> Runner {
+    let mut opts = RunnerOptions::new(dir.join("runner"), dir.join("automations.yaml"), "dev_me");
+    opts.notifier = Some(notifier);
+    opts.secrets = Arc::new(MemorySecrets::default());
+    Runner::open(opts).unwrap()
+}
+
+fn names(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(i, n)| (i.to_string(), n.to_string()))
+        .collect()
+}
+
+const BY_NAME: &str = r#"
+automations:
+  - name: Pushes
+    when: { hook: github, kinds: [push] }
+    then: [{ notify: push }]
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_name_is_pinned_to_its_id_and_never_follows_a_rename_or_a_new_hook() {
+    let mut s = setup("pin", BY_NAME);
+    let pins: Value =
+        serde_json::from_slice(&std::fs::read(s.dir.0.join("runner/hook-pins.json")).unwrap())
+            .unwrap();
+    assert_eq!(pins["github"]["id"], "hk_gh");
+    assert!(
+        s.runner
+            .take_log()
+            .iter()
+            .any(|l| l.contains("Pinned the hook name \"github\" to hk_gh")),
+    );
+    assert_eq!(ran(&mut s.runner, &from_hook("hk_gh", 1)).await, ["Pushes"]);
+
+    // The hook is renamed and a new hook takes its name (as a leaked key could).
+    s.runner
+        .set_hook_names(names(&[("hk_gh", "old"), ("hk_evil", "github")]))
+        .unwrap();
+    let log = s.runner.take_log();
+    assert!(
+        log.iter().any(|l| l.contains("line 4:")
+            && l.contains("now belongs to hk_evil, not to hk_gh")
+            && l.contains("write its id")),
+        "{log:#?}"
+    );
+    assert!(
+        ran(&mut s.runner, &from_hook("hk_evil", 2))
+            .await
+            .is_empty()
+    );
+    assert_eq!(ran(&mut s.runner, &from_hook("hk_gh", 3)).await, ["Pushes"]);
+    // Said once, not on every event.
+    assert!(
+        !s.runner
+            .take_log()
+            .iter()
+            .any(|l| l.contains("now belongs to"))
+    );
+
+    // A restart doesn't re-resolve the name to the new hook: the pin is on disk.
+    drop(s.runner);
+    let mut runner = reopen(&s.dir.0, s.notifier.clone());
+    assert_eq!(runner.hook_refs().id("github"), Some("hk_gh"));
+    assert!(ran(&mut runner, &from_hook("hk_evil", 4)).await.is_empty());
+    assert_eq!(ran(&mut runner, &from_hook("hk_gh", 5)).await, ["Pushes"]);
+    assert!(
+        runner
+            .take_log()
+            .iter()
+            .any(|l| l.contains("now belongs to hk_evil"))
+    );
+
+    // The person confirms the other hook by writing its id.
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        s.dir.0.join("automations.yaml"),
+        BY_NAME.replace("hook: github", "hook: hk_evil"),
+    )
+    .unwrap();
+    assert_eq!(ran(&mut runner, &from_hook("hk_evil", 6)).await, ["Pushes"]);
+    assert!(ran(&mut runner, &from_hook("hk_gh", 7)).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_that_resolves_to_no_hook_or_to_several_runs_nothing() {
+    let yaml = r#"
+automations:
+  - name: Payments
+    when: { hook: payments, kinds: any }
+    then: [{ notify: paid }]
+  - name: Pushes
+    when: { hook: github, kinds: [push] }
+    then: [{ notify: push }]
+"#;
+    let mut s = setup("unresolved", yaml);
+    let log = s.runner.take_log();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.contains("line 4:") && l.contains("no hook is named \"payments\""))
+            .count(),
+        1,
+        "{log:#?}"
+    );
+    // The other automation is unaffected.
+    assert_eq!(ran(&mut s.runner, &from_hook("hk_gh", 1)).await, ["Pushes"]);
+    assert!(ran(&mut s.runner, &from_hook("hk_pay", 2)).await.is_empty());
+
+    // Two hooks with the name (defensively: the relay keeps names unique): still nothing.
+    s.runner
+        .set_hook_names(names(&[
+            ("hk_gh", "github"),
+            ("hk_pay", "payments"),
+            ("hk_pay2", "payments"),
+        ]))
+        .unwrap();
+    assert!(
+        s.runner
+            .take_log()
+            .iter()
+            .any(|l| l.contains("2 hooks are named \"payments\" (hk_pay, hk_pay2)"))
+    );
+    assert!(ran(&mut s.runner, &from_hook("hk_pay", 3)).await.is_empty());
+    assert!(
+        ran(&mut s.runner, &from_hook("hk_pay2", 4))
+            .await
+            .is_empty()
+    );
+
+    // Once the name is one hook's, it resolves and is pinned.
+    s.runner
+        .set_hook_names(names(&[("hk_gh", "github"), ("hk_pay", "payments")]))
+        .unwrap();
+    assert_eq!(
+        ran(&mut s.runner, &from_hook("hk_pay", 5)).await,
+        ["Payments"]
+    );
+    assert_eq!(s.runner.hook_refs().id("payments"), Some("hk_pay"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_pin_file_resolves_no_new_name() {
+    let dir = Temp::new("badpins");
+    std::fs::write(
+        dir.0.join("automations.yaml"),
+        format!(
+            "{BY_NAME}  - name: By id\n    when: {{ hook: hk_gh, kinds: [push] }}\n    then: [{{ notify: id }}]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.0.join("runner")).unwrap();
+    std::fs::write(dir.0.join("runner/hook-pins.json"), b"{broken").unwrap();
+    let mut runner = reopen(&dir.0, Arc::new(RecordingNotifier::default()));
+    runner
+        .set_hook_names(names(&[("hk_gh", "github")]))
+        .unwrap();
+    assert_eq!(runner.hook_refs().id("github"), None);
+    assert_eq!(ran(&mut runner, &from_hook("hk_gh", 1)).await, ["By id"]);
+    assert!(
+        runner
+            .take_log()
+            .iter()
+            .any(|l| l.contains("hook-pins.json can't be read") && l.contains("ids still match"))
+    );
+    assert_eq!(
+        std::fs::read(dir.0.join("runner/hook-pins.json")).unwrap(),
+        b"{broken",
+        "left for the person to look at"
+    );
+}
+
+fn change(v: Value) -> hooks_client::HookChange {
+    serde_json::from_value(v).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_changes_warn_the_person_and_keep_the_names_current() {
+    let yaml = r#"
+automations:
+  - name: Payments
+    when: { hook: payments, kinds: any }
+    then: [{ notify: paid }]
+  - name: Pushes
+    when: { hook: github, kinds: [push] }
+    then: [{ notify: push }]
+"#;
+    let mut s = setup("changes", yaml);
+    s.runner.take_log();
+
+    // A secret rotated by an API key: the person is told.
+    s.runner
+        .on_hook_change(&change(json!({"kind": "hook.rotated", "hookId": "hk_gh",
+            "name": "github", "actor": "key_1", "at": 1})))
+        .await;
+    let shown = s.shown();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(shown[0].0, "00hooks: a hook's secret was rotated");
+    assert!(
+        shown[0]
+            .1
+            .starts_with("Hook github (hk_gh) had its secret rotated by API key key_1."),
+        "{shown:?}"
+    );
+    // By this device: only a line.
+    s.runner
+        .on_hook_change(&change(json!({"kind": "hook.rotated", "hookId": "hk_gh",
+            "name": "github", "actor": "dev_me", "at": 2})))
+        .await;
+    assert_eq!(s.shown().len(), 1);
+    assert!(
+        s.runner
+            .take_log()
+            .iter()
+            .any(|l| l.contains("rotated by this device"))
+    );
+
+    // A new hook takes a name the automations use, pinned to another hook: told, and the pin
+    // holds.
+    s.runner
+        .on_hook_change(&change(json!({"kind": "hook.created", "hookId": "hk_evil",
+            "name": "github", "actor": "key_1", "at": 3})))
+        .await;
+    let shown = s.shown();
+    assert_eq!(shown.len(), 2, "{shown:?}");
+    assert_eq!(
+        shown[1].0,
+        "00hooks: a hook took a name your automations use"
+    );
+    assert!(
+        shown[1]
+            .1
+            .contains("Hook hk_evil was created as \"github\" by API key key_1.")
+            && shown[1].1.contains("keep using hk_gh"),
+        "{shown:?}"
+    );
+    assert_eq!(s.runner.hook_names()["hk_evil"], "github");
+    assert!(
+        ran(&mut s.runner, &from_hook("hk_evil", 1))
+            .await
+            .is_empty()
+    );
+
+    // A hook renamed to a name not resolved before: told, and the automations now use it.
+    s.runner
+        .on_hook_change(&change(json!({"kind": "hook.created", "hookId": "hk_pay",
+            "name": "billing", "actor": "dev_2", "at": 4})))
+        .await;
+    assert_eq!(
+        s.shown().len(),
+        2,
+        "billing isn't a name the automations use"
+    );
+    s.runner
+        .on_hook_change(&change(json!({"kind": "hook.renamed", "hookId": "hk_pay",
+            "name": "payments", "previousName": "billing", "actor": "dev_2", "at": 5})))
+        .await;
+    let shown = s.shown();
+    assert_eq!(shown.len(), 3, "{shown:?}");
+    assert!(
+        shown[2]
+            .1
+            .contains("Hook hk_pay was renamed from \"billing\" to \"payments\" by device dev_2.")
+            && shown[2].1.contains("now use it"),
+        "{shown:?}"
+    );
+    assert_eq!(
+        ran(&mut s.runner, &from_hook("hk_pay", 2)).await,
+        ["Payments"]
+    );
+
+    // A rename away from a used name and a deletion: names kept current, nobody notified.
+    s.runner
+        .on_hook_change(&change(json!({"kind": "hook.renamed", "hookId": "hk_gh",
+            "name": "gh", "previousName": "github", "actor": "dev_me", "at": 6})))
+        .await;
+    s.runner
+        .on_hook_change(&change(json!({"kind": "hook.deleted", "hookId": "hk_evil",
+            "name": "github", "actor": "key_1", "at": 7})))
+        .await;
+    s.runner
+        .on_hook_change(&change(
+            json!({"kind": "hook.paused", "hookId": "hk_gh", "at": 8}),
+        ))
+        .await;
+    let warned = s
+        .shown()
+        .iter()
+        .filter(|(t, _)| t.starts_with("00hooks: a hook"))
+        .count();
+    assert_eq!(warned, 3, "{:?}", s.shown());
+    assert_eq!(s.runner.hook_names()["hk_gh"], "gh");
+    assert!(!s.runner.hook_names().contains_key("hk_evil"));
+    let log = s.runner.take_log();
+    assert!(
+        log.iter()
+            .any(|l| l.contains("Hook github (hk_evil) was deleted by API key key_1.")),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.contains("Hook gh (hk_gh) changed (hook.paused)")),
+        "{log:#?}"
+    );
+    // The pin still holds the renamed hook.
+    assert_eq!(ran(&mut s.runner, &from_hook("hk_gh", 3)).await, ["Pushes"]);
+}

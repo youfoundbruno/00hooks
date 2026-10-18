@@ -698,3 +698,108 @@ async fn a_next_cancelled_during_an_ack_loses_neither_the_ack_nor_the_events() {
         assert!(s.violations.is_empty(), "{:?}", s.violations);
     });
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_changes_are_handed_over_in_order_once_each_and_never_recorded_or_acknowledged() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=2);
+    relay.with(|s| {
+        s.hook_changes.push(serde_json::json!({
+            "n": 1, "kind": "hook.created", "hookId": "hk_2", "name": "payments",
+            "actor": "key_1", "at": 1760000000000i64
+        }));
+        // Unreadable data is reported, never fatal.
+        s.hook_changes
+            .push(serde_json::json!({ "kind": "hook.created" }));
+        s.hook_changes.push(serde_json::json!({
+            "n": 3, "kind": "hook.future", "hookId": "hk_2", "name": "payments", "at": 1
+        }));
+        // The same change again (delivery is at least once): handed over once.
+        s.hook_changes.push(serde_json::json!({
+            "n": 1, "kind": "hook.created", "hookId": "hk_2", "name": "payments",
+            "actor": "key_1", "at": 1760000000000i64
+        }));
+    });
+    let (client, state, _home, _) = sealed_device(&relay, "hookchange").await;
+    let mut sub = subscribe(client.clone(), state.open_events().unwrap(), fast());
+    let evs = read_hooks(&mut sub, 2).await;
+    let changes: Vec<&hooks_client::HookChange> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::HookChange(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(changes.len(), 2, "{evs:?}");
+    assert_eq!(changes[0].change(), hooks_client::HookChangeKind::Created);
+    assert_eq!(changes[0].name.as_deref(), Some("payments"));
+    assert_eq!(changes[0].actor.as_deref(), Some("key_1"));
+    assert_eq!(changes[1].change(), hooks_client::HookChangeKind::Other);
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, StreamEvent::Warning(w) if w.contains("`hook-change`"))),
+        "{evs:?}"
+    );
+    // Before the backlog, as the relay sends them right after `ready`.
+    let first_hook = evs
+        .iter()
+        .position(|e| matches!(e, StreamEvent::Hook(_)))
+        .unwrap();
+    let first_change = evs
+        .iter()
+        .position(|e| matches!(e, StreamEvent::HookChange(_)))
+        .unwrap();
+    assert!(first_change < first_hook, "{evs:?}");
+
+    // A live one, while events flow on.
+    relay.with(|s| {
+        s.hook_changes.push(serde_json::json!({
+            "n": 4, "kind": "hook.rotated", "hookId": "hk_1", "name": "github",
+            "actor": "dev_9", "at": 1760000000001i64
+        }))
+    });
+    let live = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match sub.next().await {
+                Some(Ok(StreamEvent::HookChange(c))) => return c,
+                Some(Ok(_)) => continue,
+                other => panic!("{other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(live.change(), hooks_client::HookChangeKind::Rotated);
+    assert_eq!(live.actor_words(), "device dev_9");
+
+    // Neither recorded nor counted: the cursor and the acks are the events'.
+    assert_eq!(sub.store().cursor(), 2);
+    assert!(sub.store().pending().is_empty());
+    relay.with(|s| {
+        assert_eq!(s.acked, 2);
+        assert!(s.violations.is_empty(), "{:?}", s.violations);
+    });
+
+    assert_eq!(sub.store().hook_changes_handled(), 4);
+
+    // The relay sends every change again on the next stream (as it may after a stream that went
+    // away unnoticed): the numbers handed over, kept in the state dir, skip them. A change without
+    // a number is never skipped.
+    drop(sub);
+    relay.push_events(3..=3);
+    relay.with(|s| {
+        s.hook_changes_sent.clear();
+        s.hook_changes
+            .push(serde_json::json!({ "kind": "hook.deleted", "hookId": "hk_2" }));
+    });
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let evs = read_hooks(&mut sub, 1).await;
+    let again: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::HookChange(c) => Some(c.kind.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(again, vec!["hook.deleted"], "{evs:?}");
+}

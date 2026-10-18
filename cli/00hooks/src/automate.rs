@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use hooks_client::{StateDir, StreamEvent, SubscribeOptions, subscribe};
 use hooks_runner::catalogue::{Catalogue, KindRecord};
 use hooks_runner::config::{self, Automations, Problem};
+use hooks_runner::hookrefs;
 use hooks_runner::runner::{load_names, runner_dir};
 use hooks_runner::runs::{RunRecord, RunStatus, read_runs};
 use hooks_runner::{Runner, RunnerOptions, mailbox};
@@ -324,6 +325,14 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
                 path.display()
             )),
             StreamEvent::Warning(w) => err(sentence(&sanitize(&w, false))),
+            // The runner says what changed, warns the person when it matters (a secret rotated by
+            // someone else, a name the automations use taken), and keeps the names current.
+            StreamEvent::HookChange(c) => {
+                runner.on_hook_change(&c).await;
+                flush(&mut runner);
+            }
+            // A kind of message this version doesn't know (the stream grows additively).
+            _ => {}
         }
     };
     watcher.abort();
@@ -347,13 +356,19 @@ pub fn check(file: Option<PathBuf>, strict: bool) -> CliResult {
     let rdir = runner_dir(state.path());
     let cat = Catalogue::open(rdir.join("catalogue"))
         .map_err(|e| Failure::new(sentence(&e.to_string())))?;
-    let warnings = hooks_runner::check::check(&config, &cat, &load_names(&rdir));
+    let names = load_names(&rdir);
+    let pins = hookrefs::load_pins(&rdir).map_err(|e| Failure::new(sentence(&e.to_string())))?;
+    let warnings = hooks_runner::check::check(&config, &cat, &names, &pins);
     let n = config.automations.len();
     println!(
         "{}: {n} automation{}, valid.",
         path.display(),
         if n == 1 { "" } else { "s" }
     );
+    // How each hook named in the file resolves: matching is by id only.
+    for r in hooks_runner::check::resolution(&config, &names, &pins).resolved {
+        println!("  {}", sanitize(&hookrefs::describe(&r), false));
+    }
     for w in &warnings {
         println!("  line {}: {}", w.line, sanitize(&w.message, false));
     }

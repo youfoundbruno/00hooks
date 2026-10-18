@@ -190,6 +190,13 @@ async fn login_create_a_hook_listen_and_doctor() {
     });
 
     // Human mode: a summary line per event on stderr, the pretty body on stdout, nothing replayed.
+    // A hook change (PROTOCOL §6) is a line on stderr, before the backlog.
+    relay.with(|s| {
+        s.hook_changes.push(serde_json::json!({
+            "n": 1, "kind": "hook.rotated", "hookId": "hk_1", "name": "ci", "actor": "key_1",
+            "at": 1792233600000i64
+        }))
+    });
     relay.push_events(4..=5);
     // Read stdout until the last body; its summary line is queued before it, so stderr is
     // complete by then.
@@ -218,6 +225,10 @@ async fn login_create_a_hook_listen_and_doctor() {
     .await
     .unwrap();
     assert!(all.contains("Connected. 2 events are waiting."), "{all}");
+    assert!(
+        all.contains("10:40:00  Hook ci (hk_1) had its secret rotated by API key key_1."),
+        "{all}"
+    );
     assert!(all.contains("push  ci  verified  7 B  evt_0004"), "{all}");
     assert!(!all.contains("evt_0003"), "already handed over: {all}");
     assert!(

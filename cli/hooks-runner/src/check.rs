@@ -5,54 +5,77 @@
 use std::collections::BTreeMap;
 
 use crate::catalogue::{Catalogue, KindRecord};
-use crate::config::{Automations, Problem, Trigger, field_refs, hook_matches};
+use crate::config::{Automations, Problem, Trigger, field_refs};
+use crate::hookrefs::{self, Pins, Resolution};
 use crate::runner::clock;
 
 fn label(k: &KindRecord, names: &BTreeMap<String, String>) -> String {
     format!("{}/{}", names.get(&k.hook_id).unwrap_or(&k.hook_id), k.kind)
 }
 
-/// Warnings, each naming its line.
+/// How the file's hook references resolve against the cached hook list and the runner's pins
+/// ([`hookrefs`]), without pinning anything.
+pub fn resolution(
+    config: &Automations,
+    names: &BTreeMap<String, String>,
+    pins: &Pins,
+) -> Resolution {
+    hookrefs::resolve(config, names, pins)
+}
+
+/// Warnings, each naming its line: hook references that don't resolve (or whose pin no longer
+/// matches the hook list), then what the catalogue says about kinds and fields.
 pub fn check(
     config: &Automations,
     cat: &Catalogue,
     names: &BTreeMap<String, String>,
+    pins: &Pins,
 ) -> Vec<Problem> {
-    let mut out = Vec::new();
+    let res = resolution(config, names, pins);
+    let mut out: Vec<Problem> = res.problems.iter().chain(&res.warnings).cloned().collect();
     let mut warn = |line: usize, message: String| out.push(Problem { line, message });
-    let known_hook = |h: &str| {
-        names.contains_key(h)
-            || names.values().any(|n| n == h)
-            || cat.kinds().any(|k| k.hook_id == h)
-    };
-    for h in &config.hooks {
-        if !known_hook(&h.hook) {
-            warn(
-                h.line,
-                format!(
-                    "hooks: no hook {:?} is known yet (names come from the relay when `00hooks run` starts)",
-                    h.hook
-                ),
-            );
+    // An id the relay's list doesn't have and that never sent an event.
+    let unknown_id = |id: &str| !names.contains_key(id) && !cat.kinds().any(|k| k.hook_id == id);
+    for r in &res.resolved {
+        if r.how == hookrefs::How::Id && unknown_id(&r.id) {
+            for (line, who) in config
+                .hooks
+                .iter()
+                .filter(|h| h.hook == r.reference)
+                .map(|h| (h.line, "hooks".to_string()))
+                .chain(
+                    config
+                        .automations
+                        .iter()
+                        .filter(|a| a.when.hook.as_deref() == Some(r.reference.as_str()))
+                        .map(|a| (a.when.line, format!("{:?}", a.name))),
+                )
+            {
+                warn(
+                    line,
+                    format!(
+                        "{who}: no hook {} is known yet: check the id, or run `00hooks hooks list`",
+                        r.id
+                    ),
+                );
+            }
         }
     }
     for a in &config.automations {
         let who = format!("{:?}", a.name);
-        if let Some(h) = &a.when.hook
-            && !known_hook(h)
+        // A hook that didn't resolve is reported above; its kinds can't be checked.
+        if a.when
+            .hook
+            .as_ref()
+            .is_some_and(|h| res.refs.id(h).is_none())
         {
-            warn(
-                a.when.line,
-                format!(
-                    "{who}: no hook {h:?} is known yet: check the name, or run `00hooks hooks list`"
-                ),
-            );
+            continue;
         }
         let on_hook = |k: &&KindRecord| {
             a.when
                 .hook
                 .as_ref()
-                .is_none_or(|h| hook_matches(h, &k.hook_id, names))
+                .is_none_or(|h| res.refs.matches(h, &k.hook_id))
         };
         let (kinds, any): (&[String], bool) = match &a.when.trigger {
             Trigger::Kinds(k) => (k, k.is_empty()),
@@ -179,7 +202,7 @@ automations:
     then: [{ notify: "{{payload.anything}}" }]
 "#;
         let config = crate::config::parse(yaml, Path::new("a.yaml")).unwrap();
-        let w: Vec<String> = check(&config, &cat, &names)
+        let w: Vec<String> = check(&config, &cat, &names, &Pins::new())
             .iter()
             .map(|p| p.to_string())
             .collect();
@@ -203,7 +226,11 @@ automations:
                 .any(|m| m.starts_with("line 7:") && m.contains("headers.x-missing")),
             "{w:#?}"
         );
-        assert!(w.iter().any(|m| m.contains("no hook \"gitlab\"")), "{w:#?}");
+        assert!(
+            w.iter()
+                .any(|m| m.starts_with("line 9:") && m.contains("no hook is named \"gitlab\"")),
+            "{w:#?}"
+        );
         assert!(
             !w.iter().any(|m| m.contains("payload.action")
                 || m.contains("payload.pr.n`")
@@ -211,6 +238,65 @@ automations:
             "{w:#?}"
         );
         assert_eq!(w.len(), 5, "{w:#?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hook_references_are_checked_by_id_with_the_pins() {
+        let dir = temp_dir("check-pins");
+        let mut cat = Catalogue::open(&dir).unwrap();
+        cat.observe(
+            "hk_gh",
+            "push",
+            "e1",
+            &json!({"n": 1}),
+            &BTreeMap::new(),
+            1792233600000,
+            false,
+        )
+        .unwrap();
+        let yaml = r#"
+automations:
+  - name: A
+    when: { hook: github, kinds: [push] }
+    then: [{ notify: "{{payload.n}}" }]
+  - name: B
+    when: { hook: hk_gone, kinds: any }
+    then: [{ notify: x }]
+"#;
+        let config = crate::config::parse(yaml, Path::new("a.yaml")).unwrap();
+        // The pinned hook was renamed and another took its name: the check follows the pin, so
+        // the kinds it reports are the pinned hook's, and it says the name moved.
+        let names = BTreeMap::from([
+            ("hk_gh".to_string(), "old-github".to_string()),
+            ("hk_new".to_string(), "github".to_string()),
+        ]);
+        let pins = Pins::from([(
+            "github".to_string(),
+            crate::hookrefs::Pin {
+                id: "hk_gh".into(),
+                at: 1792233600000,
+            },
+        )]);
+        let w: Vec<String> = check(&config, &cat, &names, &pins)
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        assert!(
+            w.iter()
+                .any(|m| m.starts_with("line 4:")
+                    && m.contains("now belongs to hk_new, not to hk_gh")),
+            "{w:#?}"
+        );
+        assert!(
+            w.iter()
+                .any(|m| m.starts_with("line 7:") && m.contains("no hook hk_gone is known yet")),
+            "{w:#?}"
+        );
+        assert_eq!(w.len(), 2, "push is known on the pinned hook: {w:#?}");
+        let r = resolution(&config, &names, &pins);
+        assert!(r.refs.matches("github", "hk_gh"));
+        assert!(r.new_pins.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

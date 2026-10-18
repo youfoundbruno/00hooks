@@ -98,6 +98,12 @@ pub struct State {
     /// When set, `POST /v1/accounts` needs `Authorization: Bearer <this>` (`/v1/info` still says
     /// signups are open, as a relay that misreports would).
     pub signup_token: Option<String>,
+    /// `hook-change` messages (PROTOCOL §6), in order: each device's stream sends the ones it
+    /// hasn't been sent yet after `ready`, then live ones, without an `id:`. Clearing
+    /// `hook_changes_sent` sends them all again, as the relay may (delivery is at least once).
+    pub hook_changes: Vec<Value>,
+    /// How many of `hook_changes` each device has been sent.
+    pub hook_changes_sent: HashMap<String, usize>,
     next_device: usize,
 }
 
@@ -663,6 +669,19 @@ fn frame_for(st: &Arc<Mutex<State>>, device: &str, e: &Value) -> String {
     }
 }
 
+/// The `hook-change` frames `device` hasn't been sent, marked sent (at most once per device).
+fn unsent_hook_changes(st: &Arc<Mutex<State>>, device: &str) -> Vec<String> {
+    let mut s = st.lock().unwrap();
+    let from = s.hook_changes_sent.get(device).copied().unwrap_or(0);
+    let frames: Vec<String> = s.hook_changes[from.min(s.hook_changes.len())..]
+        .iter()
+        .map(|c| format!("event: hook-change\ndata: {c}\n\n"))
+        .collect();
+    let total = s.hook_changes.len();
+    s.hook_changes_sent.insert(device.to_string(), total);
+    frames
+}
+
 fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn, device: String) -> Resp {
     let (tx, rx) = mpsc::channel::<Bytes>(64);
     tokio::spawn(async move {
@@ -687,6 +706,11 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn, device:
         if let Conn::Silent = conn {
             tx.closed().await;
             return;
+        }
+        for f in unsent_hook_changes(&st, &device) {
+            if !send(f).await {
+                return;
+            }
         }
         if let Conn::Gap(from, to) = conn {
             let gap = json!({ "from": from, "to": to, "reason": "retention" });
@@ -752,6 +776,11 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn, device:
                     return;
                 }
                 sent = e["seq"].as_u64().unwrap();
+            }
+            for f in unsent_hook_changes(&st, &device) {
+                if !send(f).await {
+                    return;
+                }
             }
             if !send(": hb\n".to_string()).await {
                 return;

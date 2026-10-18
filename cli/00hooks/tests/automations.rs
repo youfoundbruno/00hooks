@@ -390,3 +390,82 @@ async fn service_files_and_secrets() {
     let out = run(&dir, &["secrets", "set", "bad name"]).await;
     assert_eq!(out.status.code(), Some(1));
 }
+
+fn hook(id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({ "id": id, "name": name, "url": format!("https://relay.example/h/{id}"),
+        "enabled": true, "verify": { "preset": "github" }, "maxBodyBytes": 1048576,
+        "createdAt": 1, "lastEventAt": null })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_names_are_pinned_to_ids_and_hook_changes_are_told() {
+    let relay = MockRelay::start().await;
+    let home = TempHome::new("cli-pins");
+    let dir: PathBuf = home.0.clone();
+    relay.with(|s| {
+        s.client_home = Some(dir.clone());
+        s.hooks = vec![hook("hk_1", "ci")];
+    });
+    let out = run(&dir, &["login", "--relay", &relay.url]).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let log = dir.join("out/pushes.jsonl");
+    std::fs::write(
+        dir.join("automations.yaml"),
+        format!(
+            r#"version: 1
+notify: none
+automations:
+  - name: Pushes
+    when: {{ hook: ci, kinds: [push] }}
+    then:
+      - write: {{ append: {}, line: {{ n: "{{{{payload.n}}}}" }} }}
+"#,
+            log.display()
+        ),
+    )
+    .unwrap();
+
+    // The runner resolves the name, pins it, and says a secret rotated by an API key.
+    relay.with(|s| {
+        s.hook_changes.push(serde_json::json!({
+            "n": 1, "kind": "hook.rotated", "hookId": "hk_1", "name": "ci", "actor": "key_1",
+            "at": 1792233600000i64
+        }))
+    });
+    relay.push_events(1..=1);
+    let child = spawn_runner(&dir);
+    wait_for("event 1", || ns(&log) == vec![1]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stderr = stop(child);
+    assert!(
+        stderr.contains("Pinned the hook name \"ci\" to hk_1"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Hook ci (hk_1) had its secret rotated by API key key_1."),
+        "{stderr}"
+    );
+    let out = run(&dir, &["automations", "check"]).await;
+    let t = text(&out.stdout);
+    assert!(t.contains("hook \"ci\" is hk_1 (pinned "), "{t}");
+
+    // Renamed, and a new hook takes the name: after a restart the pin holds and says so.
+    relay.with(|s| s.hooks = vec![hook("hk_1", "old-ci"), hook("hk_2", "ci")]);
+    relay.push_events(2..=2);
+    let child = spawn_runner(&dir);
+    wait_for("event 2", || ns(&log) == vec![1, 2]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stderr = stop(child);
+    assert!(
+        stderr.contains("now belongs to hk_2, not to hk_1"),
+        "{stderr}"
+    );
+    let out = run(&dir, &["automations", "check", "--strict"]).await;
+    assert_eq!(out.status.code(), Some(1));
+    let t = text(&out.stdout);
+    assert!(
+        t.contains("line 5:") && t.contains("now belongs to hk_2"),
+        "{t}"
+    );
+    relay.with(|s| assert!(s.violations.is_empty(), "{:?}", s.violations));
+}

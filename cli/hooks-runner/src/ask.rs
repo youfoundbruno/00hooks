@@ -1,5 +1,5 @@
 //! **Ask an agent** (PLAN §5.2, AI actions): the runner hands the event to a host that runs agents
-//! (00next) through the [`Asker`] trait, and puts the agent's reply in `{{agent.reply}}` for the
+//! (a program that embeds the runner) through the [`Asker`] trait, and puts the agent's reply in `{{agent.reply}}` for the
 //! actions after it. The CLI has no agents of its own, so without an asker the action fails, saying
 //! so.
 //!
@@ -23,7 +23,7 @@ pub const MAX_QUOTED: usize = 32 * 1024;
 /// One question for an agent.
 #[derive(Debug, Clone)]
 pub struct AskRequest {
-    /// The automation's name (in 00next, its id).
+    /// The automation's name (or the host's id for it).
     pub automation: String,
     /// Which agent answers, as the host spells it (an agent's id, or "new" for a new one per event).
     pub agent: String,
