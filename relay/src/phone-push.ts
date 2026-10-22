@@ -65,7 +65,7 @@ export function parsePushRequest(body: Uint8Array): PushRequest {
   }
   if (!isId("dev", input.device)) throw bad("device", "device must be a phone's device id.");
   // Absent is iOS: every node written before Android keeps working unchanged.
-  const platform = input.platform ?? "ios";
+  const platform = input.platform === undefined ? "ios" : input.platform;
   if (platform !== "ios" && platform !== "android") throw bad("platform", "platform must be ios or android.");
   const token = input.token;
   if (platform === "ios") {
