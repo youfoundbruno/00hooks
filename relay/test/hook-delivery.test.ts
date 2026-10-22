@@ -310,6 +310,12 @@ describe("the test event", () => {
     hmac: { verify: { preset: "hmac", header: "X-Sig", algorithm: "sha1", encoding: "base64", prefix: "sha1=" }, signs: true },
     token: { verify: { preset: "token", header: "X-Token" }, signs: true },
     unverified: { verify: { preset: "unverified" }, signs: true },
+    calendly: { verify: { preset: "calendly" }, signs: true },
+    typeform: { verify: { preset: "typeform" }, signs: true },
+    paddle: { verify: { preset: "paddle", secret: "pdl_ntfset_test_secret" }, signs: true },
+    twitch: { verify: { preset: "twitch" }, signs: true },
+    zoom: { verify: { preset: "zoom", secret: "zoom secret token" }, signs: true },
+    pagerduty: { verify: { preset: "pagerduty", secret: "pagerduty secret" }, signs: true },
   };
 
   it("covers every preset in the table (a new preset must say whether a test can be signed for it)", () => {

@@ -71,6 +71,7 @@ export async function signSample(config: VerifyConfig, secret: string | null, ur
       "00hooks": { test: true, sentAt: now, note: "A test event sent with 00hooks test. It is not from the provider." },
     };
     if (spec.timestamp && "bodyField" in spec.timestamp) sample[spec.timestamp.bodyField] = spec.timestamp.unit === "s" ? Number(seconds) : now;
+    // (An RFC 3339 timestamp is only ever a header: Twitch's.)
     body = utf8(JSON.stringify(sample));
   }
 
@@ -79,11 +80,16 @@ export async function signSample(config: VerifyConfig, secret: string | null, ur
   for (const rule of spec.dedupe) if ("header" in rule) headers.set(rule.header, fresh());
   const params = new Map<string, string>();
   if (spec.timestamp) {
-    const value = spec.timestamp.unit === "s" ? seconds : String(now);
+    const value = spec.timestamp.unit === "s" ? seconds : spec.timestamp.unit === "rfc3339" ? new Date(now).toISOString() : String(now);
     if ("header" in spec.timestamp) headers.set(spec.timestamp.header, value);
     if ("sigParam" in spec.timestamp) params.set(spec.timestamp.sigParam, value);
   }
-  for (const p of spec.signed) if ("header" in p && !headers.has(p.header)) headers.set(p.header, p.header === "webhook-id" ? `msg_${nonce}` : fresh());
+  // Any other signed header: a timestamp the preset signs but doesn't check (Zoom's) is now, in
+  // seconds; an id is fresh.
+  for (const p of spec.signed) {
+    if (!("header" in p) || headers.has(p.header)) continue;
+    headers.set(p.header, p.header === "webhook-id" ? `msg_${nonce}` : p.header.includes("timestamp") ? seconds : fresh());
+  }
 
   if (spec.mac === "none" || secret === null) return { body, headers };
   if (spec.mac === "token") {
@@ -117,7 +123,7 @@ export async function signSample(config: VerifyConfig, secret: string | null, ur
   let value: string;
   if (f.kind === "single") value = `${f.prefix ?? ""}${encoded}`;
   else if (f.kind === "versioned") value = `${f.version},${encoded}`;
-  else value = [...[...params].map(([k, v]) => `${k}=${v}`), `${f.param}=${encoded}`].join(",");
+  else value = [...[...params].map(([k, v]) => `${k}=${v}`), `${f.param}=${encoded}`].join(f.separator ?? ",");
   headers.set(spec.sig!.header, value);
   return { body, headers };
 }
