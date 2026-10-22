@@ -15,14 +15,15 @@ accounts come with the Overblast Plan (§4.6). The CLI works on its own, and its
 embedded by other programs.
 
 Status: phases 0 to 3, 5 and 6 are built (§7): the relay (hooks, presets, replay protection,
-sealing, device pairing, API keys, the audit, the edge screen), the CLI (`login`, `devices`,
+sealing, device pairing, API keys, the audit, the edge screen, one-device delivery, static
+responses, signed test events, a one-command installer), the CLI (`login`, `devices`,
 `hooks`, `keys`, `audit`, `listen`, `doctor`, `run`, `automations`, `kinds`, `runs`, `replay`,
-`service`, `secrets`, `screen`), the runner, the `hooks-screen` crate, the runner's interface
+`service`, `secrets`, `screen`, `test`, `relay status`), the runner, the `hooks-screen` crate, the runner's interface
 for programs that run agents, and phone links: a phone pairs with a node device,
 and the relay routes the sealed envelopes between them, keeps them while a side is offline and says
-who is online, without ever seeing their content (PROTOCOL §10). Anything marked *(not built)* is
-not built; sections marked *(suggestion)* go beyond the original brief, are not built either, and
-are open for a decision.
+who is online, without ever seeing their content (PROTOCOL §10), and can wake a phone with a
+push that carries no readable content (APNs for iPhones, FCM for Android). Anything marked *(not built)* is not built;
+anything marked *not planned* was weighed and left out, and says why.
 
 ---
 
@@ -32,8 +33,8 @@ are open for a decision.
  GitHub ─┐                    Cloudflare (your own account)
  Stripe ─┤   POST /h/<hook>   ┌────────────────────────────────────────────────┐
  Shopify ┼──────────────────▶ │ Worker: limits, verify the signature, dedupe   │
- Forms  ─┤   (any webhook)    │   │                                            │
- Email  ─┘   (suggestion)     │   ▼                                            │
+ Forms  ─┘   (any webhook)    │   │                                            │
+                              │   ▼                                            │
                               │ Account Durable Object                         │
                               │   ordered log (sealed payloads), cursors, acks │
                               └───────────────┬────────────────────────────────┘
@@ -85,19 +86,25 @@ Three rules hold it together:
    stored.
 3. **Replay protection**: a timestamp window where the provider signs one (5 minutes; 60 s for
    Linear), and a seen-id set per hook in the Durable Object, written in the same transaction as the
-   event. GitHub, Shopify, Twilio and Meta sign no timestamp and retry for hours, so for them the
+   event. GitHub, Shopify, Twilio, Meta, Typeform, PagerDuty and Zoom (whose timestamp is
+   signed but has no documented window) sign no checked timestamp and retry for hours, so for them the
    marks (the delivery id where there is one, and the body hash) are the only defence; they are kept
    `REPLAY_MARK_DAYS` (180 days by default). Once a mark expires, a captured body is accepted again,
-   as a new event with a new id. So the runner should also dedupe by a hash of the content, not only
-   by event id *(not built)*.
+   as a new event with a new id. So the runner also dedupes by a hash of the content, not only by
+   event id (§5.3).
 4. **Handshakes**: providers that verify an endpoint before use (Slack's `url_verification`, Meta's
    `hub.challenge`, Twitch, Microsoft Graph) are answered by the preset, after verification. Slack's
    and Meta's are built (Meta's is a `GET` carrying the hook's verify token, kept as a keyed hash);
-   the others are not.
+   Twitch's `webhook_callback_verification` and Zoom's `endpoint.url_validation` (answered with the
+   HMAC of its token under the hook's secret) are answered after verification too. *Not planned:*
+   Microsoft Graph's: its `validationToken` is an unauthenticated echo, and Graph signs no content
+   (only a `clientState` secret inside the body), so it has no preset to answer from.
 5. **Seal and store**: the body and the headers the preset keeps are sealed to every device on the
    account (§4.4) and appended to the account's log with a monotonic sequence number.
 6. **Answer fast**: `200` as soon as the event is durably stored, so providers never time out or
-   retry needlessly (a static response configured per hook is *not built*). Dynamic responses
+   retry needlessly. A hook can carry a **static response** (`PATCH /v1/hooks/<id>` `response`: a
+   2xx status, text, JSON or XML, at most 4 KiB, never HTML) for providers that want a specific
+   reply; duplicates and screen drops get it too, so they look the same. Dynamic responses
    produced by an agent are out of scope: they'd be too slow for a provider's timeout. Twilio gets
    TwiML (empty).
 7. **Offline notices** (PROTOCOL §4a): a hook whose provider takes its reply in the response
@@ -121,17 +128,26 @@ Three rules hold it together:
   (not after running it), so delivery is at-least-once and the CLI dedupes by event id.
 - **Retention**: unacknowledged events are kept 7 days (configurable down to 1 hour) in the Durable
   Object's SQLite log, pruned by an alarm, then dropped and counted; acknowledged events are deleted
-  at once. Bodies stay under the 2 MB row limit (§3.1); *(not built)* larger bodies could go to R2
-  with a pointer in the log. Hooks, keys and devices live in D1.
+  at once. Bodies stay under the 2 MB row limit (§3.1). Hooks, keys and devices live in D1.
+  *Not planned: larger bodies in R2 with a pointer in the log.* R2 writes can't join the Durable
+  Object's transaction, so an append, an ack or retention could leave an orphaned object or a
+  pointer to nothing; each envelope is per device, so one large body would be several R2 objects
+  to delete on every ack; and the frame between the object and the Worker, and the CLI's 16 MiB
+  message limit, would need a second, chunked path. The providers 00hooks serves send far less than
+  1.75 MiB (and the big ones cap their own payloads), so the cost buys little.
 - **Deploys drop connections** (Cloudflare closes every socket on a code update), so resume isn't an
   edge case: it's exercised on every release.
 - **Several devices**: each has its own cursor, and every hook is delivered to all of the account's
-  devices. *(not built)* Delivering a hook to one chosen device (*the Mac in the office*), so an
-  automation doesn't run twice.
+  devices, unless the hook names **one device** (`deliverTo`, *the Mac in the office*): then only
+  that device gets an envelope, the others' streams pass the event by, and an automation doesn't run
+  twice. A revoked target sends the hook back to every device rather than to nobody.
 
 **How it stays cheap while always on.** The account's Durable Object talks to each device over a
 *hibernatable WebSocket*, so it costs nothing while nothing happens; the Worker in front bridges that
-socket to SSE for the CLI. *(not built)* Clients taking the WebSocket directly. The bridge:
+socket to SSE for the CLI. *Not planned: clients taking the WebSocket directly.* It was the
+fallback in case the bridge proved costly (§10), and nobody has measured that it does; doing it
+anyway would mean a second client protocol (framing, resume, backpressure, close codes) to keep
+in step with SSE, for a saving nobody has shown. The bridge:
 - sends `retry: 5000`, a first `ready` event and a final `closed {code}`;
 - handles bursts: per-hook coalescing is *not* done (every event matters here); past a 256 KB
   backlog the stream sends one `resync {after}` instead of queueing, and the CLI catches up from
@@ -145,8 +161,12 @@ socket to SSE for the CLI. *(not built)* Clients taking the WebSocket directly. 
 `/v1/devices` (list, revoke, set a sealing key), `/v1/enrolments` (add a device), `/v1/keys` (API
 keys: create, list, revoke), `/v1/events` (recent deliveries: time, hook, size, verified or not,
 delivered to which devices; never the content), `/v1/audit`, `/v1/held` (events the screen holds),
-and the phone routes (PROTOCOL §10). PROTOCOL has the full list. *(not built)* Renaming a device,
-and `/v1/test/<hook_id>` (send a signed sample event).
+and the phone routes (PROTOCOL §10). PROTOCOL has the full list. Renaming a device is
+`PATCH /v1/devices/<id>`. `POST /v1/test/<hook_id>` sends a **signed sample event**: the relay
+signs a sample with the hook's own secret, the way its preset's provider would, and sends it
+through the hook's own path (limits, verification, the screen, dedupe, sealing), with the routing
+event type `00hooks.test`, so runners show it and run only automations that ask for that kind. It
+needs a device or the `hooks:secrets` scope, and can't sign for a strict or Ed25519 hook.
 
 ## 4. Security model
 
@@ -155,7 +175,7 @@ and `/v1/test/<hook_id>` (send a signed sample event).
 - Someone who learns a hook URL sends fake events → **signature verification per provider**; a bare
   URL is never enough unless you choose the weak mode knowingly.
 - An attacker replays a genuine event → **timestamp window + seen-id set**, and the CLI dedupes by
-  event id too (by content hash: *not built*, §5.3).
+  event id, and by content hash for providers that sign no timestamp (§5.3).
 - The relay's storage or operator is compromised → **payloads are sealed to device keys**; secrets are
   hashed or encrypted at rest; there's nothing useful in logs.
 - A stolen API key → **scoped, expiring keys**; every use is logged. It can't become a reader of
@@ -182,19 +202,27 @@ and `/v1/test/<hook_id>` (send a signed sample event).
 | Shopify | `X-Shopify-Hmac-SHA256` (base64) | medium: dedupe on `X-Shopify-Webhook-Id` |
 | Twilio | HMAC-SHA1 over the exact public URL and sorted parameters | medium: verified against the URL the provider was given, byte for byte |
 | Meta (WhatsApp Cloud API, Messenger, Instagram) | `X-Hub-Signature-256` HMAC over the raw body under the app secret; the GET verify-token handshake answered at the edge | medium: no timestamp, so the body hash is the replay defence |
-| *(not built)* Calendly, Typeform and more | each provider's documented HMAC, added as table entries | per provider |
+| Calendly | `Calendly-Webhook-Signature` (`t=…,v1=…`) within 3 minutes | strong |
+| Paddle Billing | `Paddle-Signature` (`ts=…;h1=…`) within 5 s, as Paddle's own libraries check | strong |
+| Twitch EventSub | HMAC over the message id, timestamp and body, within 10 minutes; the `webhook_callback_verification` challenge answered | strong |
+| Typeform | `Typeform-Signature` base64 HMAC of the body | medium: dedupe on the signed `event_id` and the body hash |
+| PagerDuty (v3) | `X-PagerDuty-Signature` HMAC of the body | medium: dedupe on the signed `event.id` and the body hash |
+| Zoom | `x-zm-signature` over `v0:ts:body`; `endpoint.url_validation` answered with the token's HMAC | medium: Zoom documents no window, so the body hash is the replay defence; can't be strict |
+| *(not built)* HubSpot v3 and more | each provider's documented HMAC, added as table entries | per provider. HubSpot signs the request URI with its own decoding rules, worth a change of its own |
+| *Not planned:* Mailgun, Microsoft Graph | — | weak: Mailgun's signature covers a timestamp and token, not the body; Graph signs no content at all. Lemon Squeezy needs no preset: it is the generic HMAC |
 | Generic HMAC | you choose the header, algorithm and encoding | strong if the sender supports it |
 | Secret header or bearer token | constant-time compare | medium: no body integrity |
-| *(not built)* Secret in the URL path | the URL itself is the secret | weak: labelled as such |
+| *Not planned:* secret in the URL path | the URL itself is the secret | weak: URLs end up in logs, proxies, browser history and providers' dashboards, and it covers no content. The `token` preset already does better (a header, compared in constant time) |
 | Unverified | anything that arrives | marked `unverified`; automations refuse it unless you allow it per automation |
 
 Verifiers are a declarative table (provider → headers, signed content, algorithm, encoding, timestamp
 rule), always over the **raw bytes** before any parsing, with constant-time comparison
 (`crypto.subtle.verify`) and several accepted signatures so secrets can rotate. Each event carries a
 `verified` flag that the runner shows and checks. An optional **IP allowlist** per hook (the
-screen's address lists, §6a) is defence in depth only, never the sole check. *(suggestion, not
-built)* A **test URL** per hook: events sent there would reach `00hooks listen` but never run
-automations. Signing secrets the relay needs in order to verify are **encrypted at rest** with a
+screen's address lists, §6a) is defence in depth only, never the sole check. The suggested **test
+URL** per hook is answered by the signed test event instead (§3.3): it travels the hook's own
+path, so it proves the real one works, and runners don't act on it; a second public URL per hook
+would be a second door to guard. Signing secrets the relay needs in order to verify are **encrypted at rest** with a
 Worker secret (they can't be hashed, since the relay must recompute signatures), shown only once
 when generated, and rotatable with an overlap window so the old and new secrets both work for a set
 time.
@@ -244,9 +272,12 @@ state directory), and the runner keeps the newest 1,000 events (`events.jsonl`),
 samples and the run details under `<HOOKS_HOME>/runner/`, every file 0600 in a 0700 folder. So the
 protection at rest on your machine is the operating system's: your user account, disk encryption,
 backups you choose. Strict hooks' secrets and the sealing keys sit in the keychain (or a 0600 file).
-*(not built: `--seal-at-rest`)* the runner could keep its stored events sealed to the device's own
-sealing key and open them only to run or show them, so a copy of the state folder alone reads
-nothing; the cost is a key-store access per read, and no plain `grep` through history.
+*Not planned: `--seal-at-rest`* (the runner keeping its stored events sealed to the device's own
+key). It would cover only `events.jsonl`, while the catalogue's samples, the run records (agent
+replies included), the inbox and the quarantine stay readable; on Linux without a Secret Service
+the key store is a 0600 file in the same `HOOKS_HOME`, so a copy of the folder carries its key; and
+full-disk encryption already answers a lost or stolen machine. It would cost a key-store access per
+read and every `grep` through history for a protection that holds only in part.
 
 ### 4.5 Self-hosting
 
@@ -258,6 +289,19 @@ unless `OPEN_SIGNUP=1`). No other services. Your account's ids go in a gitignore
 `wrangler.jsonc`, deployed with `wrangler deploy -c wrangler.deploy.jsonc` after applying the D1
 migrations; `relay/README.md` ("Self-hosting") has the steps. The CLI takes the relay URL at login
 (`00hooks login --relay`).
+
+**The installer.** `pnpm --filter ./relay setup` does all of that with the person's own `wrangler
+login`: it creates the D1 database, writes the gitignored deploy config (rate-limit namespace ids
+from a random base; on upgrades, new bindings are merged in and the ids kept), applies the
+migrations, generates `SECRETS_KEY`, `HASH_PEPPER`, `RELAY_SIGNING_KEY` and `SIGNUP_TOKEN` locally
+(a CSPRNG) and pipes each to `wrangler secret put` on stdin before the first deploy (never as an
+argument, a file or a log line; only the signup token is shown, once, because pairing needs it),
+asks for the optional APNs and FCM keys (file paths, validated, hidden input, a terminal only),
+deploys, and checks `/v1/info`. Re-running continues where it stopped and never replaces a secret
+without a typed confirmation; `--dry-run` shows every step and runs nothing; `--check-only` checks
+a deployed relay. There is no "Deploy to Cloudflare" button: it couldn't give each account its own
+rate-limit ids, would build `relay/` without the workspace's lockfile, and would take the secrets
+through a web form seeded with `.dev.vars.example`'s placeholders, which the relay would accept.
 
 ### 4.6 Plans and the hosted relay
 
@@ -368,9 +412,16 @@ AI actions, only in a program that embeds the runner and runs agents:
   handover (`SubscribeOptions { confirm: true }`) and confirms each one only after its run's start
   record is fsynced. A crash before that hands the event over again on restart; a crash after it
   finds the event already handled and closes the run as interrupted (replay runs it by hand).
-- **Dedupe**: by event id, against the run records. *(not built)* Also by a hash of the content: a
-  provider that signs no timestamp can be replayed at the relay once its body-hash mark expires
-  (§3.1), and the replay arrives as a new event with a new id.
+- **Dedupe**: by event id, against the run records, and by a hash of the content: a provider that
+  signs no timestamp can be replayed at the relay once its body-hash mark expires (§3.1), and the
+  replay arrives as a new event with a new id. The runner keeps SHA-256 of the hook id and body for
+  verified events of presets that sign no checked timestamp (read from the preset table), fsynced
+  before the run's start record, so a crash between them neither loses the event (its own id
+  passes) nor runs a copy under another id; at most 100,000 marks for 400 days, hashes only. A
+  replay is recorded as a dropped run naming the event it repeats; `00hooks replay` still runs
+  anything on purpose.
+- **Test events** (`00hooks test`, kind `00hooks.test`) are recorded and shown, run only the
+  automations that list that kind, and stay out of the catalogue.
 - **Retries** with backoff for failed actions that are safe to retry (notify, call a URL with an
   idempotency key); never for commands unless the automation says they're idempotent.
 - **Replay** any recorded event from the run history.
@@ -394,7 +445,9 @@ AI actions, only in a program that embeds the runner and runs agents:
 00hooks service install               run `00hooks run` at login (launchd / systemd --user)
 ```
 
-*(not built)* `00hooks test <hook>`, sending a signed sample event.
+`00hooks test <hook>` sends a signed sample event (§3.3), `00hooks devices rename` renames a
+device, `00hooks hooks deliver-to` and `00hooks hooks response` set a hook's one device and static
+response, and `00hooks relay status` checks a relay (`/v1/info`).
 
 Written in Rust: one binary, for macOS and Linux. Its core (`hooks-client`: pair, stream, unseal,
 ack) is a library crate, as are the runner and the screen, so another program can embed them
@@ -545,7 +598,8 @@ implements no extras, and a relay that sets nothing announces none.
 - **Edge** (`relay/src/screen.ts`, `held.ts`; PROTOCOL §4b; tests in `relay/test/screen.test.ts`
   under Miniflare). Per-hook rules a device pushes (`PUT /v1/hooks/<id>/screen`): address and CIDR
   lists (`not` makes an allow list; a provider's published ranges go as a list labelled with
-  `preset`, the relay fetches none), ASN and country from `request.cf`, header conditions, size;
+  `preset`, the relay fetches none), ASN and country from `request.cf`, header conditions, size; time windows (hours, days and an IANA
+  time zone, past midnight allowed, read on the relay's clock at receipt);
   fingerprints (shape hash and MinHash); field rules `is`, `domain is` and `one of` as keyed hashes
   under the account's screen key; `contains`, `pattern` (a safe subset for a backtracking engine)
   and `similar text` only with `consent.words`. Drop answers `200` with an id that names nothing;
@@ -554,7 +608,8 @@ implements no extras, and a relay that sets nothing announces none.
   signatures keep `401`; decisions keep only the rule's id and hourly counts. The origin the edge saw
   travels sealed, for the devices' own screen. `/v1/info` announces `screen` and the operator's
   `extras` (`HOSTED_EXTRAS`), as data.
-- **Harness** (`cli/hooks-screen`): the same rules plus learned rules (*Always … similar*, *Block on
+- **Harness** (`cli/hooks-screen`): the same rules (time windows judged by the event's relay-signed
+  `receivedAt`, not the device clock, with the IANA zones bundled in the harness) plus learned rules (*Always … similar*, *Block on
   fields…*, *Off*, 90-day expiry unless matched), MinHash over word 5-grams with a configurable
   Jaccard threshold (0.8 by default), per-field MinHash for *similar text*, field rules of every kind
   joined by and/or, each saying pass, quarantine or drop; the quarantine list (Release once, Drop,
@@ -566,16 +621,31 @@ implements no extras, and a relay that sets nothing announces none.
   and cost per source; it fails closed to the source's fallback (quarantine when anything beyond a
   notification would act, pass when only notifications would). A rule that doesn't compile isn't
   dropped: it is reported, and what it applies to is quarantined until it is fixed. `fixtures/screen.v1.json` holds both halves to the same words, shapes, signatures,
-  domains and keyed hashes.
+  domains and keyed hashes, and to when time windows hold (daylight saving changes included).
 - **Runner and CLI**: the runner screens every live event before any automation (not replays,
   releases, or events released at the relay); a held event's run is `held`, a dropped one's
   `dropped`, and `Runner::release` runs a held one once. `00hooks screen status|on|off|held|release|
   drop [--always]|rules|sync`.
-- **Not built**: time windows in rules; per-hook or per-channel rates beyond the relay's limits;
-  TLS fingerprints; edge reputation lists; fingerprint sync across devices. Known differences
+- **Not built**: per-hook or per-channel rates beyond the relay's limits (they belong with the
+  relay's plans and limits).
+- **Not planned**:
+  - *TLS fingerprints.* A Worker sees a client's JA3/JA4 only with Cloudflare's Bot Management, an
+    Enterprise add-on, so a self-hosted relay can't count on it; and a webhook sender's TLS stack
+    changes whenever the provider updates a library, so a fingerprint rule would break genuine
+    deliveries silently.
+  - *Edge reputation lists.* The relay fetches nothing by design (it is what keeps it simple and
+    its behaviour reviewable), a public list's false positives would drop genuine deliveries before
+    anyone sees them, and the signature already refuses forgeries whatever their address. A list
+    you trust can already be pushed as an address list rule.
+  - *Fingerprint sync across devices.* Field rules keep their values on the device, in plain text,
+    by design; syncing them would need a sealed channel between devices that doesn't exist, or would
+    put the values on the relay. What can go to the edge already does (`screen sync`), and it
+    protects every device.
+- Known differences
   between the halves: the edge's `pattern` is JavaScript's syntax over 2,048 characters, the
   harness's is Rust's over 64 KiB; a JSON number written `1.0` reads `1.0` in the harness and `1` at
-  the edge.
+  the edge; time zones come from the runtime's ICU at the edge and from the bundled IANA database
+  in the harness, which can differ for a zone whose rules changed recently until both are updated.
 
 ## 7. Phases
 
@@ -585,7 +655,7 @@ implements no extras, and a relay that sets nothing announces none.
 | 1 ✓ | provider presets, replay protection, sealing, device pairing, API keys, audit | a replayed or forged event is refused; the relay's storage holds only ciphertext |
 | 2 ✓ | CLI `run` with plain actions, run records, retries, rate limits, service install | a Stripe test event sends a notification and appends a line to a file, at most once |
 | 3 ✓ | the runner for hosts: automations as data (`Runner::open_with`, `set_automations`), agent actions through `ask::Asker`, events quoted as untrusted data. The agent side and access profiles are the host's (§6) | a host's agent gets the event only as a quoted block and its reply feeds the next action; the CLI refuses an agent action and says why |
-| 4 | email-in hooks *(suggestion, not built)* | an email to a hook's address arrives as a verified event |
+| 4 | email-in hooks: *not planned* (§8) | — |
 | 5 ✓ | the screen: rules and similarity at the edge and in the harness, quarantine with Release/Drop/Always, the Decisions-API evaluator, local-model option, operator extras announced as data | a flood of near-identical junk is dropped at the edge after one Drop + Always; a prompt-injection message is quarantined before any agent runs; the evaluator failing quarantines instead of passing |
 | 6 ✓ | phone links (PROTOCOL §10): pairing, the socket, a queue per device | the relay routes sealed envelopes between a node and its phone, keeps them while one is offline, and never opens them |
 
@@ -594,9 +664,17 @@ implements no extras, and a relay that sets nothing announces none.
 Decided: SSE to the CLI, bridged by the Worker from a hibernatable WebSocket on the Durable Object
 (§3.2); sealing always on (§4.4).
 
-1. **Name**: `00hooks` is a working name.
-2. **Email-in hooks** *(suggestion)*: each hook can also have an email address (Cloudflare Email
-   Routing), so "when an email arrives at invoices@…" becomes a trigger.
+Decided: the name is `00hooks`.
+
+Not planned: **email-in hooks** (Cloudflare Email Routing to an Email Worker, so "when an email
+arrives at invoices@…" becomes a trigger). Its exit test was "arrives as a *verified* event", and
+the relay can't promise that: Email Routing only requires an incoming message to pass SPF *or*
+DKIM for *some* domain, and rejects on DMARC only when the sender's domain publishes a policy that
+says so. Neither binds the `From:` address a rule would trust, and an Email Worker gets no
+structured authentication result, only headers a sender can also write. Every email event would
+be `unverified` in all but name. It also needs a domain on Cloudflare with Email Routing, and MIME
+parsing at the edge. A provider's inbound-email webhook, verified by its preset, is the better
+route when it signs its deliveries.
 
 ## 9. Design rationale
 
@@ -624,8 +702,8 @@ Decided: SSE to the CLI, bridged by the Worker from a hibernatable WebSocket on 
   free) and holds up to 32,768 sockets.
 - **The bridge** (Worker holds SSE, Durable Object holds a hibernating WebSocket to it) is built.
   Its cost is inferred from the documentation, so measure it on your deployment with a week of idle
-  connections (`relay/docs/IDLE-COST.md`). The fallback, if it costs too much, is a direct WebSocket
-  from the CLI, which needs no bridge *(not built)*.
+  connections (`relay/docs/IDLE-COST.md`). The fallback, if it costs too much, would be a direct
+  WebSocket from the CLI, which needs no bridge; it is not planned until a measurement says so (§3.2).
 - **Rate Limiting binding**: 10 or 60 s periods, counted per location and eventually consistent, so
   it's for cheap shedding at the edge; exact quotas are counted in the Durable Object.
 - **Queues** (128 KB messages, up to 14 days) are not the event log; at most they carry side work.

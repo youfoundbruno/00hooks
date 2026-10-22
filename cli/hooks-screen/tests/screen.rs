@@ -951,3 +951,56 @@ async fn a_rule_that_can_not_be_read_holds_what_it_applies_to() {
     let s = Screen::open(&dir).unwrap();
     assert_eq!(s.check(&junk("Ana")).await.verdict, Verdict::Pass);
 }
+
+#[tokio::test]
+async fn a_time_window_reads_when_the_item_arrived_and_an_unknown_zone_holds_what_it_applies_to() {
+    let dir = temp("time");
+    let s = Screen::open(&dir).unwrap();
+    on(&s, false);
+    // Hold what arrives on Friday nights in Lisbon, from 22:00 to 06:00 (past midnight).
+    let window = Condition::Time {
+        from: "22:00".into(),
+        to: "06:00".into(),
+        days: Some(vec![5]),
+        tz: Some("Europe/Lisbon".into()),
+        not: false,
+    };
+    s.put_rule(rule("friday-nights", Verdict::Quarantine, vec![window]))
+        .unwrap();
+    let at = |t: &str| t.parse::<jiff::Timestamp>().unwrap().as_millisecond();
+    let mut it = junk("Ana");
+    // Saturday 2026-10-24 at 01:30 in Lisbon (UTC+1 until the 25th): Friday's window.
+    it.received_at = at("2026-10-24T00:30:00Z");
+    let d = s.check(&it).await;
+    assert_eq!(
+        (d.verdict, d.rule.as_deref()),
+        (Verdict::Quarantine, Some("friday-nights"))
+    );
+    // The same item read now is judged by when it arrived, not by this machine's clock.
+    it.received_at = at("2026-10-24T05:30:00Z");
+    assert_eq!(s.check(&it).await.verdict, Verdict::Pass);
+    assert_eq!(
+        s.rules()[0].describe(),
+        "Quarantine when it arrived between 22:00 and 06:00 on Fri (Europe/Lisbon)"
+    );
+    // A zone that doesn't exist doesn't compile: refused when put, and, edited in by hand, the
+    // rule is reported and holds what it applies to.
+    let bad = Condition::Time {
+        from: "22:00".into(),
+        to: "06:00".into(),
+        days: None,
+        tz: Some("Mars/Olympus".into()),
+        not: false,
+    };
+    assert!(s.put_rule(rule("mars", Verdict::Drop, vec![bad])).is_err());
+    let path = dir.join("rules.json");
+    let mut rules: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    rules[0]["conditions"][0]["tz"] = json!("Mars/Olympus");
+    std::fs::write(&path, serde_json::to_vec(&rules).unwrap()).unwrap();
+    let s = Screen::open(&dir).unwrap();
+    let errors = s.rule_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].error.contains("Mars/Olympus"), "{errors:?}");
+    let d = s.check(&it).await;
+    assert_eq!((d.verdict, d.by), (Verdict::Quarantine, By::Rule), "{d:?}");
+}

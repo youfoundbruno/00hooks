@@ -1,7 +1,7 @@
 // The screen at the edge (PROTOCOL §4b): the shared vectors, rules on origin, headers and size,
 // fingerprints and keyed field rules synced from a device, words only with consent, the hold
 // (not streamed until released, released once, dropped), drops answered 200 with nothing stored,
-// forgeries still 401, and nothing kept but hashes.
+// forgeries still 401, nothing kept but hashes, and time windows read on the relay's clock.
 
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
@@ -10,9 +10,14 @@ import screenVectors from "../../fixtures/screen.v1.json";
 import type { AccountObject } from "../src/account-object.ts";
 import { fromBase64, hmac, toHex, utf8 } from "../src/encoding.ts";
 import { hostedExtras } from "../src/held.ts";
+import { HttpError } from "../src/http.ts";
 import { codePoints, compilePattern, patternWeight } from "../src/screen-pattern.ts";
 import {
   EDGE_PATTERN_INPUT,
+  MAX_SCREEN_ZONES,
+  compileScreen,
+  decide,
+  importScreenKey,
   decodeSignature,
   domainOf,
   domainSuffixes,
@@ -134,6 +139,67 @@ describe("the shared vectors", () => {
     for (const m of screenVectors.edgeMatches) {
       expect(compilePattern(m.pattern).test(codePoints(m.value, EDGE_PATTERN_INPUT), steps), `${m.pattern} on ${m.value.slice(0, 40)}`).toBe(m.matches);
     }
+  });
+});
+
+describe("time windows", () => {
+  const refusedField = async (condition: unknown): Promise<string | null> => {
+    try {
+      parseScreen({ rules: [{ id: "t", verdict: "drop", conditions: [condition] }] });
+      return null;
+    } catch (e) {
+      if (!(e instanceof HttpError)) throw e;
+      expect(e.response.status).toBe(400);
+      return ((await e.response.json()) as { field: string }).field;
+    }
+  };
+
+  it("hold when the harness says they hold (the shared vectors), and refuse what it refuses", async () => {
+    const key = await importScreenKey(new Uint8Array(32));
+    const v = screenVectors.timeWindows;
+    expect(v.cases.length).toBeGreaterThan(30);
+    for (const c of v.cases) {
+      const screen = compileScreen(parseScreen({ rules: [{ id: "t", verdict: "drop", conditions: [c.condition] }] })!);
+      const d = { ip: null, asn: null, country: null, headers: new Headers(), body: new Uint8Array(), contentType: null, strict: true, key, at: c.at };
+      expect((await decide(screen, d)) !== null, `${JSON.stringify(c.condition)} at ${c.utc}`).toBe(c.holds);
+    }
+    for (const r of v.refused) expect(await refusedField(r.condition), JSON.stringify(r.condition)).toBe(`screen.rules[0].conditions[0].${r.field}`);
+    for (const c of v.accepted) expect(await refusedField(c), JSON.stringify(c)).toBeNull();
+  });
+
+  it("are kept as pushed, and one screen reads at most eight zones", async () => {
+    const window = { on: "time", days: [5], from: "22:00", to: "06:00", tz: "Europe/Lisbon", not: false };
+    expect(parseScreen({ rules: [{ id: "t", verdict: "drop", conditions: [window] }] })!.rules[0]!.conditions).toEqual([
+      { on: "time", days: [5], from: "22:00", to: "06:00", tz: "Europe/Lisbon" },
+    ]);
+    const zones = ["UTC", "Europe/Lisbon", "America/New_York", "Asia/Tokyo", "Asia/Kolkata", "Pacific/Auckland", "Europe/Berlin", "America/Sao_Paulo", "Africa/Lagos"];
+    const rules = (n: number) => zones.slice(0, n).map((tz, i) => ({ id: `z${i}`, verdict: "drop", conditions: [{ on: "time", from: "09:00", to: "17:00", tz }] }));
+    expect(parseScreen({ rules: rules(MAX_SCREEN_ZONES) })!.rules).toHaveLength(MAX_SCREEN_ZONES);
+    // No tz is UTC, so it doesn't count again.
+    expect(parseScreen({ rules: [...rules(MAX_SCREEN_ZONES), { id: "u", verdict: "drop", conditions: [{ on: "time", from: "01:00", to: "02:00" }] }] })!.rules).toHaveLength(9);
+    try {
+      parseScreen({ rules: rules(MAX_SCREEN_ZONES + 1) });
+      expect.unreachable();
+    } catch (e) {
+      expect(((await (e as HttpError).response.json()) as { field: string }).field).toBe("screen.rules");
+    }
+  });
+
+  it("read the relay's clock when the delivery arrives", async () => {
+    const dev = await newAccount();
+    const { hook } = await createHook(dev, { preset: "unverified" });
+    // Always (every day, all day), and never (the same, with not).
+    const always = { on: "time", from: "00:00", to: "24:00", tz: "Pacific/Kiritimati" };
+    expect((await setScreen(dev, hook.id, { rules: [{ id: "never", verdict: "drop", conditions: [{ ...always, not: true }] }] })).status).toBe(200);
+    expect((await post(hook.id, { a: 1 })).status).toBe(200);
+    expect((await stats(dev)).events).toBe(1);
+    const res = await setScreen(dev, hook.id, { rules: [{ id: "always", verdict: "drop", conditions: [always] }] });
+    expect(((await res.json()) as { screen: unknown }).screen).toEqual({ rules: [{ id: "always", verdict: "drop", conditions: [always] }], consent: { words: false } });
+    expect((await post(hook.id, { a: 2 })).status).toBe(200);
+    expect((await stats(dev)).events).toBe(1);
+    const bad = await setScreen(dev, hook.id, { rules: [{ id: "x", verdict: "drop", conditions: [{ ...always, tz: "Mars/Olympus" }] }] });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ field: "screen.rules[0].conditions[0].tz" });
   });
 });
 

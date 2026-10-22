@@ -135,11 +135,16 @@ fn event_with(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     h.insert("x-github-event".into(), event_type.into());
+    // Real deliveries differ byte for byte (GitHub's carry their own ids); trailing spaces, one per
+    // seq, keep each body distinct without changing the payload, so the content-hash dedupe
+    // doesn't take one test's events for replays of each other.
+    let mut bytes = serde_json::to_vec(body).unwrap();
+    bytes.extend(std::iter::repeat_n(b' ', seq as usize));
     serde_json::from_value(json!({
         "seq": seq, "id": format!("evt_{seq:04}"), "hookId": "hk_gh", "receivedAt": 1792233600000u64 + seq,
         "verified": verified, "preset": "github", "eventType": event_type,
         "contentType": "application/json", "headers": h,
-        "body": base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(body).unwrap())
+        "body": base64::engine::general_purpose::STANDARD.encode(bytes)
     }))
     .unwrap()
 }
@@ -1762,4 +1767,216 @@ automations:
     let passed = runner.handle(&event(2, "star", &json!({"x": 2}))).await;
     assert_eq!(passed.status, RunStatus::Ok, "{passed:?}");
     assert_eq!(notifier.shown.lock().unwrap().len(), 1);
+}
+
+/// An event of `preset` on `hook` whose body is exactly `body`.
+fn with_body(seq: u64, hook: &str, preset: &str, verified: bool, body: &[u8]) -> Event {
+    let mut e = event(seq, "push", &json!({}));
+    e.hook_id = hook.to_string();
+    e.preset = preset.to_string();
+    e.verified = verified;
+    e.body = base64::engine::general_purpose::STANDARD.encode(body);
+    e
+}
+
+/// Pushes from any hook.
+const ANY: &str = r#"
+automations:
+  - name: Any
+    when: { kinds: [push] }
+    then: [{ notify: "an event" }]
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_of_taken_content_under_a_new_id_is_dropped() {
+    let s = setup("content", ANY);
+    let Setup {
+        dir,
+        notifier,
+        mut runner,
+    } = s;
+    let body = br#"{"action":"opened","issue":{"number":1}}"#;
+    let first = runner
+        .handle(&with_body(1, "hk_gh", "github", true, body))
+        .await;
+    assert_eq!((first.status, first.ran()), (RunStatus::Ok, 1));
+
+    // The same content under a new id: a replay the relay no longer remembers.
+    let replay = runner
+        .handle(&with_body(2, "hk_gh", "github", true, body))
+        .await;
+    assert_eq!(replay.status, RunStatus::Dropped);
+    let note = replay.note.unwrap();
+    assert!(
+        note.starts_with("same content as event evt_0001 received 2026-")
+            && note.ends_with(": a replay"),
+        "{note}"
+    );
+    // Another hook with the same body is another event.
+    let other = runner
+        .handle(&with_body(3, "hk_2", "github", true, body))
+        .await;
+    assert_eq!((other.status, other.ran()), (RunStatus::Ok, 1));
+
+    // The marks survive a restart.
+    drop(runner);
+    let mut runner = reopen(&dir.0, notifier.clone());
+    let again = runner
+        .handle(&with_body(4, "hk_gh", "github", true, body))
+        .await;
+    assert_eq!(again.status, RunStatus::Dropped);
+    // Replaying by hand still runs it.
+    let by_hand = runner.replay("evt_0001").await.unwrap();
+    assert_eq!((by_hand.status, by_hand.ran()), (RunStatus::Ok, 1));
+    assert_eq!(notifier.shown.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_is_deduped_only_for_verified_events_of_untimestamped_presets() {
+    let Setup {
+        mut runner,
+        dir: _dir,
+        ..
+    } = setup("content-presets", ANY);
+    let mut seq = 0;
+    for (preset, verified, deduped) in [
+        ("unverified", false, false),
+        ("token", true, false),
+        ("github", false, false),
+        ("stripe", true, false),
+        ("slack", true, false),
+        ("linear", true, false),
+        ("standard-webhooks", true, false),
+        ("standard-webhooks-ed25519", true, false),
+        ("shopify", true, true),
+        ("twilio", true, true),
+        ("meta", true, true),
+        ("hmac", true, true),
+    ] {
+        let body = format!("{{\"same\":\"{preset}-{verified}\"}}");
+        let hook = format!("hk_{preset}");
+        seq += 1;
+        let a = runner
+            .handle(&with_body(seq, &hook, preset, verified, body.as_bytes()))
+            .await;
+        seq += 1;
+        let b = runner
+            .handle(&with_body(seq, &hook, preset, verified, body.as_bytes()))
+            .await;
+        assert_eq!(a.status, RunStatus::Ok, "{preset}");
+        let want = if deduped {
+            RunStatus::Dropped
+        } else {
+            RunStatus::Ok
+        };
+        assert_eq!(b.status, want, "{preset} verified={verified}: {b:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_between_the_mark_and_the_start_loses_nothing_and_runs_nothing_twice() {
+    let body = br#"{"n":1}"#;
+    let e1 = with_body(1, "hk_gh", "github", true, body);
+    let e2 = with_body(2, "hk_gh", "github", true, body);
+    let hash = hooks_runner::contentmarks::content_hash(&e1);
+
+    // A crash after the mark, before the run's start: the relay hands evt_0001 over again.
+    let Setup {
+        dir,
+        notifier,
+        runner,
+    } = setup("content-crash-mark", ANY);
+    drop(runner);
+    hooks_runner::contentmarks::ContentMarks::open(&dir.0.join("runner"))
+        .unwrap()
+        .record(&hash, &e1, hooks_runner::now_ms())
+        .unwrap();
+    let mut runner = reopen(&dir.0, notifier.clone());
+    let rec = runner.handle(&e1).await;
+    assert_eq!((rec.status, rec.ran()), (RunStatus::Ok, 1), "not lost");
+    assert_eq!(runner.handle(&e2).await.status, RunStatus::Dropped);
+    assert_eq!(notifier.shown.lock().unwrap().len(), 1);
+
+    // A crash after the start: neither the same event nor a copy under a new id runs.
+    let Setup {
+        dir,
+        notifier,
+        runner,
+    } = setup("content-crash-start", ANY);
+    drop(runner);
+    let runner_dir = dir.0.join("runner");
+    hooks_runner::contentmarks::ContentMarks::open(&runner_dir)
+        .unwrap()
+        .record(&hash, &e1, hooks_runner::now_ms())
+        .unwrap();
+    hooks_runner::RunLog::open(&runner_dir)
+        .unwrap()
+        .begin(&e1, "push", false)
+        .unwrap();
+    let mut runner = reopen(&dir.0, notifier.clone());
+    let same = runner.handle(&e1).await;
+    assert_eq!(same.status, RunStatus::Dropped);
+    assert!(same.note.unwrap().contains("already handled"));
+    let copy = runner.handle(&e2).await;
+    assert_eq!(copy.status, RunStatus::Dropped);
+    assert!(copy.note.unwrap().contains("a replay"));
+    assert!(notifier.shown.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_test_event_runs_only_automations_that_name_its_kind() {
+    let yaml = r#"
+automations:
+  - name: Any
+    when: { hook: github, kinds: any }
+    then: [{ notify: "any" }]
+  - name: New kinds
+    when: { new_kind: true, hook: github }
+    then: [{ notify: "new" }]
+  - name: Tests
+    when: { hook: github, kinds: [00hooks.test, push] }
+    then: [{ notify: "a test" }]
+"#;
+    let mut s = setup("test-event", yaml);
+    let t = event(1, "00hooks.test", &json!({"test": true}));
+    let rec = s.runner.handle(&t).await;
+    assert_eq!(rec.status, RunStatus::Ok, "{rec:?}");
+    assert_eq!(rec.kind, "00hooks.test");
+    let names: Vec<&str> = rec.automations.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, vec!["Tests"]);
+    assert!(!rec.new_kind);
+    assert!(
+        s.runner.catalogue().get("hk_gh", "00hooks.test").is_none(),
+        "not a kind the hook sends"
+    );
+    assert_eq!(s.shown().len(), 1);
+    // It is recorded, so it can be replayed, with the same rule.
+    let again = s.runner.replay("evt_0001").await.unwrap();
+    assert_eq!(again.automations.len(), 1);
+
+    // With no automation naming the kind, its run is recorded as skipped.
+    let any_kind = r#"
+automations:
+  - name: Any kind
+    when: { hook: github, kinds: any }
+    then: [{ notify: "an event" }]
+"#;
+    let Setup {
+        mut runner,
+        dir: _dir,
+        ..
+    } = setup("test-event-skipped", any_kind);
+    let rec = runner
+        .handle(&event(2, "00hooks.test", &json!({"test": true})))
+        .await;
+    assert_eq!(rec.status, RunStatus::Skipped);
+    assert!(rec.automations.is_empty());
+    assert_eq!(
+        rec.note.as_deref(),
+        Some("a test event (00hooks test); automations that list the kind 00hooks.test run on it")
+    );
+    assert!(runner.catalogue().kinds().next().is_none());
+    // An ordinary event still runs "any kind".
+    let rec = runner.handle(&event(3, "push", &json!({}))).await;
+    assert_eq!(rec.ran(), 1);
 }

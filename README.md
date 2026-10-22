@@ -1,80 +1,174 @@
 # 00hooks
 
-Webhooks from anywhere, delivered to your own computer in real time, safely.
+**Webhooks from anywhere, delivered to your own computer: verified, sealed, in order, and safe to
+act on.**
 
-Point any service that sends webhooks (GitHub, Stripe, Shopify, Slack, Meta, your own app) at a
-hook URL. A small relay on Cloudflare, which you run on your own account, checks the event is
-genuine, seals it so only your devices can read it, and streams it to the `00hooks` CLI on your Mac
-or Linux machine. There it runs your automations: notify you, call a URL, run an allowed command or
-write to a file.
+Point GitHub, Stripe, Shopify, Slack, Calendly or your own app at a hook URL. A small relay that
+**you** run on **your own Cloudflare account** checks the provider's signature, drops replays,
+seals the event so only your devices can open it, and streams it to the `00hooks` CLI on your Mac
+or Linux machine (or to [00next](#works-with-00next), which embeds the same libraries). There it
+runs your automations: notify you, call a URL, run an allowed command, write a file.
 
-> Status: built are the relay (hooks, presets, sealing, device pairing, API keys, the audit, the
-> screen and phone links), the CLI and its automation runner: phases 0 to 3, 5 and 6 of
-> [`docs/PLAN.md`](docs/PLAN.md) §7. PLAN marks what is not built. The wire contract is
-> [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+You don't open a port, run a public server or trust a third party with the payloads. Nobody hosts
+this for you: you deploy it, in one command.
 
-## Why
+<p align="center">
+  <img src="docs/images/architecture.svg" width="900" alt="Webhooks from GitHub, Stripe, Shopify, Slack, forms and your app reach your own relay on your Cloudflare account, which verifies, screens, drops replays, seals and logs them, then streams them sealed to your laptop, office Mac or 00next to run automations; the relay can also wake your phone with a push via APNs or FCM.">
+</p>
 
-- **Real time without opening a port.** Your machine connects out to the relay; nothing listens on it.
-- **Verified at the edge.** Provider signatures (Standard Webhooks, Stripe, GitHub, Slack and more),
-  timestamp windows and replay protection, before anything is stored.
-- **Sealed to your devices.** Events are stored and streamed as ciphertext only your devices can open.
-- **Nothing is lost.** An ordered log with resume and acknowledgements: if your laptop sleeps, events
-  wait and run when it's back, once.
-- **Safe to act on.** Webhook content is data: it is never interpolated into a shell command or a
-  file path.
-- **Yours to run.** You deploy the relay on your own Cloudflare account; there is no hosted relay.
+## What makes it different
 
-## Components
+- **Your machine, no inbound port.** Your computer connects out to the relay and keeps a resumable
+  stream open. Nothing listens on your machine.
+- **Sealed end to end, to your devices.** After verifying an event, the relay seals it with HPKE to
+  each of your devices' keys and signs the envelope. Its storage holds only ciphertext, so whoever
+  operates the relay can't read your events at rest. (It does see the payload in memory while it
+  checks the signature; **strict** hooks keep even the provider's secret off the relay.)
+- **Genuine events only.** 18 provider presets check signatures over the raw bytes, with timestamp
+  windows where the provider signs one, in constant time. Forgeries get `401` and are never stored.
+- **Replays refused, twice.** The relay keeps replay marks for each hook. Your runner also dedupes
+  by event id, and by content for providers that sign no timestamp.
+- **A firewall in front of your automations.** The screen passes, holds or drops each event: rules
+  on address, network, country, headers, size, fields and time of day, similarity to what you
+  dropped before, and an optional AI evaluator that can only answer typed questions.
+- **Nothing lost when your laptop sleeps.** An ordered log per account, with acknowledgements and
+  resume. Events wait (7 days by default) and run once, in order, when you're back.
+- **Cheap while idle.** The relay's object talks to your stream over a hibernating WebSocket, so an
+  idle connection costs close to nothing beyond the Workers plan. You can measure it on your own
+  account ([`relay/docs/IDLE-COST.md`](relay/docs/IDLE-COST.md)).
+- **Webhook content is data.** It is never put into a shell command, a file path or an agent's
+  instructions. Commands get argument lists, never a shell.
+- **Phones too.** The relay carries a sealed link between your computer and your phone, and can
+  wake an iPhone (APNs) or an Android phone (FCM) with a push that carries no readable content.
 
-- `relay/`: the Cloudflare Worker and its two Durable Object classes (TypeScript). How to run,
-  test and self-host it: [`relay/README.md`](relay/README.md).
-- `cli/`: the `00hooks` CLI (the `hooks-cli` crate), the `hooks-client` library, the `hooks-runner`
-  automation runner and the `hooks-screen` library (Rust). The libraries can be embedded by other
-  programs.
+<p align="center">
+  <img src="docs/images/one-webhook.svg" width="860" alt="One webhook's path: verify the signature (forged → 401), screen (pass, hold or drop), dedupe (replay → duplicate), seal to each device, append to the ordered log (only ciphertext stored), stream over resumable SSE (waits 7 days if offline), and the device acks after recording it.">
+</p>
 
-## Install the CLI
+## Install on your Cloudflare account
 
-You need a Rust toolchain (`rustup`; `rust-toolchain.toml` picks the stable channel). From the
-repository root:
+You need a Cloudflare account on the Workers Paid plan, Node 22+, pnpm, and this repository.
 
 ```sh
-cargo install --locked --path cli/00hooks    # installs the `00hooks` binary into ~/.cargo/bin
-00hooks --help
+pnpm install                                   # once, at the repository root
+pnpm --filter ./relay exec wrangler login      # your own Cloudflare login
+node relay/scripts/setup.mjs --dry-run         # see every step first; nothing is run
+pnpm --filter ./relay setup                    # install
 ```
 
-The crates are not published to crates.io. To build without installing, run
-`cargo build --release -p hooks-cli`; the binary is `target/release/00hooks`.
+The installer creates the D1 database, writes a gitignored deploy config with your own ids,
+applies the migrations, **generates every secret the relay needs on your computer** and hands each
+to `wrangler secret put` on stdin (never as an argument, a file or a log line), optionally asks for
+your APNs and Firebase keys (hidden input, validated), deploys, and checks the result. It prints
+your relay URL and the signup token, once, with the exact command to pair. Run it again any time:
+it picks up where it stopped and never replaces a secret unless you confirm. Afterwards,
+`node relay/scripts/setup.mjs --check-only` (or `00hooks relay status`) checks the relay.
 
-Then deploy your relay ([`relay/README.md`](relay/README.md), "Self-hosting") and log in to it.
+There is no "Deploy to Cloudflare" button, on purpose: it couldn't give your account its own
+rate-limit ids or keep secret generation on your machine. The details, and the manual steps, are in
+[`relay/README.md`](relay/README.md).
 
-## Hooks, keys and the audit
+## Pair the CLI
+
+You need a Rust toolchain (`rustup`; `rust-toolchain.toml` picks the stable channel).
+
+```sh
+cargo install --locked --path cli/00hooks       # the `00hooks` binary, into ~/.cargo/bin
+read -rs HOOKS_SIGNUP_TOKEN && export HOOKS_SIGNUP_TOKEN   # paste the token the installer showed
+00hooks login --relay https://<your relay>; unset HOOKS_SIGNUP_TOKEN
+00hooks relay status                            # version, protocol, keys, clock, push
+```
+
+Login creates this computer's signing and sealing keys in the OS keychain and pins the relay's
+key. To add another computer, run `00hooks devices add` on one you already have and use the code
+it prints with `00hooks login` on the new one.
+
+### Works with 00next
+
+00next embeds the same client and runner libraries. Give it the same relay URL and signup token
+and it pairs like any other device; its agents get events as quoted, untrusted data, within the
+limits you set there.
+
+## A first hook, in a minute
+
+```sh
+00hooks hooks create --name ci --preset github  # prints the URL and, once, the secret
+# paste both into GitHub: Settings > Webhooks > Add webhook (content type: application/json)
+00hooks test ci                                 # the relay signs a sample with the hook's own secret
+00hooks listen                                  # watch events arrive (or --json)
+```
+
+Then write `~/.config/00hooks/automations.yaml`:
+
+```yaml
+version: 1
+automations:
+  - name: Tell me about new issues
+    when: { hook: ci, kinds: [issues] }
+    only_if: payload.action == "opened"
+    then:
+      - notify: "#{{payload.issue.number}} {{payload.issue.title | truncate:60}}"
+```
+
+and run it: `00hooks run` (or `00hooks service install` to start it at login).
+
+A few more things a hook can do:
 
 ```
-00hooks login --relay https://relay.example.com          pair this computer (signing + sealing keys)
-00hooks hooks create --name ci --preset github             the URL and, once, the secret
-00hooks hooks create --name pay --preset stripe --secret-stdin   providers that issue their own secret
+00hooks hooks deliver-to ci "office mac"        only that computer gets the hook's events (runs once)
+00hooks hooks response ci --status 200 --content-type application/json --body '{"ok":true}'
+00hooks devices rename <device> "office mac"    a clearer name
 00hooks hooks create --name pay --preset stripe --strict --secret-stdin
-                                                           verify here: the relay never holds it
-00hooks hooks secret <hook> --preset stripe --secret-stdin
-                                                           a strict hook's secret on another computer
-00hooks quarantine list                                    events that couldn't be read, and why
-00hooks quarantine retry                                   open the ones that waited for a secret or key
-00hooks devices seal-key                                   a sealing key for a login from before sealing
-00hooks keys create --name ci --scope hooks:read           an API key for CI (never the stream)
-00hooks audit                                              hooks, devices and keys changed; failures counted
+                                                verify here: the relay never holds Stripe's secret
+00hooks keys create --name ci --scope hooks:read   an API key for CI (it can never read events)
+00hooks audit                                   what changed, and who changed it
 ```
 
-Presets: `github`, `standard-webhooks`, `standard-webhooks-ed25519`, `stripe`, `slack`, `linear`,
-`shopify`, `twilio`, `meta`, `hmac`, `token`, `unverified` (PROTOCOL §3 says what each one signs).
+## Provider presets
 
-**Strict** hooks keep the provider's secret on your computers only. Each computer verifies every
-event of a hook it holds the secret for, with the preset and options you gave it (`hooks secret`
-asks for `--preset`, or shows what the relay says and asks you to confirm; `--yes` for scripts), and
-keeps its own replay marks, so even a compromised relay can't forge, downgrade or replay them; it
-can still withhold them. `token` and `unverified` hooks can't be strict. An event that arrives before
-this computer has the secret is held at the relay, then kept whole in the quarantine, and runs once
-the secret is added.
+| Preset | How it is checked | Strength |
+|---|---|---|
+| `standard-webhooks` (Svix, Resend, Clerk…) | HMAC over id, timestamp and body, 5-minute window | strong |
+| `standard-webhooks-ed25519` | Ed25519: the relay holds only the sender's public key | strongest |
+| `stripe` | `Stripe-Signature`, 5-minute window | strong |
+| `slack` | `v0` HMAC with timestamp; `url_verification` answered | strong |
+| `linear` | HMAC, signed timestamp within 60 s | strong |
+| `calendly` | `t=…,v1=…` HMAC, 3-minute window | strong |
+| `paddle` | `ts=…;h1=…` HMAC, 5-second window | strong |
+| `twitch` | EventSub HMAC with timestamp; the challenge answered | strong |
+| `github` | `X-Hub-Signature-256` over the body | medium: no timestamp, replay marks instead |
+| `shopify` | `X-Shopify-Hmac-Sha256` over the body | medium |
+| `meta` (WhatsApp, Messenger, Instagram) | `X-Hub-Signature-256`; the GET verify-token check answered | medium |
+| `twilio` | HMAC-SHA1 over the URL and parameters; TwiML answers | medium |
+| `typeform` | `Typeform-Signature` over the body | medium |
+| `pagerduty` | `X-PagerDuty-Signature` over the body | medium |
+| `zoom` | `v0` HMAC; `endpoint.url_validation` answered | medium |
+| `hmac` | your choice of header, algorithm and encoding | strong if the sender supports it |
+| `token` | a secret header, constant-time compare | medium: no body integrity |
+| `unverified` | anything | marked unverified; automations refuse it unless you allow it |
+
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) §3 says exactly what each preset signs and dedupes on.
+
+## The security model, in plain words
+
+<p align="center">
+  <img src="docs/images/who-reads-what.svg" width="860" alt="Who can read what: the provider sees its own events; your relay sees metadata (time, hook, size, event type), stores only ciphertext and holds the payload in memory briefly while verifying and sealing, with strict mode keeping the secret on your devices; your devices read the full event after unsealing.">
+</p>
+
+- **The relay verifies, it never acts.** Everything that does something happens on your machine,
+  under rules you set there.
+- **What the relay sees:** when an event arrived, which hook, its size, the provider's event type
+  and whether it verified. It stores the content only as ciphertext sealed to your devices.
+- **What it can't do:** read stored events, sign as your devices, or turn a stolen API key into a
+  reader of your events (streaming needs a device key that never leaves the machine).
+- **What a compromised relay could still do:** see payloads in memory as it seals them, and
+  withhold or delay events (you'd see the gaps). With a strict hook it can't forge, downgrade or
+  replay that hook's events either.
+- **Requests are signed** by device keys, with single-use nonces. Hook secrets are stored encrypted,
+  shown once, and rotate with an overlap.
+
+The full model is [`docs/PLAN.md`](docs/PLAN.md) §4; the wire contract is
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md). Found a problem? See [`SECURITY.md`](SECURITY.md).
 
 ## Automations
 
@@ -136,6 +230,62 @@ automations:
   `00hooks screen held`, `release`, `drop --always` and `sync` (the rules that can run at the relay,
   with field values as keyed hashes). See PLAN §6a and PROTOCOL §4b.
 
+## Costs and limits
+
+- **Cloudflare:** the Workers Paid plan (Durable Objects with SQLite storage, and the Rate Limiting
+  binding, need it). An idle stream is designed to cost close to nothing; measure yours with
+  [`relay/docs/IDLE-COST.md`](relay/docs/IDLE-COST.md).
+- **Bodies:** 1 MiB per delivery by default, up to 1.75 MiB per hook (they live in the Durable
+  Object's rows).
+- **Rates:** 60 deliveries per 10 s per hook and 600 per 10 s per sending address at the edge, by
+  default; each account's log has a quota (10,000 waiting events, 256 MiB), and each hook a share.
+- **Retention:** unacknowledged events wait 7 days by default; older ones are dropped and reported
+  as a gap, never silently.
+- **Devices:** 10 computers per account by default, plus phones.
+
+`relay/README.md` lists every setting.
+
+## FAQ
+
+**Is there a hosted relay?** No. You run your own, on your Cloudflare account.
+
+**Why not just use a tunnel to my laptop?** A tunnel forwards whatever arrives, whenever your laptop
+is on. 00hooks checks each event at the edge, keeps it sealed while you're offline, and delivers it
+once, in order, when you're back.
+
+**Can the relay operator read my events?** Not at rest: storage holds ciphertext only. The payload
+is in the relay's memory for a moment while it verifies and seals it; that's needed to check a
+signature, and the code is open. Strict hooks also keep the provider's secret off the relay.
+
+**What if my computer is off for a while?** Events wait at the relay (7 days by default) and run
+in order when it's back.
+
+**Two machines both run my automations. Will they run twice?** Not if you pick one: `00hooks hooks
+deliver-to <hook> <device>` sends that hook's events to one computer only.
+
+**How do I test a hook without the provider?** `00hooks test <hook>`: the relay signs a sample
+with the hook's own secret and sends it through the real path. It is marked as a test, and only
+automations that list the kind `00hooks.test` run on it.
+
+**Email?** Not yet, and not planned as is: Cloudflare's Email Routing gives a Worker no reliable
+proof of who sent a message ([`docs/PLAN.md`](docs/PLAN.md) §8 explains).
+
+## Repository
+
+- [`relay/`](relay/): the Cloudflare Worker and its two Durable Object classes (TypeScript), with
+  the installer.
+- [`cli/`](cli/): the `00hooks` CLI, and the `hooks-client`, `hooks-runner` and `hooks-screen`
+  libraries (Rust), which other programs can embed.
+- [`docs/PLAN.md`](docs/PLAN.md): the design, the security model, and what is built and why some
+  things aren't. [`docs/PROTOCOL.md`](docs/PROTOCOL.md): the contract between the relay and its
+  clients.
+
+## Contributing
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md). In short: `pnpm check`
+passes, every change has a test that pins it, and nothing secret or personal goes into the
+repository. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
-Apache-2.0. See [`LICENSE`](LICENSE).
+Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).

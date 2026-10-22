@@ -54,6 +54,12 @@ management requests are rate-limited per address (`429`, §1); an account at its
 `409` (§2); and a relay with neither a signup token nor `OPEN_SIGNUP=1` refuses signups with `403` (its
 `/v1/info` says `signupOpen: false`).
 
+Additive within version 2 (finishing the plan): renaming a device (`PATCH /v1/devices/<id>`, §2);
+a hook's `deliverTo` and `response` (§3, §6); the signed test event (`POST /v1/test/<hookId>`,
+§3), whose routing `eventType` is `00hooks.test`; and the audit kinds `device.renamed` and
+`hook.delivery` (§9). A client that ignores them keeps working: an event its hook delivers to
+another device never reaches it, and a test event is an ordinary verified event.
+
 Additive within version 2 (plans, §2a, §2b): `plans`, `entitlements` and `hostedPlan` in
 `/v1/info`; `GET /v1/account`; `PUT /v1/account/plan` and `entitlement` in `POST /v1/accounts` (only
 on a relay with entitlement keys); `onLimit` and `pausedUntil` in `Hook`, and
@@ -194,6 +200,11 @@ characters); both sides compute it.
   already in the log keep the key they were sealed to (each envelope names its kid). This is how a
   device created before version 2 gets one. Another device (or an API key) gets `403` `forbidden`:
   whoever sets a device's sealing key chooses who can read what is sealed to it.
+- `PATCH /v1/devices/<id>` (signed by a device, or an API key with `devices:write`) `{ "name" }` →
+  `{ "device": <as GET /v1/devices lists it> }`: renames one of the account's devices (a phone
+  too). The name is 1 to 100 characters once trimmed, without control characters (`400` `invalid`,
+  `field: "name"`). A revoked device, a phone whose pairing ran out unconfirmed, or another
+  account's device is `404`. Audit: `device.renamed`, named by the new name.
 - `DELETE /v1/devices/<id>` (signed, or an API key with `devices:write`) → `204`: revokes it; its open stream closes at once with `4401`.
   Revoking a device also revokes every phone paired with it, and revoking a phone tells its node
   (§10.5).
@@ -206,11 +217,13 @@ characters); both sides compute it.
 - `GET /v1/info` (unsigned) → `{ "version", "protocol": 2, "protocols": [2], "signupOpen": bool,
   "relayKey", "serverTime", "screen": { "edge": true, "maxRules": 200, "heldDays" }, "extras": [],
   "phone": { "protocol": 1, "push": { "available": bool, "environment": "sandbox" | "production" |
-  null } }, "plans": true, "entitlements": bool, "hostedPlan"?: {…} }` (the last three: §2a).
+  null, "platforms": { "ios": { "available": bool, "environment": … }, "android": { "available": bool } } } }, "plans": true, "entitlements": bool, "hostedPlan"?: {…} }` (the last three: §2a).
   `signupOpen` is true only when a signup needs no token
   (`OPEN_SIGNUP=1` and no `SIGNUP_TOKEN`). `phone` says the relay carries phone links (§10) and the
-  version of their socket protocol; `phone.push` says whether it can wake a phone through APNs
-  (§10.7) and which APNs environment it sends to (null when it can't).
+  version of their socket protocol; `phone.push.platforms` says, per platform, whether it can wake a
+  phone (§10.7): `ios` through APNs, with the APNs environment it sends to (null when it can't), and
+  `android` through FCM. `phone.push.available` and `environment` are the same as `ios`'s, for
+  clients written before Android.
   `screen` says what the edge screen takes (§4b). `extras` lists the optional hosted extras this
   relay offers (fingerprint sync across devices, reputation lists shared as hashes, a longer hold,
   evaluator credits…), each `{ "id", "title", "description"?, "url"? }`, as the operator sets them
@@ -332,11 +345,26 @@ characters, and `exp` is later than now and than `iat` (times in Unix **seconds*
   refer to a hook by name resolve the name to the hook's id once and keep the id: a hook renamed
   later, or a new hook given a freed name, is a different hook.
 - `GET /v1/hooks` (`hooks:read`) → `{ "hooks": [<Hook>] }`; `GET /v1/hooks/<id>` → `<Hook>`.
-- `PATCH /v1/hooks/<id>` (`hooks:write`) `{ "name"?, "enabled"?, "maxBodyBytes"?, "offlineNotice"? }`
-  → `<Hook>`. `"offlineNotice": null` clears it.
+- `PATCH /v1/hooks/<id>` (`hooks:write`) `{ "name"?, "enabled"?, "maxBodyBytes"?, "offlineNotice"?,
+  "deliverTo"?, "response"? }` → `<Hook>`. `null` clears `offlineNotice`, `deliverTo` and `response`.
+  - `deliverTo`: a device id. The hook's events are sealed to that device alone, so an automation
+    that two machines both run happens once (*the Mac in the office*); every other device's stream
+    passes them by without a word (§6). It must be an active device of kind `device` of the account
+    with a sealing key (`400` `invalid`, `field: "deliverTo"`). When that device is revoked (or
+    loses its key) the hook's deliveries go to every device again rather than to nobody, and the
+    events only it could read are deleted with it. Changing it is an audit line `hook.delivery`
+    (named by the device id, or `*` for every device).
+  - `response`: `{ "status"?: 200–299 but 204 and 205 (200 by default), "contentType"?:
+    "text/plain" (default) | "application/json" | "application/xml" | "text/xml", "body"?: at most
+    4,096 bytes of UTF-8 (valid JSON for JSON) }`: what the relay answers the provider for a delivery
+    it accepts, instead of `{"received": …}`: stored, a duplicate, or dropped by the screen (which
+    must look the same). Refusals (`401`, `404`, `413`, `429`) keep their usual answers. It carries
+    `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; sandbox`, and
+    never HTML: the relay's origin serves no page someone wrote. A `twilio` hook, answered with TwiML,
+    can't have one (`400`, `field: "response"`); a due Slack notice (§4a) takes precedence.
 - `POST /v1/hooks/<id>/rotate` (a device, or `hooks:secrets`) → `{ "secret" }`; the previous secret
   keeps working for 24 h. Only for presets whose secret the relay generates; a provider-issued secret (Stripe, Slack,
-  Linear, Shopify, Twilio) is rotated at the provider, and a strict hook's secret is on the devices:
+  Linear, Shopify, Twilio, Meta, Paddle, Zoom, PagerDuty) is rotated at the provider, and a strict hook's secret is on the devices:
   both answer `409` `conflict`.
 - `DELETE /v1/hooks/<id>` (`hooks:write`) → `204`. Events already in the log stay until acknowledged.
 - **The plan's caps** (§2a), checked in the hook's insert itself, so creations racing can't pass
@@ -362,9 +390,27 @@ Every device's stream is told of each hook created, rotated, renamed or deleted 
 
 `Hook`: `{ "id", "name", "url", "enabled", "verify": { "preset", …non-secret fields }, "maxBodyBytes",
 "createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null, "screenRules",
-"onLimit": "refuse" | "accept_and_drop", "pausedUntil": <ms> | null }` (`screenRules`: how many edge
-rules the hook's screen has, §4b). `lastEventAt` is written at most once a minute per hook (the
-account's object keeps the exact time, `GET /v1/account`).
+"deliverTo": "dev_…" | null, "response": { "status", "contentType", "body" } | null, "onLimit": "refuse" |
+"accept_and_drop", "pausedUntil": <ms> | null }` (`screenRules`: how many edge rules the hook's screen
+has, §4b). `lastEventAt` is written at most once a minute per hook (the account's object keeps the
+exact time, `GET /v1/account`).
+
+### The test event
+
+`POST /v1/test/<hookId>` (a device, or an API key with `hooks:secrets`: signing with a hook's secret
+needs what being shown it does) sends the hook a sample delivery, signed with the hook's own
+secret the way its preset's provider signs (the preset table drives it: signed parts, a timestamp
+of now, fresh delivery ids so it is never a duplicate), through the hook's own path: rate limits,
+verification, the screen, dedupe, sealing and the log apply exactly as to a delivery. The sample is
+JSON (`{"type": "00hooks.test", …, "00hooks": {"test": true, "sentAt", "note"}}`; a form for `twilio`),
+and the event's routing `eventType` is `00hooks.test`, set by the relay whatever the preset reads
+(and only by it: a delivery whose preset reads that type, from GitHub's unsigned header say, gets
+none),
+and signed with the rest of the metadata (§5). → `200` `{ "status": <what the delivery was
+answered>, "answer": <its JSON answer, or null>, "eventType": "00hooks.test" }`. A strict hook (its
+secret is on the devices) and a `standard-webhooks-ed25519` hook (the relay holds only the public
+key) can't be signed for: `409` `conflict`; send a test from the provider. The reference runner
+records a test event and runs only the automations whose kinds name `00hooks.test`.
 
 ### Presets
 
@@ -386,11 +432,18 @@ scheme with Node's own crypto where they don't).
 | `shopify` | `secret` (required) | provider's | `X-Shopify-Hmac-Sha256: <base64 HMAC-SHA256(body)>` |
 | `meta` | `secret` (required: the app secret), `verifyToken`? (8 to 200 printable characters) | provider's; the verify token is generated when absent | `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(body)>` under the app secret (WhatsApp Cloud API, Messenger, Instagram); answers the GET handshake (§4) |
 | `twilio` | `secret` (required: the auth token) | provider's | `X-Twilio-Signature: <base64 HMAC-SHA1>` over the **public URL the relay was reached at**, then, for a form body, every parameter name and value (names sorted by code point, each name's distinct values sorted); for a JSON body, the URL alone, whose `bodySHA256` query parameter must equal the body's hex SHA-256. Tried with the URL as reached, without its port, and with the scheme's default port, as Twilio's own libraries do |
+| `calendly` | `secret`? (Calendly's webhook signing key) | generated when absent | `Calendly-Webhook-Signature: t=<s>,v1=<hex>`: HMAC-SHA256 of `t.body`; `t` within **180 s** (Calendly's documented tolerance) |
+| `typeform` | `secret`? | generated when absent | `Typeform-Signature: sha256=<base64 HMAC-SHA256(body)>` |
+| `paddle` | `secret` (required: the destination's `pdl_ntfset_…` key) | provider's | Paddle Billing. `Paddle-Signature: ts=<s>;h1=<hex>[;h1=…]` (`;`-separated): HMAC-SHA256 of `ts:body`; any `h1` may match; `ts` within **5 s**, as Paddle's own SDKs check |
+| `twitch` | `secret`? (10 to 100 ASCII characters, Twitch's rule) | generated when absent | Twitch EventSub. `Twitch-Eventsub-Message-Signature: sha256=<hex HMAC-SHA256(message id ‖ timestamp ‖ body)>`, the `Twitch-Eventsub-Message-Timestamp` (RFC 3339) within **600 s**; answers `webhook_callback_verification` (below) |
+| `zoom` | `secret` (required: the app's secret token) | provider's | `x-zm-signature: v0=<hex HMAC-SHA256("v0:" ts ":" body)>`, `ts` from `x-zm-request-timestamp`. Zoom documents no window, and doesn't say whether its retries (up to 85 minutes later) are signed afresh, so the timestamp is signed but not checked; answers `endpoint.url_validation` (below). Can't be strict |
+| `pagerduty` | `secret` (required) | provider's | PagerDuty v3. `X-PagerDuty-Signature: v1=<hex HMAC-SHA256(body)>[,v1=…]`; any `v1` may match |
 | `hmac` | `header` (required), `algorithm` (`sha256` default, or `sha1`), `encoding` (`hex` default, or `base64`), `prefix`?, `secret`? | generated when absent | HMAC of the raw body |
 | `token` | `header` (default `Authorization`), `secret`? | generated when absent | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength; **no dedupe** |
 | `unverified` | — | — | accepts anything; events carry `verified: false`; **no dedupe** |
 
-Every preset except `unverified` and `token` also takes `"strict": true` (below). A strict `token`
+Every preset except `unverified`, `token` and `zoom` (its endpoint check needs the secret, below)
+also takes `"strict": true` (below). A strict `token`
 hook would prove nothing on the device (the token reaches the relay in the clear and signs no
 content), so the relay refuses it (`400`, `field: "verify.strict"`), as it refuses a strict
 `unverified` one, and a device refuses to verify one. A `secret` is 8 to 512
@@ -399,8 +452,8 @@ characters; the relay refuses to create a hook of a provider-issued preset witho
 
 What each preset's signature covers, what the relay uses besides, and its replay marks (a delivery is
 a duplicate when **any** mark was seen in the last 7 days; for the presets that sign no timestamp,
-`github`, `shopify`, `twilio`, `meta` and `hmac`, the body-hash mark is kept `REPLAY_MARK_DAYS`, 180
-days by default):
+`github`, `shopify`, `twilio`, `meta`, `typeform`, `zoom`, `pagerduty` and `hmac`, the body-hash
+mark is kept `REPLAY_MARK_DAYS`, 180 days by default):
 
 | `preset` | signed | used but **not** signed (the sender's claim) | replay marks | `eventType` |
 |---|---|---|---|---|
@@ -413,6 +466,12 @@ days by default):
 | `shopify` | the body | `X-Shopify-Webhook-Id`, `X-Shopify-Topic` | the webhook id, the body's hash | `X-Shopify-Topic` (claimed) |
 | `twilio` | the URL and the form parameters (or the URL, with the JSON body's hash in it) | `I-Twilio-Idempotency-Token` | the token, the body's hash | none |
 | `meta` | the body | — | the body's hash (Meta sends no delivery id, and retries the same body) | the body's `object` (signed): `whatsapp_business_account`, `page`, `instagram` |
+| `calendly` | `t`, the body (with its `event`) | — | the body's hash (no event id in the body) | the body's `event` (signed): `invitee.created`… |
+| `typeform` | the body (with `event_id` and `event_type`) | — | the body's `event_id`, the body's hash | the body's `event_type` (signed) |
+| `paddle` | `ts`, the body (with `event_id` and `event_type`) | — | the body's `event_id`, the body's hash | the body's `event_type` (signed) |
+| `twitch` | the message id, the timestamp, the body | `Twitch-Eventsub-Message-Type`, `-Retry`, `-Subscription-Type` and `-Version` (kept, not used) | the message id (a resend keeps it) | the body's `subscription.type` (signed) |
+| `zoom` | the timestamp, the body (with its `event`) | — | the body's hash | the body's `event` (signed) |
+| `pagerduty` | the body (with `event.id` and `event.event_type`) | `X-Webhook-Id`, `X-Webhook-Subscription` (kept, not used) | the body's `event.id`, the body's hash | the body's `event.event_type` (signed) |
 | `hmac` | the body | — | the body's hash | none |
 | `token` | nothing (the token proves the sender knows the secret; the body has no integrity) | — | none | none |
 | `unverified` | nothing | — | none | none |
@@ -420,12 +479,20 @@ days by default):
 Where the id a provider sends is **not** signed (GitHub, Linear, Shopify, Twilio), someone who
 captured one delivery could resend it under a new id; the body-hash mark answers that as a duplicate.
 The cost: two genuinely different deliveries with byte-identical bodies within 7 days are stored
-once. GitHub, Shopify, Twilio, Meta and the generic `hmac` preset sign no timestamp, so for them
-these marks are the only replay defence: a captured genuine delivery (GitHub shows recent ones, body
+once. GitHub, Shopify, Twilio, Meta, Typeform, PagerDuty and the generic `hmac` preset sign no
+timestamp (Zoom signs one the relay doesn't check), so for them these marks are the only replay
+defence: a captured genuine delivery (GitHub shows recent ones, body
 and signature, to a repository's admins) verifies forever. That is why their body-hash mark is kept
 for `REPLAY_MARK_DAYS` rather than a week. Past it, a replay is accepted as a new event with a new
 `evt_` id, so a client that acts on events should also dedupe by the content's hash, kept at least
-as long as it keeps anything; the reference runner is meant to. Marks are stored as keyed hashes (HMAC-SHA256 under `HASH_PEPPER` of the hook
+as long as it keeps anything. The reference runner does: for a verified (or strict-verified) event
+of these presets it keeps SHA-256 of the hook id and the body bytes (not the headers: a replay's
+delivery id differs), fsynced before the run's start record, at most 100,000 marks for 400 days
+(oldest first out), as hashes only in a 0600 file of its state folder. A delivery whose content it
+has already taken under another id is recorded as a dropped run ("same content as event evt_…
+received …: a replay") and never run; `00hooks replay` still runs a recorded event on purpose. It
+never dedupes `token`, `unverified` or timestamped presets this way (identical bodies are legitimate
+there, or the timestamp already refuses old replays). Marks are stored as keyed hashes (HMAC-SHA256 under `HASH_PEPPER` of the hook
 id and the mark), never the ids themselves: an event id read from a body is content too.
 
 **Slack's endpoint check.** A `slack` delivery whose body is `{"type":"url_verification",
@@ -433,6 +500,22 @@ id and the mark), never the ids themselves: an event id read from a body is cont
 `[A-Za-z0-9._~-]`, or it is treated as an ordinary event) **after** the signature verifies, and it is
 not stored: it carries no event. GitHub's `ping` (sent when a webhook is created) is verified, deduped
 and stored as a normal event with `eventType: "ping"`, so a new hook can be tested end to end.
+
+**Twitch's endpoint check.** A `twitch` delivery with `Twitch-Eventsub-Message-Type:
+webhook_callback_verification` whose body carries a `challenge` (at most 200 characters of
+`[A-Za-z0-9._~-]`, or it is treated as an ordinary event) is answered `200` `text/plain` with the
+challenge **after** the signature and timestamp verify, and it is not stored. A `revocation`
+(Twitch telling you why it ended a subscription) is verified and stored like any event; its type
+header is kept with it.
+
+**Zoom's endpoint check.** A `zoom` delivery whose body is `{"event":"endpoint.url_validation",
+"payload":{"plainToken":…}}` is answered `200` `application/json` with `{"plainToken",
+"encryptedToken"}`, the token's hex HMAC-SHA256 under the secret that verified the delivery, **after**
+the signature verifies; it is not stored. The token is read only from a body Zoom signed, so nobody
+else can make the relay compute it, and it must be at most 200 characters of `[A-Za-z0-9_-]`: with
+no `:` in it, the answer can never be a signature over a `v0:…` delivery. The answer needs the
+secret, so a strict `zoom` hook is refused (`400`, `field: "verify.strict"`): Zoom re-checks the
+endpoint every 72 hours and would switch the webhook off.
 
 **Meta's endpoint check.** Before Meta sends anything to a callback URL it asks
 `GET /h/<hookId>?hub.mode=subscribe&hub.verify_token=…&hub.challenge=…`. A `meta` hook keeps its
@@ -443,8 +526,8 @@ or unsafe challenge, a wrong token) is `401` `signature`, counted like a failed 
 is stored. Hooks of other presets answer `GET` with `404`. The verify token is not a signing secret
 (it proves nothing about later deliveries), so a strict `meta` hook keeps it at the relay too.
 
-`maxBodyBytes` is at most 1,835,008 (bodies live in 2 MB SQLite rows; larger ones move to R2 in a
-later phase). It is 1 MiB by default, and 256 KiB for a strict or `unverified` hook (anyone who
+`maxBodyBytes` is at most 1,835,008 (bodies live in 2 MB SQLite rows; PLAN §3.2 says why larger
+bodies don't go to R2). It is 1 MiB by default, and 256 KiB for a strict or `unverified` hook (anyone who
 knows its URL can send it junk the relay can't tell from deliveries); `PATCH` raises it. Secrets are stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM, the hook id
 as associated data), never returned after creation.
 
@@ -457,8 +540,8 @@ body together with the signature headers and the URL, and each device verifies t
 signature itself:
 
 - **At the edge**: size and rate as always; the preset's signature header must be present and well
-  formed; a timestamp the provider puts in a **header** (Stripe's `t`, Slack's, Standard Webhooks')
-  must be within its window. The body is never parsed. Replay marks are the **body hash only**:
+  formed; a timestamp the provider puts in a **header** (Stripe's `t`, Slack's, Standard Webhooks',
+  Calendly's `t`, Paddle's `ts`, Twitch's) must be within its window. The body is never parsed. Replay marks are the **body hash only**:
   an unverified sender must not be able to burn an id a genuine delivery will need later, and a
   forger can't predict a future genuine body. Events are stored `verified: false`, `strict: true`,
   with `eventType` only from a header (GitHub, Shopify) and otherwise null.
@@ -601,8 +684,8 @@ a device releases it) or `drop` (§4 step 5a). No rule holding is a pass. Nothin
 a decision leaves the rule's id and an hourly count.
 
 **What it reads.** The client's address (`CF-Connecting-IP`), its network (`request.cf.asn`) and
-country (`request.cf.country`), the headers, the body's size and, unless the hook is strict, the
-body itself, read as the harness reads it: JSON, else a form's fields (a repeated name becomes a
+country (`request.cf.country`), the headers, the body's size, the time it arrived (the relay's
+clock, which is the event's `receivedAt`) and, unless the hook is strict, the body itself, read as the harness reads it: JSON, else a form's fields (a repeated name becomes a
 list), else UTF-8 text. A strict hook's body is never parsed, so conditions on its body never hold
 there (its devices still screen it).
 
@@ -629,6 +712,7 @@ Condition  =
   { "on": "field", "path", "op": "pattern", "pattern", "not"?: true }        needs consent.words
   { "on": "field", "path", "op": "similar_text", "signature", "threshold"? } needs consent.words
   { "on": "similar", "shape"?: 64 hex, "text"?: signature, "threshold"? }
+  { "on": "time", "from": "HH:MM", "to": "HH:MM", "days"?: [0..6…], "tz"?: IANA zone, "not"?: true }
 ```
 
 Lists hold 1 to 1,000 entries. `not` turns a list into an allow list: `{"on": "ip", "in": <GitHub's
@@ -690,6 +774,24 @@ missing network, country or field.
   once), its patterns and `contains` comparisons take at most 2,000,000 steps, and its field paths
   pass at most 1,000,000 payload nodes. A delivery that would need more is held, as if a rule had
   said `quarantine`, under the rule id `~over-budget` (not a valid rule id, so it names no rule).
+- **Time windows** (`time`) hold when the delivery arrived, read as a wall clock in `tz` (an IANA
+  name such as `Europe/Lisbon`; UTC when absent), on one of `days` (0 is Sunday; every day when
+  absent) at or after `from` and before `to`. `from` is `00:00` to `23:59`, `to` is `00:00` to
+  `24:00` and differs from `from`. A window whose `from` is later than its `to` runs past midnight,
+  and is on the day it started: `{"days": [5], "from": "22:00", "to": "06:00"}` holds from Friday
+  22:00 to Saturday 06:00. Daylight saving time is the zone's: a wall-clock time that is skipped
+  never occurs, and one that repeats holds both times. The time is the relay's clock when the
+  delivery arrives, the instant it signs as the event's `receivedAt`; the harness judges the same
+  event by that `receivedAt` (not the device's clock), so both halves agree, and an event read
+  late is judged by when it arrived. A zone's name is letters first, then letters, digits, `_`, `+`
+  and `-` in parts joined by `/`, at most 64 characters (no offsets like `+01:00`; case is
+  ignored and older names such as `US/Eastern` work), and must be in the zone database; an unknown
+  zone, `Etc/Unknown` and `Factory` are refused (`400` on the condition's `tz`), as is a bad `from`,
+  `to` or `days` (on that field). One screen's windows are in at most 8 different zones (no `tz`
+  counts as `UTC`; `400`, `field: "screen.rules"`). Each zone's formatter is made once per relay
+  isolate, and a delivery reads its wall clock once per zone. The two halves' zone databases
+  (the runtime's ICU at the relay, the IANA database bundled with the harness) can differ for a
+  zone whose rules changed recently, until both are updated.
 - **Fingerprints** (`similar`): `shape` is the payload's shape hash (its field paths and types:
   every path `payload.a`, `payload.l[]`… with its types sorted and joined by `|`, the lines
   `path:types` sorted and joined by `\n`, then hex SHA-256; at most 2,000 fields, 32 levels and 50
@@ -701,8 +803,9 @@ missing network, country or field.
   equal slots is at least `threshold` (0.5 to 1; 0.8 when absent).
 
 `fixtures/screen.v1.json` pins words, shapes, signatures, domains (with the caps), keyed hashes,
-which patterns are in the edge's subset with their weights, and what edge patterns match
-(pathological inputs included); the relay's tests and the harness's (`cli/hooks-screen`) both run
+which patterns are in the edge's subset with their weights, what edge patterns match
+(pathological inputs included), and when time windows hold (past midnight, days, daylight saving
+transitions, `not`) with the windows and zones refused; the relay's tests and the harness's (`cli/hooks-screen`) both run
 it.
 
 **The hold.** A quarantined event is sealed to every device as usual, but with the associated data
@@ -919,8 +1022,11 @@ data: {…event…}
 - **Probe**: `GET /v1/stream?probe=1` (signed, `X-00h-Protocol: 2`) answers `retry`, `ready` and
   `closed {"code":1000,"reason":"probe"}`, then ends, without replacing the device's live stream and
   without sending events (for `00hooks doctor`).
-- *(later)* per-hook delivery, so a device receives only the hooks routed to it: today every active
-  device with a sealing key gets an envelope for every event, and filters locally.
+- **Per-hook delivery**: an event of a hook with `deliverTo` (§3) has an envelope for that device
+  only. Another device's stream skips it **silently**, with no `gap` (nothing was lost to it), so
+  seqs a device receives need not be consecutive. Once its device acknowledges it (or is revoked),
+  the event is deleted without waiting for the others. Every other event goes to every active
+  device with a sealing key, which filters locally.
 
 How the relay serves it (informative): the Worker holds the SSE response and connects to the
 account's Durable Object over a WebSocket that the object accepts with the hibernation API, so the
@@ -939,6 +1045,9 @@ when it was received), then dropped, which shows up as a `gap`. Only events that
 each contiguous run of them as its own `gap`.
 
 Clients dedupe by `id` before acting, so at-least-once delivery never runs an automation twice.
+For the presets that sign no timestamp they also dedupe by content (§3): the reference runner writes
+its content mark before its run's start record and confirms the event only after both, so a crash
+between them hands the same `id` over again, which its own mark names and lets through.
 The reference client records an event (opened) before acknowledging it, and then hands it to its
 consumer. By default it marks the event handed-over as it does (at most once to the consumer); a
 consumer that records durably itself can ask to **confirm** instead (`SubscribeOptions::confirm`,
@@ -976,8 +1085,8 @@ alone. Codes: `unauthorized`,
 `clock_skew`, `not_found`, `too_large`, `rate_limited`, `quota` (a `429`: the account's log is full),
 `signature`, `invalid` (with `field`), `conflict`, `forbidden` (a `403`: an API key without the
 scope, or a route only a device may use), `unavailable` (a `503`: the relay is missing a safety
-binding or its signing key and refuses rather than run without it), `push_failed` (a `502`: Apple's
-push service didn't take a push, §10.7), `internal` (a `500`; the relay logs the
+binding or its signing key and refuses rather than run without it), `push_failed` (a `502`: the push
+service, Apple's or Google's, didn't take a push, §10.7), `internal` (a `500`; the relay logs the
 cause, never the payload). Messages never contain secrets, signatures or payload content.
 
 ## 9. API keys, the audit log and the events list
@@ -1003,9 +1112,9 @@ scope, or on a route only a device may use, is `403` `forbidden`.
 |---|---|
 | `hooks:read` | `GET /v1/hooks`, `GET /v1/hooks/<id>` |
 | `hooks:write` | `POST /v1/hooks` (without a relay-generated secret or verify token), `PATCH`/`DELETE /v1/hooks/<id>` |
-| `hooks:secrets` | `POST /v1/hooks/<id>/rotate`, and, with `hooks:write`, `POST /v1/hooks` for a hook whose secret or verify token the relay generates: the only scope ever shown a hook's secret |
+| `hooks:secrets` | `POST /v1/hooks/<id>/rotate`, `POST /v1/test/<hookId>`, and, with `hooks:write`, `POST /v1/hooks` for a hook whose secret or verify token the relay generates: the only scope ever shown a hook's secret |
 | `events:read` | `GET /v1/events` |
-| `devices:write` | `GET /v1/devices`, `DELETE /v1/devices/<id>` |
+| `devices:write` | `GET /v1/devices`, `PATCH /v1/devices/<id>` (rename), `DELETE /v1/devices/<id>` |
 | `audit:read` | `GET /v1/audit` |
 | `hooks:read` (screen) | `GET /v1/hooks/<id>/screen` |
 | `hooks:write` (pauses) | `POST /v1/hooks/<id>/unpause` |
@@ -1032,6 +1141,8 @@ Names and ids only: never a secret, a token, a header value or a payload.
 | `key.used` | the key | the key | the key's name; `count` uses in the hour starting at `at` |
 | `verify.failed` | the hook | null | the hook's name, while it exists; `count` failures in the hour starting at `at` (approximate: counted at the edge, §4 step 4) |
 | `hook.screen` | the hook | the device or key | the hook's name |
+| `hook.delivery` | the hook | the device or key | the device its events now go to, or `*` for every device |
+| `device.renamed` | the device | the device or key | its new name |
 | `screen.held`, `screen.dropped` | the hook | null | the hook's name; `count` in the hour starting at `at` (`screen.dropped` is counted at the edge, like `verify.failed`) |
 | `held.released`, `held.dropped` | the event | the device or key | null |
 | `hook.paused` | the hook | null | the scope whose refusals paused it |
@@ -1280,22 +1391,30 @@ request, then hands it to the object, whose `101` goes back to the client.
 
 ### 10.7 Push
 
-A node can ask the relay to wake one of its phones through Apple's push service (APNs) when the
-phone's socket isn't online. The **node** keeps each phone's APNs device token (the phone sends it to
-its node, sealed, like everything else) and decides what is worth a push; the **relay** holds only
-the operator's APNs key, checks that the phone is the node's, applies the limits, and sends a fixed,
-opaque alert. The relay stores no device token and puts nothing the node wrote into the alert.
+A node can ask the relay to wake one of its phones when the phone's socket isn't online: an iPhone
+through Apple's push service (APNs), an Android phone through Firebase Cloud Messaging (FCM, below).
+The **node** keeps each phone's device token (the phone sends it to its node, sealed, like everything
+else) and decides what is worth a push; the **relay** holds only the operator's APNs key and FCM
+service account, checks that the phone is the node's, applies the limits, and sends a fixed, opaque
+alert. The relay stores no device token and puts nothing the node wrote into the alert.
 
 **`POST /v1/phone/push`** (signed by a device of kind `device`; a phone, or an API key, is `403`
 `forbidden` as on the other node-only phone routes):
 
 ```
-{ "device": "dev_…", "token": <the APNs device token: lowercase hex, 32 to 400 characters, an even number>,
+{ "device": "dev_…", "platform"?: "ios" | "android",
+  "token": <ios: the APNs device token: lowercase hex, 32 to 400 characters, an even number;
+            android: the FCM registration token: 32 to 1,024 of A–Z a–z 0–9 - _ :>,
   "environment"?: "sandbox" | "production",
   "kind": "approval" | "ask" | "finished" | "handoff" | "reconnect" | "task" | "done" | "drive",
   "ref": <22 characters of unpadded base64url>,
   "preview"?: { "at": <integer ms>, "enc": <43 base64url>, "ct": <standard padded base64, at most 1,400 characters>, "sig": <86 base64url> } }
 ```
+
+`platform` is `ios` when absent, so requests written before Android are iOS ones; `environment` is
+for iOS only (with `android` it is `400` `invalid`). Steps 1 to 6 are the same for both platforms,
+and a phone's limits are its own whichever platform it is pushed on; steps 7 and 8 are APNs', and
+FCM's are under "Android" below.
 
 `ref` is the node's own reference (what the phone opens when the alert is tapped); `preview`, when
 given, is sealed to the phone by the node and carried as it is, so the phone's notification extension
@@ -1306,7 +1425,8 @@ can show the real text on the device. The relay reads neither. Checks, in order:
 2. `device` must be one of the calling node's own phones, confirmed and not revoked: anything else
    (a pending phone, a revoked one, another node's, another account's, an unknown id) is `403`
    `forbidden` "That phone isn't paired with this device.". Nothing is sent.
-3. Push isn't configured on this relay (below): `200` `{ "sent": false, "reason": "unavailable" }`.
+3. Push isn't configured on this relay for the request's platform (below): `200`
+   `{ "sent": false, "reason": "unavailable" }`.
 4. `environment` is given and isn't the relay's: `200` `{ "sent": false, "reason": "environment" }`.
    Without `environment` it isn't checked.
 5. The phone's socket is online (§10.3): `200` `{ "sent": false, "reason": "online" }`. It gets the
@@ -1365,6 +1485,48 @@ imports; `/v1/info` says so (§2). The APNs hosts aren't configurable.
 
 The requests were checked against a mock of APNs in the relay's tests, not against Apple's service.
 APNs needs HTTP/2, which the Workers runtime negotiates for outbound HTTPS.
+
+**Android.** With `"platform": "android"`, steps 1 to 6 are as above; then:
+
+7. The relay sends `POST https://fcm.googleapis.com/v1/projects/<project_id>/messages:send` with
+   `authorization: Bearer <access token>` and `content-type: application/json`. The body is built by
+   the relay alone, with the same texts as the table above:
+
+   ```
+   { "message": { "token": "<token>",
+                  "notification": { "title": T, "body": B },
+                  "data": { "zn": "<the APNs payload's zn object, as JSON text>" },
+                  "android": { "priority": "high", "ttl": "86400s", "collapse_key": "<kind>",
+                               "notification": { "tag": "<kind>" } } } }
+   ```
+
+   `data.zn` is the same object APNs carries in `zn` (`v`, `kind`, `ref`, and `p` only when a preview
+   is given), as a string because FCM's data values are strings. Nothing else from the request goes
+   into the message.
+8. FCM's answer: `200` → `200` `{ "sent": true }`. `404`, or the error code `UNREGISTERED` or
+   `SENDER_ID_MISMATCH`, or `400` `INVALID_ARGUMENT` whose field violation is `message.token` →
+   `200` `{ "sent": false, "reason": "unregistered" }`: the node forgets that token, as for APNs.
+   Any other `INVALID_ARGUMENT` is about the relay's message and keeps the token. `401` → the relay
+   fetches a fresh access token and tries once more, and answers from that second try. `429` →
+   `429` `rate_limited` with `Retry-After: 60`. Anything else, a network error, a redirect, or no
+   access token from Google → `502` `push_failed`. The relay logs the kind, FCM's status and error
+   word, never the token, the access token or the message.
+
+**The access token** is an OAuth2 token from `POST https://oauth2.googleapis.com/token`
+(`application/x-www-form-urlencoded`: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and
+`assertion=<JWT>`). The assertion is an RS256 JWT: header `{"alg":"RS256","typ":"JWT","kid":<private_key_id>}`
+(no `kid` when the service account has none), claims `{"iss":<client_email>,"scope":"https://www.googleapis.com/auth/firebase.messaging","aud":"https://oauth2.googleapis.com/token","iat":<Unix seconds>,"exp":<iat + 3600>}`,
+signed with RSASSA-PKCS1-v1_5 and SHA-256. Each instance reuses its access token until five
+minutes before the `expires_in` Google gave (at most an hour), shares one exchange between parallel
+pushes, and fetches a new one when the service account changes. A refused exchange isn't cached.
+
+**Configuration** (Worker secret): `FCM_SERVICE_ACCOUNT`, the whole JSON key file of a Google service
+account of the Firebase project (Firebase console → Project settings → Service accounts → Generate
+new private key). The relay reads `type` (must be `service_account`), `project_id` (6 to 30 of
+a–z 0–9 -), `client_email`, `private_key` (a PKCS#8 PEM of an RSA key of at least 2,048 bits) and,
+when present, `private_key_id`; it ignores the rest, `token_uri` included. Android push is available
+when it parses and the key imports; `/v1/info` says so (§2). The token endpoint and the FCM host
+aren't configurable. As for APNs, the requests were checked against mocks, not against Google.
 
 The envelope's `push` field (§10.4) is from an earlier design, in which the relay pushed when it
 queued a tagged envelope. It is still accepted from a node and carried, and ignored.

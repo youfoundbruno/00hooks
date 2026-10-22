@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 360" width="900" height="360" role="img" aria-labelledby="title desc">
+  <title id="title">What happens to one webhook</title>
+  <desc id="desc">One webhook passes through the relay: verify the signature, screen it (pass, hold or drop), dedupe replays, seal it to each device, append it to the ordered log, stream it over resumable SSE, and the device acknowledges it after recording it.</desc>
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; fill: #1f2328; }
+    .muted { fill: #59636e; font-size: 13px; }
+    .bold { font-weight: 600; }
+    .num { font-weight: 600; fill: #0969da; }
+    .num-green { font-weight: 600; fill: #1a7f37; }
+    .box { fill: rgba(140, 149, 159, 0.08); stroke: #8c959f; stroke-width: 1.5; }
+    .step { fill: rgba(56, 139, 253, 0.10); stroke: #0969da; stroke-width: 1.5; }
+    .dev { fill: rgba(46, 160, 67, 0.10); stroke: #1a7f37; stroke-width: 1.5; }
+    .line { fill: none; stroke: #59636e; stroke-width: 1.75; }
+    .head { fill: #59636e; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .num { fill: #4493f8; }
+      .num-green { fill: #3fb950; }
+      .box { fill: rgba(140, 149, 159, 0.10); stroke: #6e7681; }
+      .step { fill: rgba(56, 139, 253, 0.14); stroke: #4493f8; }
+      .dev { fill: rgba(46, 160, 67, 0.14); stroke: #3fb950; }
+      .line { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="head"/>
+    </marker>
+  </defs>
+
+  <!-- Legend -->
+  <rect x="20" y="16" width="18" height="14" rx="3" class="step"/>
+  <text x="46" y="28" class="muted">on your relay</text>
+  <rect x="160" y="16" width="18" height="14" rx="3" class="dev"/>
+  <text x="186" y="28" class="muted">on your device</text>
+
+  <!-- Row 1 -->
+  <rect x="20" y="50" width="190" height="64" rx="10" class="box"/>
+  <text x="115" y="77" text-anchor="middle" class="bold">Webhook arrives</text>
+  <text x="115" y="98" text-anchor="middle" class="muted">POST /h/&lt;hook&gt;</text>
+
+  <rect x="243" y="50" width="190" height="64" rx="10" class="step"/>
+  <text x="338" y="77" text-anchor="middle"><tspan class="num">1 </tspan><tspan class="bold">Verify signature</tspan></text>
+  <text x="338" y="98" text-anchor="middle" class="muted">over the raw bytes</text>
+
+  <rect x="466" y="50" width="190" height="64" rx="10" class="step"/>
+  <text x="561" y="77" text-anchor="middle"><tspan class="num">2 </tspan><tspan class="bold">Screen</tspan></text>
+  <text x="561" y="98" text-anchor="middle" class="muted">pass · hold · drop</text>
+
+  <rect x="689" y="50" width="190" height="64" rx="10" class="step"/>
+  <text x="784" y="77" text-anchor="middle"><tspan class="num">3 </tspan><tspan class="bold">Dedupe</tspan></text>
+  <text x="784" y="98" text-anchor="middle" class="muted">seen this one before?</text>
+
+  <path d="M210,82 H240" class="line" marker-end="url(#arrow)"/>
+  <path d="M433,82 H463" class="line" marker-end="url(#arrow)"/>
+  <path d="M656,82 H686" class="line" marker-end="url(#arrow)"/>
+
+  <text x="338" y="138" text-anchor="middle" class="muted">forged → 401</text>
+  <text x="561" y="138" text-anchor="middle" class="muted">optional firewall rules</text>
+  <text x="561" y="157" text-anchor="middle" class="muted">hold → kept aside, sealed</text>
+  <text x="561" y="176" text-anchor="middle" class="muted">drop → 200, not kept</text>
+  <text x="784" y="138" text-anchor="middle" class="muted">replay → duplicate,</text>
+  <text x="784" y="157" text-anchor="middle" class="muted">not stored again</text>
+
+  <!-- Turn down -->
+  <path d="M869,114 C869,170 869,170 869,207" class="line" marker-end="url(#arrow)"/>
+
+  <!-- Row 2 (right to left) -->
+  <rect x="689" y="210" width="190" height="64" rx="10" class="step"/>
+  <text x="784" y="237" text-anchor="middle"><tspan class="num">4 </tspan><tspan class="bold">Seal to each device</tspan></text>
+  <text x="784" y="258" text-anchor="middle" class="muted">HPKE, signed by relay</text>
+
+  <rect x="466" y="210" width="190" height="64" rx="10" class="step"/>
+  <text x="561" y="237" text-anchor="middle"><tspan class="num">5 </tspan><tspan class="bold">Ordered log</tspan></text>
+  <text x="561" y="258" text-anchor="middle" class="muted">one per account</text>
+
+  <rect x="243" y="210" width="190" height="64" rx="10" class="step"/>
+  <text x="338" y="237" text-anchor="middle"><tspan class="num">6 </tspan><tspan class="bold">Stream</tspan></text>
+  <text x="338" y="258" text-anchor="middle" class="muted">SSE, resumable</text>
+
+  <rect x="20" y="210" width="190" height="64" rx="10" class="dev"/>
+  <text x="115" y="237" text-anchor="middle"><tspan class="num-green">7 </tspan><tspan class="bold">Ack</tspan></text>
+  <text x="115" y="258" text-anchor="middle" class="muted">after it's recorded</text>
+
+  <path d="M689,242 H659" class="line" marker-end="url(#arrow)"/>
+  <path d="M466,242 H436" class="line" marker-end="url(#arrow)"/>
+  <path d="M243,242 H213" class="line" marker-end="url(#arrow)"/>
+
+  <text x="784" y="298" text-anchor="middle" class="muted">then the plaintext</text>
+  <text x="784" y="317" text-anchor="middle" class="muted">is forgotten</text>
+  <text x="561" y="298" text-anchor="middle" class="muted">only ciphertext stored</text>
+  <text x="338" y="298" text-anchor="middle" class="muted">device offline? the event</text>
+  <text x="338" y="317" text-anchor="middle" class="muted">waits (7 days by default)</text>
+  <text x="115" y="298" text-anchor="middle" class="muted">then deleted on the relay;</text>
+  <text x="115" y="317" text-anchor="middle" class="muted">the device unseals and runs it</text>
+</svg>

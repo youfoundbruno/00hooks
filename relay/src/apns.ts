@@ -74,12 +74,6 @@ export async function apnsConfig(env: Env): Promise<ApnsConfig | null> {
   return { key, keyId, teamId, topic, environment: rawEnv, cacheKey: `${keyId}\n${teamId}\n${pem}` };
 }
 
-/** What `/v1/info` says about push (PROTOCOL §2). */
-export async function pushInfo(env: Env): Promise<{ available: boolean; environment: ApnsEnvironment | null }> {
-  const c = await apnsConfig(env);
-  return { available: c !== null, environment: c?.environment ?? null };
-}
-
 const b64urlJson = (v: unknown) => toBase64Url(utf8(JSON.stringify(v)));
 
 /** Signs a fresh provider token: ES256 over `header.claims` (WebCrypto's raw r‖s is JOSE's form). */

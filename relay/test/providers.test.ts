@@ -29,7 +29,7 @@ function status(fn: () => unknown): number {
 describe("creating hooks for the phase 1 presets", () => {
   it("needs the provider's secret for providers that issue it, and never generates one", async () => {
     const dev = await newAccount();
-    for (const preset of ["stripe", "slack", "linear", "shopify", "twilio"]) {
+    for (const preset of ["stripe", "slack", "linear", "shopify", "twilio", "paddle", "zoom", "pagerduty"]) {
       const res = await signed(dev, "POST", "/v1/hooks", { name: preset, verify: { preset } });
       expect(res.status, preset).toBe(400);
       expect(await res.json()).toMatchObject({ field: "verify.secret" });
@@ -113,6 +113,83 @@ describe("Slack", () => {
     expect(res.headers.get("Content-Type")).toContain("text/plain");
     expect(await res.text()).toBe("3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P");
     expect((await accountObject(dev.accountId).stats()).events).toBe(0);
+  });
+});
+
+describe("Twitch", () => {
+  const secret = "twitch-subscription-secret";
+  async function twitchHeaders(id: string, body: string, type: string, key = secret) {
+    const ts = new Date().toISOString();
+    return {
+      "Twitch-Eventsub-Message-Id": id,
+      "Twitch-Eventsub-Message-Timestamp": ts,
+      "Twitch-Eventsub-Message-Signature": `sha256=${toHex(await hmac("SHA-256", utf8(key), utf8(id + ts + body)))}`,
+      "Twitch-Eventsub-Message-Type": type,
+    };
+  }
+
+  it("answers webhook_callback_verification with the challenge only after the signature verifies, and stores nothing", async () => {
+    const dev = await newAccount();
+    const { hook, secret: generated } = await createHook(dev, { preset: "twitch", secret });
+    expect(generated).toBeUndefined();
+    const body = '{"challenge":"pogchamp-kappa-360noscope-vohiyo","subscription":{"type":"channel.follow","status":"webhook_callback_verification_pending"}}';
+    const forged = await post(hook.id, body, await twitchHeaders("v-1", body, "webhook_callback_verification", "not-the-secret"));
+    expect(forged.status).toBe(401);
+    const res = await post(hook.id, body, await twitchHeaders("v-1", body, "webhook_callback_verification"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
+    expect(await res.text()).toBe("pogchamp-kappa-360noscope-vohiyo");
+    expect((await accountObject(dev.accountId).stats()).events).toBe(0);
+  });
+
+  it("stores notifications and revocations, deduped on the signed message id", async () => {
+    const dev = await newAccount();
+    const { hook } = await createHook(dev, { preset: "twitch", secret });
+    const body = '{"subscription":{"type":"channel.follow","status":"enabled"},"event":{"user_id":"1337"}}';
+    expect((await post(hook.id, body, await twitchHeaders("n-1", body, "notification"))).status).toBe(200);
+    // Twitch's resend: the same message id, signed afresh.
+    expect(await (await post(hook.id, body, await twitchHeaders("n-1", body, "notification"))).json()).toEqual({ duplicate: true });
+    const revoked = '{"subscription":{"type":"channel.follow","status":"authorization_revoked"}}';
+    expect((await post(hook.id, revoked, await twitchHeaders("r-1", revoked, "revocation"))).status).toBe(200);
+
+    const { sse } = await openStream(dev);
+    await sse.nextEvent();
+    const first = data<StreamedEvent>(await sse.nextEvent());
+    expect(first).toMatchObject({ verified: true, preset: "twitch", eventType: "channel.follow" });
+    const second = data<StreamedEvent>(await sse.nextEvent());
+    const opened = await openEvent(dev, second);
+    expect(opened.text).toBe(revoked);
+    expect(opened.headers["twitch-eventsub-message-type"]).toBe("revocation");
+    expect(opened.headers).not.toHaveProperty("twitch-eventsub-message-signature");
+    await sse.cancel();
+    expect((await accountObject(dev.accountId).stats()).events).toBe(2);
+  });
+});
+
+describe("Zoom", () => {
+  it("answers endpoint.url_validation with the token's HMAC, after the signature verifies, and stores nothing", async () => {
+    const dev = await newAccount();
+    const secret = "zoom-app-secret-token";
+    const { hook } = await createHook(dev, { preset: "zoom", secret });
+    const body = '{"payload":{"plainToken":"qgg8vlvZRS6UYooatFL8Aw"},"event_ts":1654503849680,"event":"endpoint.url_validation"}';
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sign = async (key: string) => `v0=${toHex(await hmac("SHA-256", utf8(key), utf8(`v0:${ts}:${body}`)))}`;
+    const forged = await post(hook.id, body, { "x-zm-request-timestamp": ts, "x-zm-signature": await sign("wrong-secret") });
+    expect(forged.status).toBe(401);
+    const res = await post(hook.id, body, { "x-zm-request-timestamp": ts, "x-zm-signature": await sign(secret) });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      plainToken: "qgg8vlvZRS6UYooatFL8Aw",
+      encryptedToken: toHex(await hmac("SHA-256", utf8(secret), utf8("qgg8vlvZRS6UYooatFL8Aw"))),
+    });
+    expect((await accountObject(dev.accountId).stats()).events).toBe(0);
+  });
+
+  it("can't be strict: the check needs the secret at the relay", async () => {
+    const dev = await newAccount();
+    const res = await signed(dev, "POST", "/v1/hooks", { name: "zoom", verify: { preset: "zoom", strict: true } });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ field: "verify.strict" });
   });
 });
 

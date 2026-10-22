@@ -17,14 +17,64 @@ CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hiber
 ```
 
 - `src/index.ts`: routes. `src/auth.ts`: signed requests. `src/keys.ts`: API keys.
-  `src/accounts.ts`: accounts, devices, enrolments, sealing keys. `src/hooks.ts`: the hook API.
+  `src/accounts.ts`: accounts, devices, enrolments, sealing keys. `src/hooks.ts`: the hook API;
+  `src/hook-delivery.ts`: a hook's static response and one-device delivery; `src/test-event.ts`: the
+  signed test event (`POST /v1/test/<hook>`); `src/devices.ts`: renaming a device.
   `src/presets.ts`: the preset table and its interpreter. `src/envelope.ts`: sealing and the relay's
   envelope signature. `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE
   bridge. `src/audit.ts`: the audit log and events list. `src/account-object.ts`: the Durable
   Object. `src/phone.ts`: the phone routes; `src/phone-object.ts`: their Durable Object (mailbox,
-  cursors, sockets); `src/phone-push.ts` and `src/apns.ts`: waking a phone through APNs. `migrations/`: the D1 schema.
+  cursors, sockets); `src/phone-push.ts`, `src/apns.ts` and `src/fcm.ts`: waking a phone through APNs or FCM. `migrations/`: the D1 schema.
 - `scripts/seal-interop.ts` seals events with `src/envelope.ts` under Node, for the CLI's interop
   tests (`fixtures/seal-interop.v1.json`).
+
+## Install on your Cloudflare account
+
+You need a Cloudflare account on the Workers Paid plan, Node 22 or later, and this repository with
+its dependencies (`pnpm install` at the root). Then, from the repository root:
+
+```sh
+pnpm --filter ./relay exec wrangler login    # once: your own Cloudflare login
+node relay/scripts/setup.mjs --dry-run       # optional: every step it would take, nothing run
+pnpm --filter ./relay setup                  # or: node relay/scripts/setup.mjs
+```
+
+Setup uses your `wrangler login` and, step by step:
+
+1. writes `relay/wrangler.deploy.jsonc` (gitignored) from `wrangler.jsonc`, with Rate Limiting
+   `namespace_id`s derived from a random base it keeps there. Those ids must not be used by any
+   other Worker's rate limiter in your Cloudflare account (they would share counters): choose the
+   base yourself with `--ratelimit-base <n>` if you need to;
+2. creates the D1 database `00hooks` (or reuses yours) and puts its id in that file;
+3. applies the D1 migrations;
+4. generates `SECRETS_KEY`, `HASH_PEPPER`, `RELAY_SIGNING_KEY` and `SIGNUP_TOKEN` on your computer
+   (node:crypto) and pipes each to `wrangler secret put` on stdin: none is written to a file,
+   passed as an argument or printed, except the signup token, shown once at the end because you
+   need it to pair. It sets them before the first deploy (wrangler holds them in an empty draft
+   Worker), so the relay never runs without them;
+5. asks, each optional, for the push keys: the APNs `.p8` file (a path; it is read and checked, never
+   shown), its key id, your team id (both typed hidden), the app's bundle id and the environment,
+   and the Firebase service account JSON file for Android. "skip" leaves that push off. Without a
+   terminal it won't ask: pass `--skip-push`, `--from-env` or `--from-file <json>` (`--help` lists
+   the names);
+6. deploys, then checks `GET /v1/info`: protocol 2, a relay key, signups needing the token, push.
+
+It ends with the relay's address and how to pair: `00hooks login --relay <url>` with the signup
+token in `HOOKS_SIGNUP_TOKEN` (it prints the exact lines), or, in 00next, Settings › Automations
+with the same address and token.
+
+Run it again any time: each step checks whether it is done (database, migrations, config, secrets),
+so a run that stopped continues, and an upgrade carries what's new in `wrangler.jsonc` (bindings,
+migrations, rate limits, the cron) into your deploy config, keeping your ids and edits. Secrets
+already set are kept; `--rotate <NAME>` replaces one after you type its name back, with what it
+breaks: `RELAY_SIGNING_KEY` makes every device log in again, `SECRETS_KEY` makes every stored hook
+secret unreadable, `HASH_PEPPER` invalidates API keys, Meta verify tokens and replay marks.
+`--rotate SIGNUP_TOKEN` is harmless to existing accounts. `--check-only` checks a deployed relay
+("relay status"). Settings that aren't secrets go in `wrangler.deploy.jsonc`'s `vars` (edit it, or
+`--var RETENTION_DAYS=3`; see "Settings"). The manual steps it automates are under "Self-hosting".
+
+There is no "Deploy to Cloudflare" button: it would build from a copy of `wrangler.jsonc` with
+shared Rate Limiting ids, and would take the secrets in a web form instead of generating them here.
 
 ## Develop
 
@@ -52,6 +102,8 @@ You need a Cloudflare account on the Workers Paid plan (Durable Objects with SQL
 Rate Limiting binding) and `wrangler` (a dev dependency of `relay/`: run it with
 `pnpm --filter ./relay exec wrangler …`, or from `relay/` with `pnpm exec wrangler …`).
 
+`pnpm --filter ./relay setup` (above) does all of this; these are the steps by hand, for reference.
+
 The tracked `wrangler.jsonc` holds placeholder ids for development and tests. Don't edit it for a
 deployment. Keep your account's ids in a copy that git ignores:
 
@@ -76,6 +128,7 @@ deployment. Keep your account's ids in a copy that git ignores:
    | `APNS_TEAM_ID` | Your Apple developer team's 10-character id | `wrangler secret put APNS_TEAM_ID -c wrangler.deploy.jsonc` |
    | `APNS_TOPIC` | The phone app's bundle id | `wrangler secret put APNS_TOPIC -c wrangler.deploy.jsonc` |
    | `APNS_ENVIRONMENT` | `sandbox` for development builds of the app, `production` (the default when unset) for TestFlight and the App Store | `wrangler secret put APNS_ENVIRONMENT -c wrangler.deploy.jsonc` |
+   | `FCM_SERVICE_ACCOUNT` | Optional, for Android push (below): the whole JSON key file of a service account of your Firebase project (Project settings → Service accounts → Generate new private key) | `wrangler secret put FCM_SERVICE_ACCOUNT -c wrangler.deploy.jsonc < service-account.json` |
 
    With `npx`: `npx wrangler secret put APNS_KEY -c wrangler.deploy.jsonc < AuthKey_XXXXXXXXXX.p8`,
    and so on for each name.
@@ -102,6 +155,7 @@ wrangler.deploy.jsonc`), and only then deploy: new code may need the new tables.
 | `0006_…` | hook names unique within an account |
 | `0007_…` (when present) | phone hardening |
 | `0008_plans.sql` | plans and entitlements: the account's plan, its end, its workspace and override; hook pauses and `onLimit`; hook creations per day. Existing rows stay on the `default` plan |
+| `0009_hook_delivery.sql` | a hook's one-device delivery (`deliverTo`) and static response |
 
 Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
 
@@ -188,14 +242,19 @@ creations, which are counted in the D1 insert itself.
 
 ### Push
 
-Push is off until the APNs secrets above are set: every `POST /v1/phone/push` answers
-`{ "sent": false, "reason": "unavailable" }` and nothing goes to Apple. Once `APNS_KEY`, `APNS_KEY_ID`,
-`APNS_TEAM_ID` and `APNS_TOPIC` are set and the key imports, `/v1/info` says
-`"push": { "available": true, "environment": … }` under `phone`. The node keeps each phone's device
-token and sends it with each request; the relay keeps no token, sends a fixed alert per kind, and
-limits each phone to one push per kind a minute and 30 an hour (PROTOCOL §10.7). The requests to
-Apple were checked against a mock in the tests, not against Apple's service: try one push on a
-sandbox build before relying on it.
+Push is off until its secrets above are set: every `POST /v1/phone/push` answers
+`{ "sent": false, "reason": "unavailable" }` and nothing goes to Apple or Google. iPhones (requests
+with no `platform`, or `"ios"`) need `APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID` and `APNS_TOPIC`, with
+a key that imports; Android phones (`"platform": "android"`) need `FCM_SERVICE_ACCOUNT`. Either can
+be set without the other. `/v1/info` says which under `phone.push.platforms`
+(`{ "ios": { "available", "environment" }, "android": { "available" } }`), and keeps
+`phone.push.available` and `environment` for iOS. The node keeps each phone's device token and
+sends it with each request; the relay keeps no token, sends a fixed alert per kind, and limits each
+phone to one push per kind a minute and 30 an hour, whichever platform (PROTOCOL §10.7). The
+service account is used only to get a token for sending messages
+(`https://www.googleapis.com/auth/firebase.messaging`). The requests to Apple and Google were checked
+against mocks in the tests, not against the real services: try one push on a development build
+before relying on it.
 
 ## Security notes
 
@@ -254,7 +313,7 @@ sandbox build before relying on it.
   and never opens them; it keeps a pairing only as a verifier of its proof (spent once, atomically),
   checks only routing (`from` is the signed-in device, `to` its peer), sizes, rates and queues, and
   stores envelopes as received until acknowledged. A phone may use only the phone routes. Push
-  (PROTOCOL §10.7) sends only fixed alert texts and the node's sealed preview; the device token is
-  never stored or logged.
+  (PROTOCOL §10.7) sends only fixed alert texts and the node's sealed preview, to Apple or Google
+  hosts that aren't configurable; the device token is never stored or logged.
 - **Errors** are fixed sentences: they never quote a secret, a signature or payload content.
 - **Webhook content is data**: the relay never acts on it.

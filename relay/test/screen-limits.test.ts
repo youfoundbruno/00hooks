@@ -207,6 +207,7 @@ describe("the compiled screen", () => {
     contentType: "application/json",
     strict: false,
     key: await importScreenKey(new Uint8Array(32)),
+    at: 0,
     ...init,
   });
 

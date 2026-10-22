@@ -191,7 +191,16 @@ async fn a_strict_hook_keeps_its_secret_here_and_never_sends_it() {
 async fn provider_presets_need_their_secret_and_ed25519_its_public_key() {
     let relay = MockRelay::start().await;
     let home = logged_in(&relay, "p1-presets").await;
-    for preset in ["stripe", "slack", "linear", "shopify", "twilio"] {
+    for preset in [
+        "stripe",
+        "slack",
+        "linear",
+        "shopify",
+        "twilio",
+        "paddle",
+        "zoom",
+        "pagerduty",
+    ] {
         let out = run(
             &home.0,
             &["hooks", "create", "--name", preset, "--preset", preset],

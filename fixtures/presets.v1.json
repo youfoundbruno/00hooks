@@ -503,6 +503,375 @@
       "bodySha256": "70dffdff2bea61b27a76e0061c6c607942ac573b2b0275bdf250b3f2f61a4230"
     },
     {
+      "name": "calendly: t= and v1, within 3 minutes",
+      "source": "computed (Calendly's documented scheme)",
+      "verify": {
+        "preset": "calendly"
+      },
+      "secrets": [
+        "5mEzn9C-00hooks-vector-signing-key"
+      ],
+      "now": 1792233770000,
+      "headers": {
+        "calendly-webhook-signature": "t=1792233600,v1=38e1ee69352fac0f13edce01e95795d34411c8f3cdadad72a3ba47a1da6c9bc7"
+      },
+      "body": "{\"created_at\":\"2026-10-17T00:00:00.000000Z\",\"created_by\":\"https://api.calendly.com/users/AAAA\",\"event\":\"invitee.created\",\"payload\":{\"uri\":\"https://api.calendly.com/scheduled_events/BBBB/invitees/CCCC\"}}",
+      "expect": {
+        "ok": true,
+        "eventType": "invitee.created"
+      },
+      "bodySha256": "b2402735614737cfada954e0946b2bd214141fe87bad52a4e7fad2256ae6f8f1"
+    },
+    {
+      "name": "calendly: outside 180 s",
+      "source": "computed, late",
+      "verify": {
+        "preset": "calendly"
+      },
+      "secrets": [
+        "5mEzn9C-00hooks-vector-signing-key"
+      ],
+      "now": 1792233781000,
+      "headers": {
+        "calendly-webhook-signature": "t=1792233600,v1=38e1ee69352fac0f13edce01e95795d34411c8f3cdadad72a3ba47a1da6c9bc7"
+      },
+      "body": "{\"created_at\":\"2026-10-17T00:00:00.000000Z\",\"created_by\":\"https://api.calendly.com/users/AAAA\",\"event\":\"invitee.created\",\"payload\":{\"uri\":\"https://api.calendly.com/scheduled_events/BBBB/invitees/CCCC\"}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "b2402735614737cfada954e0946b2bd214141fe87bad52a4e7fad2256ae6f8f1"
+    },
+    {
+      "name": "calendly: a new t= with the old signature",
+      "source": "computed, tampered",
+      "verify": {
+        "preset": "calendly"
+      },
+      "secrets": [
+        "5mEzn9C-00hooks-vector-signing-key"
+      ],
+      "now": 1792233601000,
+      "headers": {
+        "calendly-webhook-signature": "t=1792233601,v1=38e1ee69352fac0f13edce01e95795d34411c8f3cdadad72a3ba47a1da6c9bc7"
+      },
+      "body": "{\"created_at\":\"2026-10-17T00:00:00.000000Z\",\"created_by\":\"https://api.calendly.com/users/AAAA\",\"event\":\"invitee.created\",\"payload\":{\"uri\":\"https://api.calendly.com/scheduled_events/BBBB/invitees/CCCC\"}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "b2402735614737cfada954e0946b2bd214141fe87bad52a4e7fad2256ae6f8f1"
+    },
+    {
+      "name": "typeform: sha256= and the base64 HMAC of the body",
+      "source": "computed (Typeform's documented scheme)",
+      "verify": {
+        "preset": "typeform"
+      },
+      "secrets": [
+        "typeform-00hooks-vector-secret"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "typeform-signature": "sha256=aU3dFqq+tx0EzptAvLNkBawgB13ONQjfURu/22eMIug="
+      },
+      "body": "{\"event_id\":\"01HXYZ00HOOKSVECTOR0000000\",\"event_type\":\"form_response\",\"form_response\":{\"form_id\":\"lT4Z3j\",\"answers\":[]}}",
+      "expect": {
+        "ok": true,
+        "eventType": "form_response"
+      },
+      "bodySha256": "ceae5f701ef12a426279ac8b39a8cd973c098f0178ba6b3b4faf75198c8ca288"
+    },
+    {
+      "name": "typeform: the hex form of the right HMAC is refused",
+      "source": "computed, wrong encoding",
+      "verify": {
+        "preset": "typeform"
+      },
+      "secrets": [
+        "typeform-00hooks-vector-secret"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "typeform-signature": "sha256=694ddd16aabeb71d04ce9b40bcb36405ac20075dce3508df511bbfdb678c22e8"
+      },
+      "body": "{\"event_id\":\"01HXYZ00HOOKSVECTOR0000000\",\"event_type\":\"form_response\",\"form_response\":{\"form_id\":\"lT4Z3j\",\"answers\":[]}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "ceae5f701ef12a426279ac8b39a8cd973c098f0178ba6b3b4faf75198c8ca288"
+    },
+    {
+      "name": "paddle: ts= and two h1 (the second is the right one, as during a rotation), 5 s late",
+      "source": "computed (Paddle's documented scheme)",
+      "verify": {
+        "preset": "paddle"
+      },
+      "secrets": [
+        "pdl_ntfset_01gkpjp8bkm3tm53kdgkx6sms7_00hooksVectorSecretKey00"
+      ],
+      "now": 1792233605000,
+      "headers": {
+        "paddle-signature": "ts=1792233600;h1=0000000000000000000000000000000000000000000000000000000000000000;h1=e9baeb838bbd6b23c930aee4a28639c3e5850e83e0774e4a71876e3eb748b2dd"
+      },
+      "body": "{\"event_id\":\"evt_01h8bzakzx3hm2fmen703n5q45\",\"event_type\":\"transaction.completed\",\"occurred_at\":\"2026-10-17T00:00:00.000000Z\",\"notification_id\":\"ntf_01h8bzam1z32agrxjwhjgqk8w6\",\"data\":{\"id\":\"txn_01h8bz\"}}",
+      "expect": {
+        "ok": true,
+        "eventType": "transaction.completed"
+      },
+      "bodySha256": "35593a8206f3b385bf02b68670c7b726264e782bb6b0afcfb468a44147de2fe1"
+    },
+    {
+      "name": "paddle: 6 s late",
+      "source": "computed, late",
+      "verify": {
+        "preset": "paddle"
+      },
+      "secrets": [
+        "pdl_ntfset_01gkpjp8bkm3tm53kdgkx6sms7_00hooksVectorSecretKey00"
+      ],
+      "now": 1792233606000,
+      "headers": {
+        "paddle-signature": "ts=1792233600;h1=e9baeb838bbd6b23c930aee4a28639c3e5850e83e0774e4a71876e3eb748b2dd"
+      },
+      "body": "{\"event_id\":\"evt_01h8bzakzx3hm2fmen703n5q45\",\"event_type\":\"transaction.completed\",\"occurred_at\":\"2026-10-17T00:00:00.000000Z\",\"notification_id\":\"ntf_01h8bzam1z32agrxjwhjgqk8w6\",\"data\":{\"id\":\"txn_01h8bz\"}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "35593a8206f3b385bf02b68670c7b726264e782bb6b0afcfb468a44147de2fe1"
+    },
+    {
+      "name": "paddle: Stripe's comma instead of Paddle's semicolon",
+      "source": "computed, malformed",
+      "verify": {
+        "preset": "paddle"
+      },
+      "secrets": [
+        "pdl_ntfset_01gkpjp8bkm3tm53kdgkx6sms7_00hooksVectorSecretKey00"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "paddle-signature": "ts=1792233600,h1=e9baeb838bbd6b23c930aee4a28639c3e5850e83e0774e4a71876e3eb748b2dd"
+      },
+      "body": "{\"event_id\":\"evt_01h8bzakzx3hm2fmen703n5q45\",\"event_type\":\"transaction.completed\",\"occurred_at\":\"2026-10-17T00:00:00.000000Z\",\"notification_id\":\"ntf_01h8bzam1z32agrxjwhjgqk8w6\",\"data\":{\"id\":\"txn_01h8bz\"}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "35593a8206f3b385bf02b68670c7b726264e782bb6b0afcfb468a44147de2fe1"
+    },
+    {
+      "name": "twitch: a notification, 9 minutes later",
+      "source": "computed (Twitch's documented scheme)",
+      "verify": {
+        "preset": "twitch"
+      },
+      "secrets": [
+        "twitch-00hooks-vector-secret"
+      ],
+      "now": 1792234140000,
+      "headers": {
+        "twitch-eventsub-message-id": "e76c6bd4-55c9-4987-8304-da1588d8988b",
+        "twitch-eventsub-message-timestamp": "2026-10-17T10:40:00.634234626Z",
+        "twitch-eventsub-message-signature": "sha256=c752ab3ca994d104f8467b67d784d6318a75d0391aa6f017396ecf99e48b0225",
+        "twitch-eventsub-message-type": "notification"
+      },
+      "body": "{\"subscription\":{\"id\":\"f1c2a387-161a-49f9-a165-0f21d7a4e1c4\",\"status\":\"enabled\",\"type\":\"channel.follow\",\"version\":\"2\",\"condition\":{\"broadcaster_user_id\":\"12826\"}},\"event\":{\"user_id\":\"1337\",\"broadcaster_user_id\":\"12826\"}}",
+      "expect": {
+        "ok": true,
+        "eventType": "channel.follow"
+      },
+      "bodySha256": "f6f95f54842205920173f8b199a8cb344680113921642d4849e0563c1529eed4"
+    },
+    {
+      "name": "twitch: more than 10 minutes old",
+      "source": "computed, late",
+      "verify": {
+        "preset": "twitch"
+      },
+      "secrets": [
+        "twitch-00hooks-vector-secret"
+      ],
+      "now": 1792234200635,
+      "headers": {
+        "twitch-eventsub-message-id": "e76c6bd4-55c9-4987-8304-da1588d8988b",
+        "twitch-eventsub-message-timestamp": "2026-10-17T10:40:00.634234626Z",
+        "twitch-eventsub-message-signature": "sha256=c752ab3ca994d104f8467b67d784d6318a75d0391aa6f017396ecf99e48b0225",
+        "twitch-eventsub-message-type": "notification"
+      },
+      "body": "{\"subscription\":{\"id\":\"f1c2a387-161a-49f9-a165-0f21d7a4e1c4\",\"status\":\"enabled\",\"type\":\"channel.follow\",\"version\":\"2\",\"condition\":{\"broadcaster_user_id\":\"12826\"}},\"event\":{\"user_id\":\"1337\",\"broadcaster_user_id\":\"12826\"}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "f6f95f54842205920173f8b199a8cb344680113921642d4849e0563c1529eed4"
+    },
+    {
+      "name": "twitch: another message id",
+      "source": "computed, tampered",
+      "verify": {
+        "preset": "twitch"
+      },
+      "secrets": [
+        "twitch-00hooks-vector-secret"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "twitch-eventsub-message-id": "another",
+        "twitch-eventsub-message-timestamp": "2026-10-17T10:40:00.634234626Z",
+        "twitch-eventsub-message-signature": "sha256=c752ab3ca994d104f8467b67d784d6318a75d0391aa6f017396ecf99e48b0225",
+        "twitch-eventsub-message-type": "notification"
+      },
+      "body": "{\"subscription\":{\"id\":\"f1c2a387-161a-49f9-a165-0f21d7a4e1c4\",\"status\":\"enabled\",\"type\":\"channel.follow\",\"version\":\"2\",\"condition\":{\"broadcaster_user_id\":\"12826\"}},\"event\":{\"user_id\":\"1337\",\"broadcaster_user_id\":\"12826\"}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "f6f95f54842205920173f8b199a8cb344680113921642d4849e0563c1529eed4"
+    },
+    {
+      "name": "twitch: a timestamp with an offset",
+      "source": "computed (RFC 3339)",
+      "verify": {
+        "preset": "twitch"
+      },
+      "secrets": [
+        "twitch-00hooks-vector-secret"
+      ],
+      "now": 1792233660000,
+      "headers": {
+        "twitch-eventsub-message-id": "e76c6bd4-55c9-4987-8304-da1588d8988b",
+        "twitch-eventsub-message-timestamp": "2026-10-17T12:40:00+02:00",
+        "twitch-eventsub-message-signature": "sha256=1bb9d3aaa88bed9c209cbe00218fdfc1204ad6eae1bc0ba0afbbe944a613368f",
+        "twitch-eventsub-message-type": "notification"
+      },
+      "body": "{\"subscription\":{\"id\":\"f1c2a387-161a-49f9-a165-0f21d7a4e1c4\",\"status\":\"enabled\",\"type\":\"channel.follow\",\"version\":\"2\",\"condition\":{\"broadcaster_user_id\":\"12826\"}},\"event\":{\"user_id\":\"1337\",\"broadcaster_user_id\":\"12826\"}}",
+      "expect": {
+        "ok": true,
+        "eventType": "channel.follow"
+      },
+      "bodySha256": "f6f95f54842205920173f8b199a8cb344680113921642d4849e0563c1529eed4"
+    },
+    {
+      "name": "twitch: a signed but impossible date",
+      "source": "computed, malformed",
+      "verify": {
+        "preset": "twitch"
+      },
+      "secrets": [
+        "twitch-00hooks-vector-secret"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "twitch-eventsub-message-id": "e76c6bd4-55c9-4987-8304-da1588d8988b",
+        "twitch-eventsub-message-timestamp": "2026-02-30T00:00:00Z",
+        "twitch-eventsub-message-signature": "sha256=e093473a9b624cd8ed41b931135b6cdea36c0ca98090ddf31c2451feb6f98d00",
+        "twitch-eventsub-message-type": "notification"
+      },
+      "body": "{\"subscription\":{\"id\":\"f1c2a387-161a-49f9-a165-0f21d7a4e1c4\",\"status\":\"enabled\",\"type\":\"channel.follow\",\"version\":\"2\",\"condition\":{\"broadcaster_user_id\":\"12826\"}},\"event\":{\"user_id\":\"1337\",\"broadcaster_user_id\":\"12826\"}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "f6f95f54842205920173f8b199a8cb344680113921642d4849e0563c1529eed4"
+    },
+    {
+      "name": "zoom: a meeting event, a day after its timestamp",
+      "source": "computed (Zoom's documented scheme)",
+      "verify": {
+        "preset": "zoom"
+      },
+      "secrets": [
+        "zoom-00hooks-vector-secret-token"
+      ],
+      "now": 1792320000000,
+      "headers": {
+        "x-zm-request-timestamp": "1792233600",
+        "x-zm-signature": "v0=47ec47576daa5586f198ac741d94280d0fe2a69d4d20d4024ddd028ec8b69ee8"
+      },
+      "body": "{\"event\":\"meeting.started\",\"event_ts\":1792233600000,\"payload\":{\"account_id\":\"AAAA\",\"object\":{\"id\":\"1234567890\"}}}",
+      "expect": {
+        "ok": true,
+        "eventType": "meeting.started"
+      },
+      "bodySha256": "731916342b28e83f822521d59907ca039062612f88f9fdb18e96b5c601c864eb"
+    },
+    {
+      "name": "zoom: another timestamp with the same signature",
+      "source": "computed, tampered",
+      "verify": {
+        "preset": "zoom"
+      },
+      "secrets": [
+        "zoom-00hooks-vector-secret-token"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "x-zm-request-timestamp": "1792233601",
+        "x-zm-signature": "v0=47ec47576daa5586f198ac741d94280d0fe2a69d4d20d4024ddd028ec8b69ee8"
+      },
+      "body": "{\"event\":\"meeting.started\",\"event_ts\":1792233600000,\"payload\":{\"account_id\":\"AAAA\",\"object\":{\"id\":\"1234567890\"}}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "731916342b28e83f822521d59907ca039062612f88f9fdb18e96b5c601c864eb"
+    },
+    {
+      "name": "zoom: the endpoint check verifies like any delivery",
+      "source": "computed (Zoom's documented validation body)",
+      "verify": {
+        "preset": "zoom"
+      },
+      "secrets": [
+        "zoom-00hooks-vector-secret-token"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "x-zm-request-timestamp": "1792233600",
+        "x-zm-signature": "v0=c4f62c866890a7395f8be7258082f5aff82b5d338356d14be760f782b6565e91"
+      },
+      "body": "{\"payload\":{\"plainToken\":\"qgg8vlvZRS6UYooatFL8Aw\"},\"event_ts\":1654503849680,\"event\":\"endpoint.url_validation\"}",
+      "expect": {
+        "ok": true,
+        "eventType": "endpoint.url_validation"
+      },
+      "bodySha256": "4896a881323fa96488e5f3d51bc9c2dd83c1ebe9d3730a2da65ec00b37d7b2ce"
+    },
+    {
+      "name": "pagerduty: two v1 (the second is the right one, as during a rotation)",
+      "source": "computed (PagerDuty's documented scheme)",
+      "verify": {
+        "preset": "pagerduty"
+      },
+      "secrets": [
+        "pagerduty-00hooks-vector-secret"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "x-pagerduty-signature": "v1=f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0,v1=9af150d21d26f6f092ae4079cafe335a51efda50010566ba74807407a673a22e",
+        "x-webhook-id": "d1"
+      },
+      "body": "{\"event\":{\"id\":\"5ac64822-4adc-4fda-ade0-410becf0de4f\",\"event_type\":\"incident.priority_updated\",\"resource_type\":\"incident\",\"occurred_at\":\"2020-10-02T18:45:22.169Z\",\"data\":{\"id\":\"PGR0VU2\"}}}",
+      "expect": {
+        "ok": true,
+        "eventType": "incident.priority_updated"
+      },
+      "bodySha256": "0ce050ee642a5bf99822dce1235feebfc155525ba613fc56bbccdf3c73f87ef4"
+    },
+    {
+      "name": "pagerduty: one changed byte",
+      "source": "computed, tampered",
+      "verify": {
+        "preset": "pagerduty"
+      },
+      "secrets": [
+        "pagerduty-00hooks-vector-secret"
+      ],
+      "now": 1792233600000,
+      "headers": {
+        "x-pagerduty-signature": "v1=9af150d21d26f6f092ae4079cafe335a51efda50010566ba74807407a673a22e"
+      },
+      "body": "{\"event\":{\"id\":\"5ac64822-4adc-4fda-ade0-410becf0de4f\",\"event_type\":\"incident.priority_updated\",\"resource_type\":\"incident\",\"occurred_at\":\"2020-10-02T18:45:22.169Z\",\"data\":{\"id\":\"PGR0VU3\"}}}",
+      "expect": {
+        "ok": false
+      },
+      "bodySha256": "97d9979576aa573780a84e3c87dc44196ac0a2fa072afbc4b0c65bd1819d8cfe"
+    },
+    {
       "name": "hmac: sha256 hex with a prefix (RFC 4231 case 2)",
       "source": "published (RFC 4231)",
       "verify": {

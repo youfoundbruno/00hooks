@@ -1,11 +1,12 @@
 // `POST /v1/phone/push` (PROTOCOL §10.7): a node asks the relay to wake one of its phones through
-// APNs. The node keeps the phone's device token (the phone sends it sealed to its node) and decides
+// APNs (iOS) or FCM (Android). The node keeps the phone's device token (the phone sends it sealed to its node) and decides
 // what to push; the relay checks the phone is the node's, applies its limits, and sends a fixed,
 // opaque alert. It stores no token, and nothing from the request but the kind, the ref and the
 // sealed preview reaches the payload. Kept out of index.ts: the main module may export only
 // handlers and Durable Object classes.
 
-import { apnsConfig, providerToken, sendToApns, type ApnsConfig, type ApnsResult } from "./apns.ts";
+import { apnsConfig, providerToken, sendToApns, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from "./apns.ts";
+import { accessToken, fcmConfig, sendToFcm, type FcmConfig, type FcmResult } from "./fcm.ts";
 import { phoneStub, type Caller } from "./auth.ts";
 import { isId } from "./encoding.ts";
 import { HttpError, error, invalid, json, parseJsonObject } from "./http.ts";
@@ -14,7 +15,7 @@ import { isStandardBase64 } from "./phone-object.ts";
 export const PUSH_KINDS = ["approval", "ask", "finished", "handoff", "reconnect", "task", "done", "drive"] as const;
 export type PushKind = (typeof PUSH_KINDS)[number];
 
-/** The alert for each kind: fixed texts, so nothing the node or an agent wrote is shown by Apple. */
+/** The alert for each kind: fixed texts, so nothing the node or an agent wrote is shown by Apple or Google. */
 export const PUSH_TEXTS: Record<PushKind, { title: string; body: string; category: string }> = {
   approval: { title: "An agent needs you", body: "Approval needed.", category: "APPROVAL" },
   ask: { title: "An agent needs you", body: "It asked you something.", category: "ASK" },
@@ -36,8 +37,13 @@ export interface PushPreview {
   sig: string;
 }
 
+export const PUSH_PLATFORMS = ["ios", "android"] as const;
+export type PushPlatform = (typeof PUSH_PLATFORMS)[number];
+
 export interface PushRequest {
   device: string;
+  /** Which service wakes the phone: `ios` (APNs, the default) or `android` (FCM). */
+  platform: PushPlatform;
   token: string;
   environment?: "sandbox" | "production";
   kind: PushKind;
@@ -45,7 +51,7 @@ export interface PushRequest {
   preview?: PushPreview;
 }
 
-const FIELDS = new Set(["device", "token", "environment", "kind", "ref", "preview"]);
+const FIELDS = new Set(["device", "platform", "token", "environment", "kind", "ref", "preview"]);
 const PREVIEW_FIELDS = new Set(["at", "enc", "ct", "sig"]);
 
 const bad = (field: string, message: string) => new HttpError(invalid(field, message));
@@ -55,24 +61,32 @@ export function parsePushRequest(body: Uint8Array): PushRequest {
   const input = parseJsonObject(body);
   for (const k of Object.keys(input)) {
     // The unknown field is named only when it is a plain word: nothing else from the body is echoed.
-    if (!FIELDS.has(k)) throw bad(/^[A-Za-z0-9_-]{1,40}$/.test(k) ? k : "body", "A push request has only device, token, environment, kind, ref and preview.");
+    if (!FIELDS.has(k)) throw bad(/^[A-Za-z0-9_-]{1,40}$/.test(k) ? k : "body", "A push request has only device, platform, token, environment, kind, ref and preview.");
   }
   if (!isId("dev", input.device)) throw bad("device", "device must be a phone's device id.");
+  // Absent is iOS: every node written before Android keeps working unchanged.
+  const platform = input.platform === undefined ? "ios" : input.platform;
+  if (platform !== "ios" && platform !== "android") throw bad("platform", "platform must be ios or android.");
   const token = input.token;
-  if (typeof token !== "string" || token.length < 32 || token.length > 400 || token.length % 2 !== 0 || !/^[0-9a-f]+$/.test(token)) {
-    throw bad("token", "token must be the APNs device token in lowercase hex (32 to 400 characters, an even number).");
+  if (platform === "ios") {
+    if (typeof token !== "string" || token.length < 32 || token.length > 400 || token.length % 2 !== 0 || !/^[0-9a-f]+$/.test(token)) {
+      throw bad("token", "token must be the APNs device token in lowercase hex (32 to 400 characters, an even number).");
+    }
+  } else if (typeof token !== "string" || !/^[A-Za-z0-9_:-]{32,1024}$/.test(token)) {
+    throw bad("token", "token must be the FCM registration token (32 to 1024 letters, digits, -, _ or :).");
   }
   const environment = input.environment;
   if (environment !== undefined && environment !== "sandbox" && environment !== "production") {
     throw bad("environment", "environment must be sandbox or production.");
   }
+  if (environment !== undefined && platform === "android") throw bad("environment", "environment is for iOS only.");
   const kind = input.kind;
   if (typeof kind !== "string" || !(PUSH_KINDS as readonly string[]).includes(kind)) {
     throw bad("kind", `kind must be one of ${PUSH_KINDS.join(", ")}.`);
   }
   const ref = input.ref;
   if (typeof ref !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(ref)) throw bad("ref", "ref must be 22 characters of unpadded base64url.");
-  const out: PushRequest = { device: input.device, token, kind: kind as PushKind, ref };
+  const out: PushRequest = { device: input.device, platform, token, kind: kind as PushKind, ref };
   if (environment !== undefined) out.environment = environment;
   if (input.preview !== undefined) out.preview = previewField(input.preview);
   return out;
@@ -107,6 +121,38 @@ export function pushPayload(kind: PushKind, ref: string, preview?: PushPreview):
   });
 }
 
+/** The time FCM keeps an undelivered message, as APNs' `apns-expiration` does: a day. */
+export const FCM_TTL = "86400s";
+
+/**
+ * The FCM v1 message, built here only. The same fixed texts as APNs; `data.zn` carries what APNs
+ * carries in `zn` (the kind, the ref and the preview as given), as JSON text because FCM's data
+ * values are strings. The token is the only thing from the request outside `zn`.
+ */
+export function fcmPayload(token: string, kind: PushKind, ref: string, preview?: PushPreview): string {
+  const t = PUSH_TEXTS[kind];
+  const zn = { v: 1, kind, ref, ...(preview ? { p: { at: preview.at, enc: preview.enc, ct: preview.ct, sig: preview.sig } } : {}) };
+  return JSON.stringify({
+    message: {
+      token,
+      notification: { title: t.title, body: t.body },
+      data: { zn: JSON.stringify(zn) },
+      android: { priority: "high", ttl: FCM_TTL, collapse_key: kind, notification: { tag: kind } },
+    },
+  });
+}
+
+/** What `/v1/info` says about push (PROTOCOL §2). `available` and `environment` are iOS's, for older clients. */
+export async function pushInfo(env: Env): Promise<{
+  available: boolean;
+  environment: ApnsEnvironment | null;
+  platforms: { ios: { available: boolean; environment: ApnsEnvironment | null }; android: { available: boolean } };
+}> {
+  const [apns, fcm] = await Promise.all([apnsConfig(env), fcmConfig(env)]);
+  const ios = { available: apns !== null, environment: apns?.environment ?? null };
+  return { ...ios, platforms: { ios, android: { available: fcm !== null } } };
+}
+
 /** What the PhoneObject decided about a push before anything is sent. */
 export type PushAdmission =
   | { ok: true }
@@ -117,13 +163,14 @@ export type PushAdmission =
 /** `POST /v1/phone/push` (a node device). */
 export async function pushToPhone(env: Env, caller: Caller, body: Uint8Array): Promise<Response> {
   const req = parsePushRequest(body);
-  const config = await apnsConfig(env);
+  const apns = req.platform === "ios" ? await apnsConfig(env) : null;
+  const fcm = req.platform === "android" ? await fcmConfig(env) : null;
   const admission = await phoneStub(env, caller.accountId).admitPush({
     node: caller.deviceId,
     phone: req.device,
     kind: req.kind,
-    available: config !== null,
-    relayEnvironment: config?.environment ?? null,
+    available: apns !== null || fcm !== null,
+    relayEnvironment: apns?.environment ?? null,
     requestedEnvironment: req.environment ?? null,
   });
   if (!admission.ok) {
@@ -139,11 +186,11 @@ export async function pushToPhone(env: Env, caller: Caller, body: Uint8Array): P
     }
     return json({ sent: false, reason: admission.reason });
   }
-  // Admitted, so available: counted against the phone's limits from here, whatever APNs answers.
-  return send(config!, req);
+  // Admitted, so available: counted against the phone's limits from here, whatever the service answers.
+  return fcm ? sendAndroid(fcm, req) : send(apns!, req);
 }
 
-/** What a `429` from APNs is passed on with. */
+/** What a `429` from APNs or FCM is passed on with. */
 export const APNS_RETRY_AFTER_S = 60;
 
 async function send(config: ApnsConfig, req: PushRequest): Promise<Response> {
@@ -177,5 +224,45 @@ async function send(config: ApnsConfig, req: PushRequest): Promise<Response> {
     case "failed":
       console.error("phone push failed", req.kind, result.status, result.reason ?? "-", payload.length);
       return error(502, "push_failed", "Apple's push service didn't accept the push.");
+  }
+}
+
+async function sendAndroid(config: FcmConfig, req: PushRequest): Promise<Response> {
+  const fcmReq = { token: req.token, payload: fcmPayload(req.token, req.kind, req.ref, req.preview) };
+  let result: FcmResult | null = null;
+  let bearer = await accessToken(config, Date.now());
+  if (bearer !== null) {
+    result = await sendToFcm(config, bearer, fcmReq);
+    if (result.kind === "access_token") {
+      // FCM refused the access token: fetch a fresh one and try once more.
+      bearer = await accessToken(config, Date.now(), true);
+      if (bearer !== null) result = await sendToFcm(config, bearer, fcmReq);
+    }
+  }
+  // Logs carry the kind, statuses and the error word only: never the token or the message.
+  if (bearer === null) {
+    console.error("phone push: no FCM access token", req.kind);
+    return error(502, "push_failed", "Google's push service refused the relay's credentials.");
+  }
+  switch (result!.kind) {
+    case "sent":
+      return json({ sent: true });
+    case "unregistered":
+      return json({ sent: false, reason: "unregistered" });
+    case "rate_limited":
+      console.warn("phone push: FCM rate limited", req.kind);
+      return error(
+        429,
+        "rate_limited",
+        "Google's push service is limiting this relay; try again later.",
+        { retryAfter: APNS_RETRY_AFTER_S },
+        { "Retry-After": String(APNS_RETRY_AFTER_S) },
+      );
+    case "access_token":
+      console.error("phone push: FCM refused the access token twice", req.kind);
+      return error(502, "push_failed", "Google's push service refused the relay's credentials.");
+    case "failed":
+      console.error("phone push: FCM failed", req.kind, result!.status, result!.reason ?? "-");
+      return error(502, "push_failed", "Google's push service didn't accept the push.");
   }
 }

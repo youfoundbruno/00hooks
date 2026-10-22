@@ -1688,15 +1688,21 @@ automations:
 
     #[test]
     fn the_readme_example_is_valid() {
+        // The README's first example (a first hook) and its full one (the Automations section).
         let readme = include_str!("../../../README.md");
-        let yaml = readme
-            .split("```yaml\n")
-            .nth(1)
-            .and_then(|s| s.split("```").next())
-            .expect("the README has a yaml example");
-        let a = p(yaml).unwrap_or_else(|e| panic!("{e:?}"));
-        assert_eq!(a.automations.len(), 1);
-        assert_eq!(a.automations[0].actions.len(), 4);
+        let block = |n: usize| {
+            readme
+                .split("```yaml\n")
+                .nth(n)
+                .and_then(|s| s.split("```").next())
+                .expect("the README has yaml examples")
+        };
+        let first = p(block(1)).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(first.automations.len(), 1);
+        assert_eq!(first.automations[0].actions.len(), 1);
+        let full = p(block(2)).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(full.automations.len(), 1);
+        assert_eq!(full.automations[0].actions.len(), 4);
     }
 
     #[test]

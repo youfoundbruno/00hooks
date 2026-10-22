@@ -10,6 +10,7 @@ mod hooks;
 mod listen;
 mod output;
 mod quarantine;
+mod relay;
 mod screen;
 mod service;
 
@@ -101,6 +102,19 @@ enum Cmd {
     },
     /// Check the key, the clock, the relay and the stream.
     Doctor,
+    /// What the relay says about itself: version, protocols, key, signup, clock, push, screen.
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCmd,
+    },
+    /// Have the relay send a hook a signed test event (kind 00hooks.test), and say what it got.
+    /// Only automations that list the kind 00hooks.test run on it.
+    Test {
+        /// The hook (id or name).
+        hook: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Listen and run automations from automations.yaml, until stopped.
     Run {
         /// The automations file (default: ~/.config/00hooks/automations.yaml).
@@ -157,6 +171,19 @@ enum Cmd {
     Quarantine {
         #[command(subcommand)]
         cmd: Option<QuarantineCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RelayCmd {
+    /// GET /v1/info of the relay this computer is logged in to (or --relay), and what it means here.
+    Status {
+        /// Another relay's address.
+        #[arg(long)]
+        relay: Option<String>,
+        /// Print the relay's answer as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -291,6 +318,12 @@ enum DevicesCmd {
     },
     /// Give this computer a new sealing key (a login from before sealing has none).
     SealKey,
+    /// Rename a device (by id or current name).
+    Rename {
+        device: String,
+        /// The new name (1 to 100 characters).
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -339,8 +372,8 @@ enum HooksCmd {
         #[arg(long)]
         prefix: Option<String>,
         /// Read the sender's existing secret from stdin instead of letting the relay generate one.
-        /// Required for stripe, slack, linear, shopify, twilio and meta (the app secret), which issue
-        /// their own.
+        /// Required for stripe, slack, linear, shopify, twilio, meta (the app secret), paddle, zoom
+        /// and pagerduty, which issue their own.
         #[arg(long)]
         secret_stdin: bool,
         /// standard-webhooks-ed25519: the sender's public key (whpk_…). Not a secret.
@@ -400,6 +433,34 @@ enum HooksCmd {
     Pause { hook: String },
     /// Accept events again.
     Resume { hook: String },
+    /// Deliver a hook's events to one device only (by id or name), so its automations run on
+    /// one computer; --all delivers them to every device again.
+    DeliverTo {
+        hook: String,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        device: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Set the static answer the relay gives the provider for each accepted delivery, or --clear it.
+    Response {
+        hook: String,
+        /// 200 to 299, but not 204 or 205.
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        status: Option<u16>,
+        /// text/plain, application/json, application/xml or text/xml.
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        content_type: Option<String>,
+        /// The body (at most 4096 bytes).
+        #[arg(long, conflicts_with_all = ["body_file", "clear"])]
+        body: Option<String>,
+        /// Read the body from this file.
+        #[arg(long, value_name = "PATH", conflicts_with = "clear")]
+        body_file: Option<PathBuf>,
+        /// Answer with the default again.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Delete a hook.
     Delete {
         hook: String,
@@ -448,6 +509,7 @@ async fn dispatch(cmd: Cmd) -> CliResult {
             DevicesCmd::Add => account::devices_add().await,
             DevicesCmd::Revoke { id, yes } => account::devices_revoke(id, yes).await,
             DevicesCmd::SealKey => account::devices_seal_key().await,
+            DevicesCmd::Rename { device, name } => account::devices_rename(device, name).await,
         },
         Cmd::Keys { cmd } => match cmd {
             KeysCmd::Create {
@@ -521,9 +583,49 @@ async fn dispatch(cmd: Cmd) -> CliResult {
             HooksCmd::Pause { hook } => hooks::set_enabled(hook, false).await,
             HooksCmd::Resume { hook } => hooks::set_enabled(hook, true).await,
             HooksCmd::Delete { hook, yes } => hooks::delete(hook, yes).await,
+            HooksCmd::DeliverTo { hook, device, all } => {
+                hooks::deliver_to(hook, if all { None } else { device }).await
+            }
+            HooksCmd::Response {
+                hook,
+                status,
+                content_type,
+                body,
+                body_file,
+                clear,
+            } => {
+                if clear {
+                    return hooks::set_response(hook, None).await;
+                }
+                let body = match (body, body_file) {
+                    (Some(b), None) => b,
+                    (None, Some(p)) => std::fs::read_to_string(&p).map_err(|e| {
+                        ctx::Failure::new(format!(
+                            "Couldn't read {} as UTF-8 text: {e}.",
+                            p.display()
+                        ))
+                    })?,
+                    _ => {
+                        return Err(ctx::Failure::new(
+                            "Give the answer's body with --body TEXT or --body-file PATH \
+                             (--body \"\" for an empty one).",
+                        ));
+                    }
+                };
+                let r = hooks::response_spec(
+                    status.unwrap_or_default(),
+                    content_type.as_deref().unwrap_or_default(),
+                    body,
+                )?;
+                hooks::set_response(hook, Some(r)).await
+            }
         },
         Cmd::Listen { json, hooks } => listen::run(json, hooks).await,
         Cmd::Doctor => doctor::run().await,
+        Cmd::Relay { cmd } => match cmd {
+            RelayCmd::Status { relay: r, json } => relay::status(r, json).await,
+        },
+        Cmd::Test { hook, json } => hooks::test(hook, json).await,
         Cmd::Run { automations } => automate::run(automations).await,
         Cmd::Automations { cmd } => match cmd {
             AutomationsCmd::Check {

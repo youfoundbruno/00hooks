@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" role="img" aria-labelledby="title desc">
+  <title id="title">00hooks architecture</title>
+  <desc id="desc">Webhooks from any service reach your own relay on your Cloudflare account, which verifies, screens, dedupes, seals and logs them, then streams them sealed to your devices, which run automations. The relay can also wake a phone with a push through APNs or FCM.</desc>
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; fill: #1f2328; }
+    .muted { fill: #59636e; font-size: 13px; }
+    .title { font-size: 16px; font-weight: 600; }
+    .bold { font-weight: 600; }
+    .box { fill: rgba(140, 149, 159, 0.08); stroke: #8c959f; stroke-width: 1.5; }
+    .relay { fill: rgba(56, 139, 253, 0.08); stroke: #0969da; stroke-width: 1.75; }
+    .step { fill: rgba(56, 139, 253, 0.12); stroke: #0969da; stroke-width: 1.25; }
+    .dev { fill: rgba(46, 160, 67, 0.10); stroke: #1a7f37; stroke-width: 1.5; }
+    .line { fill: none; stroke: #59636e; stroke-width: 1.75; }
+    .blue { stroke: #0969da; }
+    .green { stroke: #1a7f37; }
+    .dash { stroke-dasharray: 6 5; }
+    .head { fill: #59636e; }
+    .head-blue { fill: #0969da; }
+    .head-green { fill: #1a7f37; }
+    .accent-blue { fill: #0969da; }
+    .accent-green { fill: #1a7f37; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .box { fill: rgba(140, 149, 159, 0.10); stroke: #6e7681; }
+      .relay { fill: rgba(56, 139, 253, 0.10); stroke: #4493f8; }
+      .step { fill: rgba(56, 139, 253, 0.16); stroke: #4493f8; }
+      .dev { fill: rgba(46, 160, 67, 0.14); stroke: #3fb950; }
+      .line { stroke: #9198a1; }
+      .blue { stroke: #4493f8; }
+      .green { stroke: #3fb950; }
+      .head { fill: #9198a1; }
+      .head-blue { fill: #4493f8; }
+      .head-green { fill: #3fb950; }
+      .accent-blue { fill: #4493f8; }
+      .accent-green { fill: #3fb950; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="head"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="head-blue"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="head-green"/>
+    </marker>
+  </defs>
+
+  <!-- Providers -->
+  <text x="85" y="50" text-anchor="middle" class="bold">Any webhook</text>
+  <g>
+    <rect x="20" y="70" width="130" height="32" rx="8" class="box"/>
+    <text x="85" y="91" text-anchor="middle">GitHub</text>
+    <rect x="20" y="118" width="130" height="32" rx="8" class="box"/>
+    <text x="85" y="139" text-anchor="middle">Stripe</text>
+    <rect x="20" y="166" width="130" height="32" rx="8" class="box"/>
+    <text x="85" y="187" text-anchor="middle">Shopify</text>
+    <rect x="20" y="214" width="130" height="32" rx="8" class="box"/>
+    <text x="85" y="235" text-anchor="middle">Slack</text>
+    <rect x="20" y="262" width="130" height="32" rx="8" class="box"/>
+    <text x="85" y="283" text-anchor="middle">Forms</text>
+    <rect x="20" y="310" width="130" height="32" rx="8" class="box"/>
+    <text x="85" y="331" text-anchor="middle">Your app</text>
+  </g>
+  <text x="85" y="368" text-anchor="middle" class="muted">POST /h/&lt;hook&gt;</text>
+  <g>
+    <path d="M150,86 H197" class="line" marker-end="url(#arrow)"/>
+    <path d="M150,134 H197" class="line" marker-end="url(#arrow)"/>
+    <path d="M150,182 H197" class="line" marker-end="url(#arrow)"/>
+    <path d="M150,230 H197" class="line" marker-end="url(#arrow)"/>
+    <path d="M150,278 H197" class="line" marker-end="url(#arrow)"/>
+    <path d="M150,326 H197" class="line" marker-end="url(#arrow)"/>
+  </g>
+
+  <!-- Relay -->
+  <rect x="200" y="40" width="280" height="345" rx="14" class="relay"/>
+  <text x="340" y="66" text-anchor="middle" class="title">Your relay</text>
+  <text x="340" y="86" text-anchor="middle" class="muted">your own Cloudflare account</text>
+  <g>
+    <rect x="225" y="104" width="230" height="30" rx="7" class="step"/>
+    <text x="340" y="124" text-anchor="middle">verify the signature</text>
+    <path d="M340,134 V145" class="line blue" marker-end="url(#arrow-blue)"/>
+    <rect x="225" y="148" width="230" height="30" rx="7" class="step"/>
+    <text x="340" y="168" text-anchor="middle">screen (optional)</text>
+    <path d="M340,178 V189" class="line blue" marker-end="url(#arrow-blue)"/>
+    <rect x="225" y="192" width="230" height="30" rx="7" class="step"/>
+    <text x="340" y="212" text-anchor="middle">drop replays</text>
+    <path d="M340,222 V233" class="line blue" marker-end="url(#arrow-blue)"/>
+    <rect x="225" y="236" width="230" height="30" rx="7" class="step"/>
+    <text x="340" y="256" text-anchor="middle">seal to each device</text>
+    <path d="M340,266 V277" class="line blue" marker-end="url(#arrow-blue)"/>
+    <rect x="225" y="280" width="230" height="30" rx="7" class="step"/>
+    <text x="340" y="300" text-anchor="middle">ordered log</text>
+  </g>
+  <text x="340" y="335" text-anchor="middle" class="muted">stores only ciphertext</text>
+  <text x="340" y="356" text-anchor="middle" class="muted">routes node ↔ phone messages</text>
+
+  <!-- Sealed stream to devices -->
+  <g>
+    <path d="M480,295 C540,295 545,88 597,88" class="line green" marker-end="url(#arrow-green)"/>
+    <path d="M480,295 C540,295 545,168 597,168" class="line green" marker-end="url(#arrow-green)"/>
+    <path d="M480,295 C540,295 545,248 597,248" class="line green" marker-end="url(#arrow-green)"/>
+  </g>
+  <text x="540" y="328" text-anchor="middle" class="bold accent-green">sealed</text>
+  <text x="540" y="347" text-anchor="middle" class="muted">SSE, resumable</text>
+
+  <!-- Devices -->
+  <text x="700" y="44" text-anchor="middle" class="bold">Your devices</text>
+  <g>
+    <rect x="600" y="60" width="200" height="56" rx="10" class="dev"/>
+    <text x="700" y="84" text-anchor="middle" class="bold">Laptop</text>
+    <text x="700" y="104" text-anchor="middle" class="muted">00hooks CLI</text>
+    <rect x="600" y="140" width="200" height="56" rx="10" class="dev"/>
+    <text x="700" y="164" text-anchor="middle" class="bold">Office Mac</text>
+    <text x="700" y="184" text-anchor="middle" class="muted">00hooks CLI</text>
+    <rect x="600" y="220" width="200" height="56" rx="10" class="dev"/>
+    <text x="700" y="244" text-anchor="middle" class="bold">00next</text>
+    <text x="700" y="264" text-anchor="middle" class="muted">embeds the libraries</text>
+  </g>
+  <text x="815" y="164" class="muted">unseal,</text>
+  <text x="815" y="183" class="muted">screen,</text>
+  <text x="815" y="202" class="muted">run</text>
+
+  <!-- Automations -->
+  <path d="M700,276 V317" class="line" marker-end="url(#arrow)"/>
+  <rect x="600" y="320" width="340" height="150" rx="12" class="box"/>
+  <text x="770" y="346" text-anchor="middle" class="title">Automations &amp; agents</text>
+  <text x="620" y="374">notify me</text>
+  <text x="790" y="374">call a URL</text>
+  <text x="620" y="398">run an allowed command</text>
+  <text x="620" y="422">write a file</text>
+  <text x="620" y="446" class="muted">agents: only in programs that</text>
+  <text x="620" y="463" class="muted">embed the runner (like 00next)</text>
+
+  <!-- Phone -->
+  <path d="M340,385 V437" class="line dash" marker-end="url(#arrow)"/>
+  <text x="352" y="408" class="muted">push (APNs / FCM)</text>
+  <text x="352" y="426" class="muted">no readable content</text>
+  <rect x="240" y="440" width="200" height="56" rx="12" class="box"/>
+  <text x="340" y="464" text-anchor="middle" class="bold">Your phone</text>
+  <text x="340" y="484" text-anchor="middle" class="muted">iOS / Android</text>
+</svg>

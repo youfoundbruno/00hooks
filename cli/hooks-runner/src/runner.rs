@@ -15,12 +15,13 @@ use crate::catalogue::{Catalogue, Observation};
 use crate::config::{
     Action, ActionKind, Automation, Automations, NotifyMode, Trigger, describe_rate,
 };
+use crate::contentmarks::{self, ContentMarks};
 use crate::hookrefs::{self, HookRefs, Pin, Pins};
 use crate::runs::{ActionResult, AutomationRun, RunLog, RunRecord, RunStatus};
 use crate::secrets::SecretStore;
 use crate::state::{Admit, Breaker, States};
 use crate::text::sanitize;
-use crate::{Error, HOP_HEADER, ORIGIN_HEADER, Result, context, now_ms};
+use crate::{Error, HOP_HEADER, ORIGIN_HEADER, Result, TEST_KIND, context, is_test_event, now_ms};
 
 /// Events beyond this many hops are dropped as a loop.
 pub const HOP_LIMIT: u32 = 3;
@@ -77,6 +78,8 @@ pub struct Runner {
     given: bool,
     catalogue: Catalogue,
     runs: RunLog,
+    /// The content-hash dedupe: what content was already taken, for presets that sign no timestamp.
+    marks: ContentMarks,
     states: States,
     http: reqwest::Client,
     /// Hook names by id, from the relay (cached in `hooks.json`).
@@ -136,6 +139,7 @@ impl Runner {
             },
             catalogue: Catalogue::open(opts.dir.join("catalogue"))?,
             runs: RunLog::open(&opts.dir)?,
+            marks: ContentMarks::open(&opts.dir)?,
             states: States::open(&opts.dir)?,
             http: actions::call::http_client(),
             names: load_names(&opts.dir),
@@ -570,8 +574,45 @@ impl Runner {
             return self.finish(rec);
         }
 
+        // A replay under a new id of content already taken (PROTOCOL §3). The mark is written before
+        // the run's start: a crash between the two leaves a mark naming this very event, so it
+        // still runs when the relay hands it over again, and a copy under another id never does.
+        if !replay && contentmarks::applies(e) {
+            let hash = contentmarks::content_hash(e);
+            let now = now_ms();
+            match self.marks.get(&hash, now) {
+                Some(m) if m.e != e.id => {
+                    let note = format!(
+                        "same content as event {} received {}: a replay",
+                        m.e,
+                        clock(m.r)
+                    );
+                    confirm(&e.id);
+                    let rec = self.dropped(e, note);
+                    return self.finish(rec);
+                }
+                Some(_) => {}
+                None => {
+                    if let Err(err) = self.marks.record(&hash, e, now) {
+                        // Without the mark a replay of it could run later: don't act yet. It isn't
+                        // confirmed, so it comes back after a restart.
+                        let mut rec = self.dropped(
+                            e,
+                            format!(
+                                "couldn't record the event's content mark, so nothing ran: {err}"
+                            ),
+                        );
+                        rec.status = RunStatus::Failed;
+                        self.say(format!("Couldn't record event {}: {err}", e.id));
+                        return rec;
+                    }
+                }
+            }
+        }
+
         let payload = context::payload(e);
         let kind = context::kind_name(e, &payload);
+        let test = is_test_event(e);
         let hook_name = self.names.get(&e.hook_id).cloned();
         let started_at = now_ms();
         let run = match self.runs.begin(e, &kind, replay) {
@@ -592,7 +633,8 @@ impl Runner {
             }
         };
 
-        let observation = if replay {
+        // A test event isn't a kind the hook sends: it stays out of the catalogue.
+        let observation = if replay || test {
             Observation {
                 key: crate::catalogue::key(&e.hook_id, &kind),
                 new_kind: false,
@@ -740,8 +782,17 @@ impl Runner {
         }
         let status = if autos.iter().any(AutomationRun::failed) {
             RunStatus::Failed
+        } else if test && autos.is_empty() {
+            RunStatus::Skipped
         } else {
             RunStatus::Ok
+        };
+        let capped = if status == RunStatus::Skipped {
+            Some(format!(
+                "a test event (00hooks test); automations that list the kind {TEST_KIND} run on it"
+            ))
+        } else {
+            capped
         };
         let rec = RunRecord {
             run,
@@ -784,6 +835,13 @@ impl Runner {
             && !self.refs.matches(h, &e.hook_id)
         {
             return None;
+        }
+        // A test event runs only what names its kind: not "any kind", nor the catalogue's triggers.
+        if is_test_event(e) {
+            return match &a.when.trigger {
+                Trigger::Kinds(k) => k.iter().any(|k| k == TEST_KIND).then_some("kind"),
+                _ => None,
+            };
         }
         match &a.when.trigger {
             Trigger::Kinds(k) => (k.is_empty() || k.iter().any(|k| k == kind)).then_some("kind"),

@@ -4,7 +4,8 @@ use std::io::{BufRead, IsTerminal};
 
 use hooks_client::api::{check_id, system_now_ms};
 use hooks_client::{
-    Client, Config, DeviceKey, Error, KeychainStore, PROTOCOL_VERSION, SealKey, StateDir,
+    Client, Config, DeviceInfo, DeviceKey, Error, KeychainStore, PROTOCOL_VERSION, SealKey,
+    StateDir,
 };
 
 use crate::ctx::{
@@ -388,6 +389,62 @@ pub async fn devices_add() -> CliResult {
         "On the other computer, run this and type the code when asked:\n  00hooks login --relay {} --code",
         ctx.config.relay
     );
+    Ok(())
+}
+
+/// A device by id (`dev_…`) or by its exact current name.
+pub async fn resolve_device(ctx: &Ctx, which: &str) -> CliResult<DeviceInfo> {
+    let devices = ctx.client.devices().await.map_err(|e| ctx.explain(e))?;
+    if which.starts_with("dev_") {
+        return devices.into_iter().find(|d| d.id == which).ok_or_else(|| {
+            Failure::new(format!(
+                "No device {} on this account. Run `00hooks devices` to see them.",
+                sanitize(which, false)
+            ))
+        });
+    }
+    let mut matches: Vec<DeviceInfo> = devices.into_iter().filter(|d| d.name == which).collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(Failure::new(format!(
+            "No device named {}. Run `00hooks devices` to see them.",
+            sanitize(which, false)
+        ))),
+        _ => Err(Failure::new(format!(
+            "More than one device is named {}; use its id (`00hooks devices`).",
+            sanitize(which, false)
+        ))),
+    }
+}
+
+/// The longest device name, in characters (PROTOCOL §2).
+const MAX_DEVICE_NAME: usize = 100;
+
+pub async fn devices_rename(which: String, name: String) -> CliResult {
+    let name = name.trim().to_string();
+    let chars = name.chars().count();
+    if chars == 0 || chars > MAX_DEVICE_NAME {
+        return Err(Failure::new(format!(
+            "A device name is 1 to {MAX_DEVICE_NAME} characters."
+        )));
+    }
+    let ctx = Ctx::load()?;
+    let d = resolve_device(&ctx, &which).await?;
+    let old = sanitize(&d.name, false);
+    let d = ctx
+        .client
+        .rename_device(&d.id, &name)
+        .await
+        .map_err(|e| ctx.explain(e))?;
+    if d.id == ctx.config.device_id {
+        // Keep the login's own record of its name in step.
+        let mut config = ctx.config.clone();
+        config.device_name = d.name.clone();
+        ctx.state
+            .save_config(&config)
+            .map_err(|e| Failure::new(sentence(&e.to_string())))?;
+    }
+    println!("Renamed {old} ({}) to {}.", d.id, sanitize(&d.name, false));
     Ok(())
 }
 

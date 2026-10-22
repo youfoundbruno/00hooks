@@ -88,7 +88,10 @@ describe("phone pairing", () => {
   it("announces the phone protocol in /v1/info", async () => {
     const info = (await (await fetchRelay("/v1/info")).json()) as { phone: unknown; protocol: number };
     // Push isn't configured in the tests' bindings (phone-push.test.ts sets it).
-    expect(info.phone).toEqual({ protocol: 1, push: { available: false, environment: null } });
+    expect(info.phone).toEqual({
+      protocol: 1,
+      push: { available: false, environment: null, platforms: { ios: { available: false, environment: null }, android: { available: false } } },
+    });
     expect(info.protocol).toBe(2);
   });
 

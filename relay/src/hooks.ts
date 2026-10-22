@@ -17,6 +17,7 @@ import {
 } from "./presets.ts";
 import { openSecret, pepperedHash, sealSecret } from "./seal.ts";
 import { parseScreen, type EdgeScreen } from "./screen.ts";
+import { parseDeliverTo, parseStaticResponse, staticResponseOf } from "./hook-delivery.ts";
 import { resolvePlan, secondsToMidnight, type AccountPlanColumns, type ResolvedPlan } from "./plans.ts";
 import { utcDay } from "./account-object.ts";
 
@@ -63,6 +64,10 @@ export interface HookRow {
   offline_notice: string | null;
   /** The screen's rules, as JSON (PROTOCOL §4b), or null. */
   screen?: string | null;
+  /** The one device the hook's events go to (PROTOCOL §3), or null for every device. */
+  deliver_to?: string | null;
+  /** The static answer for the provider, as JSON (src/hook-delivery.ts), or null. */
+  static_response?: string | null;
   /** Paused after a flood of refusals until then (PROTOCOL §4), or null. */
   paused_until: number | null;
   /** What a delivery past the daily cap gets: `refuse` (429) or `accept_and_drop` (200, a gap). */
@@ -108,6 +113,8 @@ export function hookJson(row: HookRow, origin: string) {
     lastEventAt: row.last_event_at,
     offlineNotice: offlineNoticeOf(row),
     screenRules: screenOf(row)?.rules.length ?? 0,
+    deliverTo: row.deliver_to ?? null,
+    response: staticResponseOf(row.static_response),
     onLimit: row.on_limit === "accept_and_drop" ? "accept_and_drop" : "refuse",
     pausedUntil: row.paused_until !== null && row.paused_until > Date.now() ? row.paused_until : null,
   };
@@ -278,13 +285,24 @@ export async function patchHook(env: Env, caller: Principal, origin: string, id:
     const parsed = parseOfflineNotice(input.offlineNotice, (JSON.parse(row.verify) as VerifyConfig).preset);
     notice = parsed ? JSON.stringify(parsed) : null;
   }
+  // Who receives the hook's events, and what the provider is answered (src/hook-delivery.ts).
+  const deliverTo = input.deliverTo === undefined ? (row.deliver_to ?? null) : await parseDeliverTo(env, caller.accountId, input.deliverTo);
+  let response = row.static_response ?? null;
+  if (input.response !== undefined) {
+    const parsed = parseStaticResponse(input.response, (JSON.parse(row.verify) as VerifyConfig).preset);
+    response = parsed ? JSON.stringify(parsed) : null;
+  }
   if (name !== row.name) await assertNameFree(env, caller.accountId, name, id);
   await env.DB.prepare(
-    "UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ?, on_limit = ?, paused_until = CASE WHEN ? THEN NULL ELSE paused_until END WHERE id = ?",
+    "UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ?, deliver_to = ?, static_response = ?, on_limit = ?, paused_until = CASE WHEN ? THEN NULL ELSE paused_until END WHERE id = ?",
   )
-    .bind(name, enabled, maxBodyBytes, notice, onLimit, unpause ? 1 : 0, id)
+    .bind(name, enabled, maxBodyBytes, notice, deliverTo, response, onLimit, unpause ? 1 : 0, id)
     .run()
     .catch(uniqueName);
+  if (deliverTo !== (row.deliver_to ?? null)) {
+    // Who reads a hook's events is worth a line in the audit: the name is the device, or `*` for all.
+    await accountStub(env, caller.accountId).audit({ kind: "hook.delivery", actor: caller.actor, subject: id, name: deliverTo ?? "*" });
+  }
   if (unpause) await accountStub(env, caller.accountId).hookUnpaused(id, caller.actor);
   if (name !== row.name) {
     await accountStub(env, caller.accountId).hookChanged({ kind: "hook.renamed", hookId: id, name, previousName: row.name, actor: caller.actor });

@@ -139,15 +139,21 @@ async function nodeWithPhone(): Promise<{ node: TestNode; phone: TestPhone }> {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 describe("/v1/info push", () => {
+  /** The push object for iOS alone (Android isn't configured in these tests). */
+  const ios = (available: boolean, environment: string | null) => ({
+    available,
+    environment,
+    platforms: { ios: { available, environment }, android: { available: false } },
+  });
   const info = async () => ((await (await fetchRelay("/v1/info")).json()) as { phone: { protocol: number; push: unknown } }).phone;
 
   it("says push is unavailable until the key is set, and which environment once it is", async () => {
-    expect(await info()).toEqual({ protocol: 1, push: { available: false, environment: null } });
+    expect(await info()).toEqual({ protocol: 1, push: ios(false, null) });
     await configure();
-    expect(await info()).toEqual({ protocol: 1, push: { available: true, environment: "production" } });
+    expect(await info()).toEqual({ protocol: 1, push: ios(true, "production") });
     resetApnsCache();
     await configure({ environment: "sandbox" });
-    expect((await info()).push).toEqual({ available: true, environment: "sandbox" });
+    expect((await info()).push).toEqual(ios(true, "sandbox"));
   });
 
   it("is unavailable with any setting missing or malformed, or a key that doesn't import", async () => {
@@ -166,14 +172,14 @@ describe("/v1/info push", () => {
     for (const c of cases) {
       for (const k of APNS_VARS) mutableEnv[k] = good[k];
       Object.assign(mutableEnv, c);
-      expect((await info()).push, JSON.stringify(c).slice(0, 60)).toEqual({ available: false, environment: null });
+      expect((await info()).push, JSON.stringify(c).slice(0, 60)).toEqual(ios(false, null));
     }
   });
 
   it("takes the key with \\n escapes and surrounding whitespace, as a secret is often pasted", async () => {
     const key = await configure();
     mutableEnv.APNS_KEY = `  \n${key.pem.replace(/\n/g, "\\n")}\n  `;
-    expect((await info()).push).toEqual({ available: true, environment: "production" });
+    expect((await info()).push).toEqual(ios(true, "production"));
   });
 });
 

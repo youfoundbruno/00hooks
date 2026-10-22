@@ -1,6 +1,6 @@
 //! The vectors the relay is held to as well (`fixtures/screen.v1.json`): words, shapes, MinHash
 //! signatures, domains, keyed field hashes, which patterns may go to the edge (and their weight),
-//! and what edge patterns match. Run with `HOOKS_WRITE_SCREEN_FIXTURES=1` to write the file after a
+//! what edge patterns match, and when time windows hold. Run with `HOOKS_WRITE_SCREEN_FIXTURES=1` to write the file after a
 //! deliberate change.
 
 use base64::Engine;
@@ -10,6 +10,7 @@ use hooks_screen::fields::{
     keyed_hash,
 };
 use hooks_screen::minhash::{Signature, murmur3_32};
+use hooks_screen::rules::{Compiled, Rule, View};
 use hooks_screen::{parse_payload, shape, text};
 use serde_json::{Value, json};
 
@@ -28,6 +29,150 @@ fn bodies() -> Vec<(&'static str, Option<&'static str>, String)> {
         ("unicode-keys", Some("application/json"), json!({"é": "acute", "z": "zed", "Z": "big zed", "日本": "kanji", "a.b": "dotted"}).to_string()),
         ("empty", None, String::new()),
     ]
+}
+
+/// An item received at `at` (Unix milliseconds), for time windows.
+fn item_at(at: i64) -> hooks_screen::Item {
+    serde_json::from_value(json!({
+        "id": "evt_t",
+        "source": {"kind": "webhook", "id": "hk_t", "name": "t"},
+        "payload": {},
+        "receivedAt": at,
+    }))
+    .unwrap()
+}
+
+fn time_rule(condition: &Value) -> Result<Compiled, String> {
+    let rule: Rule = serde_json::from_value(
+        json!({"id": "t", "name": "t", "verdict": "drop", "conditions": [condition]}),
+    )
+    .map_err(|e| e.to_string())?;
+    Compiled::new(rule)
+}
+
+/// When time windows hold, each answer written here by hand (not taken from either half), and the
+/// windows both halves refuse, with the field the relay names.
+fn time_windows() -> Value {
+    let at = |s: &str| s.parse::<jiff::Timestamp>().unwrap().as_millisecond();
+    let nights = json!({"on": "time", "from": "22:00", "to": "06:00", "tz": "Europe/Lisbon"});
+    let friday_nights = json!({"on": "time", "days": [5], "from": "22:00", "to": "06:00"});
+    let weekends = json!({"on": "time", "days": [0, 6], "from": "00:00", "to": "24:00"});
+    let office_ny = json!({"on": "time", "days": [1, 2, 3, 4, 5], "from": "09:00", "to": "17:00", "tz": "America/New_York"});
+    let gap_ny = json!({"on": "time", "from": "02:00", "to": "03:00", "tz": "America/New_York"});
+    let twice_ny = json!({"on": "time", "from": "01:00", "to": "02:00", "tz": "America/New_York"});
+    let outside_office = json!({"on": "time", "from": "09:00", "to": "17:00", "not": true});
+    let kolkata = json!({"on": "time", "from": "09:00", "to": "17:00", "tz": "Asia/Kolkata"});
+    let auckland_friday = json!({"on": "time", "days": [5], "from": "09:00", "to": "10:00", "tz": "Pacific/Auckland"});
+    let to_midnight = json!({"on": "time", "days": [4], "from": "22:00", "to": "00:00"});
+    let friday_nights_not =
+        json!({"on": "time", "days": [5], "from": "22:00", "to": "06:00", "not": true});
+    // 2026-10-23 is a Friday. Lisbon is UTC+0 in winter and UTC+1 in summer (from 29 March 2026);
+    // New York springs forward on 8 March 2026 (02:00 EST to 03:00 EDT) and falls back on
+    // 1 November 2026 (02:00 EDT to 01:00 EST).
+    let cases: Vec<(&Value, &str, bool)> = vec![
+        (&nights, "2026-01-15T23:30:00Z", true),
+        (&nights, "2026-01-15T22:00:00Z", true),
+        (&nights, "2026-01-15T05:59:59Z", true),
+        (&nights, "2026-01-15T06:00:00Z", false),
+        (&nights, "2026-01-15T12:00:00Z", false),
+        (&nights, "2026-07-15T21:30:00Z", true),
+        (&nights, "2026-07-15T05:30:00Z", false),
+        (&nights, "2026-03-29T00:59:59Z", true),
+        (&nights, "2026-03-29T05:00:00Z", false),
+        (&friday_nights, "2026-10-23T23:00:00Z", true),
+        (&friday_nights, "2026-10-24T03:00:00Z", true),
+        (&friday_nights, "2026-10-24T23:00:00Z", false),
+        (&friday_nights, "2026-10-23T03:00:00Z", false),
+        (&friday_nights_not, "2026-10-24T03:00:00Z", false),
+        (&friday_nights_not, "2026-10-23T03:00:00Z", true),
+        (&weekends, "2026-10-24T12:00:00Z", true),
+        (&weekends, "2026-10-25T23:59:59Z", true),
+        (&weekends, "2026-10-26T00:00:00Z", false),
+        (&weekends, "2026-10-23T23:59:59Z", false),
+        (&office_ny, "2026-03-06T13:30:00Z", false),
+        (&office_ny, "2026-03-09T13:30:00Z", true),
+        (&office_ny, "2026-03-09T21:00:00Z", false),
+        (&office_ny, "2026-03-07T15:00:00Z", false),
+        (&gap_ny, "2026-03-08T06:59:59Z", false),
+        (&gap_ny, "2026-03-08T07:00:00Z", false),
+        (&gap_ny, "2026-03-09T06:30:00Z", true),
+        (&twice_ny, "2026-11-01T05:30:00Z", true),
+        (&twice_ny, "2026-11-01T06:30:00Z", true),
+        (&twice_ny, "2026-11-01T07:00:00Z", false),
+        (&outside_office, "2026-10-22T12:00:00Z", false),
+        (&outside_office, "2026-10-22T18:00:00Z", true),
+        (&outside_office, "2026-10-22T08:59:59Z", true),
+        (&kolkata, "2026-01-15T03:30:00Z", true),
+        (&kolkata, "2026-01-15T03:29:59Z", false),
+        (&auckland_friday, "2026-01-15T20:30:00Z", true),
+        (&auckland_friday, "2026-07-16T21:30:00Z", true),
+        (&auckland_friday, "2026-07-16T20:30:00Z", false),
+        (&to_midnight, "2026-10-22T23:59:59Z", true),
+        (&to_midnight, "2026-10-23T00:00:00Z", false),
+    ];
+    let cases: Vec<Value> = cases
+        .into_iter()
+        .map(|(c, when, want)| {
+            let rule = time_rule(c).unwrap_or_else(|e| panic!("{c}: {e}"));
+            let holds = rule.test(&item_at(at(when)), &mut View::default());
+            assert_eq!(holds, want, "{c} at {when}");
+            json!({"condition": c, "utc": when, "at": at(when), "holds": holds})
+        })
+        .collect();
+    let w = |extra: Value| {
+        let mut c = json!({"on": "time", "from": "09:00", "to": "17:00"});
+        for (k, v) in extra.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        c
+    };
+    let refused: Vec<Value> = [
+        (w(json!({"tz": "Mars/Olympus"})), "tz"),
+        (w(json!({"tz": "+01:00"})), "tz"),
+        (w(json!({"tz": "Etc/Unknown"})), "tz"),
+        (w(json!({"tz": "Factory"})), "tz"),
+        (w(json!({"tz": ""})), "tz"),
+        (w(json!({"tz": "../zoneinfo/UTC"})), "tz"),
+        (w(json!({"tz": format!("Europe/{}", "L".repeat(60))})), "tz"),
+        (w(json!({"tz": 1})), "tz"),
+        (w(json!({"from": "24:00"})), "from"),
+        (w(json!({"from": "9:00"})), "from"),
+        (w(json!({"from": "09:60"})), "from"),
+        (w(json!({"to": "24:01"})), "to"),
+        (w(json!({"to": "09:00"})), "to"),
+        (w(json!({"days": [7]})), "days"),
+        (w(json!({"days": []})), "days"),
+        (w(json!({"days": [1, 1]})), "days"),
+        (w(json!({"days": ["1"]})), "days"),
+        (w(json!({"days": [1.5]})), "days"),
+        (w(json!({"not": "yes"})), "not"),
+    ]
+    .into_iter()
+    .map(|(c, field)| {
+        assert!(time_rule(&c).is_err(), "{c} is refused");
+        json!({"condition": c, "field": field})
+    })
+    .collect();
+    // Zones as both halves name them: case doesn't matter, and old names still work.
+    let accepted: Vec<Value> = [
+        "UTC",
+        "Europe/Lisbon",
+        "europe/lisbon",
+        "US/Eastern",
+        "Asia/Calcutta",
+        "Europe/Kyiv",
+        "Etc/GMT+5",
+        "America/Argentina/Buenos_Aires",
+        "America/Port-au-Prince",
+    ]
+    .iter()
+    .map(|tz| {
+        let c = w(json!({"tz": tz}));
+        assert!(time_rule(&c).is_ok(), "{tz} is a zone");
+        c
+    })
+    .collect();
+    json!({"cases": cases, "refused": refused, "accepted": accepted})
 }
 
 fn build() -> Value {
@@ -254,6 +399,7 @@ fn build() -> Value {
         "fieldHashes": hashes,
         "edgePatterns": patterns,
         "edgeMatches": matches,
+        "timeWindows": time_windows(),
     })
 }
 

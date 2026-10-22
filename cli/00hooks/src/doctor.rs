@@ -83,16 +83,16 @@ pub async fn run() -> CliResult {
         Ok(info) => {
             let t1 = system_now_ms();
             r.ok(&format!(
-                "Relay reachable: version {}, protocol {}.",
+                "Relay reachable: version {}, protocol {} (`00hooks relay status` says more).",
                 sanitize(&info.version, false),
                 info.protocol
             ));
-            if info.protocol != PROTOCOL_VERSION {
+            if !crate::relay::speaks(&info) {
                 r.fail(&format!(
                     "This 00hooks speaks protocol {PROTOCOL_VERSION}; update it to match the relay."
                 ));
             }
-            let skew = info.server_time - (t0 + t1) / 2;
+            let skew = crate::relay::skew_ms(&info, t0, t1);
             let text = format!("Clock: {} off the relay's.", describe_skew(skew));
             if skew.abs() < 5_000 {
                 r.ok(&text);
