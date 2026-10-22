@@ -234,6 +234,112 @@ async fn a_hook_delivers_to_one_device_and_answers_with_a_static_response() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn devices_are_tagged_and_hooks_deliver_to_lists_and_tags() {
+    let relay = MockRelay::start().await;
+    let home = logged_in(&relay, "recipients").await;
+    ok(
+        &home.0,
+        &["hooks", "create", "--name", "ci", "--preset", "github"],
+    )
+    .await;
+    relay.with(|s| {
+        s.other_devices
+            .push(json!({ "id": "dev_9", "name": "server", "createdAt": 1,
+                                     "lastSeenAt": null, "current": false, "sealKid": "k",
+                                     "kind": "device", "peer": null }));
+        s.other_devices
+            .push(json!({ "id": "dev_7", "name": "office", "createdAt": 1,
+                                     "lastSeenAt": null, "current": false, "sealKid": "k",
+                                     "kind": "device", "peer": null, "tags": ["mac"] }))
+    });
+
+    // Tagging adds to what the device has; untagging removes; the list shows them.
+    let out = ok(&home.0, &["devices", "tag", "office", "office-macs", "mac"]).await;
+    assert!(out.contains("tagged mac, office-macs"), "{out}");
+    let listed = ok(&home.0, &["devices"]).await;
+    assert!(
+        listed.contains("TAGS") && listed.contains("mac, office-macs"),
+        "{listed}"
+    );
+    ok(&home.0, &["devices", "untag", "office", "mac"]).await;
+    assert_eq!(
+        relay.with(|s| s.other_devices[1]["tags"].clone()),
+        json!(["office-macs"])
+    );
+    // Bad tags are refused before any call.
+    let err = fails(&home.0, &["devices", "tag", "office", "Office Macs"]).await;
+    assert!(err.contains("isn't a tag"), "{err}");
+
+    // Several devices and a tag: `recipients`, never `deliverTo`.
+    let out = ok(
+        &home.0,
+        &[
+            "hooks",
+            "deliver-to",
+            "ci",
+            "server",
+            "dev_7",
+            "server",
+            "--tag",
+            "office-macs",
+        ],
+    )
+    .await;
+    assert!(
+        out.contains("server (dev_9) and office (dev_7) and devices tagged office-macs"),
+        "{out}"
+    );
+    assert_eq!(
+        relay.with(|s| s.hook_patches.last().cloned()),
+        Some(json!({"recipients": {"devices": ["dev_9", "dev_7"], "tags": ["office-macs"]}}))
+    );
+    let shown = ok(&home.0, &["hooks", "show", "ci"]).await;
+    assert!(shown.contains("dev_9, dev_7 + tag office-macs"), "{shown}");
+
+    // A tag no device carries: the relay pauses the hook, and the CLI says so.
+    let out = ok(&home.0, &["hooks", "deliver-to", "ci", "--tag", "nobody"]).await;
+    assert!(out.contains("is paused"), "{out}");
+    assert_eq!(
+        relay.with(|s| s.hook_patches.last().cloned()),
+        Some(json!({"recipients": {"devices": [], "tags": ["nobody"]}}))
+    );
+    let list = ok(&home.0, &["hooks", "list"]).await;
+    assert!(
+        list.contains("paused: no recipient") && list.contains("tag nobody"),
+        "{list}"
+    );
+
+    // One device and no tag still uses `deliverTo`, which every relay understands.
+    ok(&home.0, &["hooks", "deliver-to", "ci", "server"]).await;
+    assert_eq!(
+        relay.with(|s| s.hook_patches.last().cloned()),
+        Some(json!({"deliverTo": "dev_9"}))
+    );
+    ok(&home.0, &["hooks", "deliver-to", "ci", "--all"]).await;
+    assert_eq!(
+        relay.with(|s| s.hook_patches.last().cloned()),
+        Some(json!({"deliverTo": null}))
+    );
+    assert!(
+        ok(&home.0, &["hooks", "show", "ci"])
+            .await
+            .contains("every device")
+    );
+    let err = fails(&home.0, &["hooks", "deliver-to", "ci"]).await;
+    assert!(err.contains("--all"), "{err}");
+
+    // A relay that predates lists and tags ignores them: the CLI says so instead of claiming it.
+    relay.with(|s| s.old_relay = true);
+    let err = fails(
+        &home.0,
+        &["hooks", "deliver-to", "ci", "--tag", "office-macs"],
+    )
+    .await;
+    assert!(err.contains("too old"), "{err}");
+    ok(&home.0, &["hooks", "deliver-to", "ci", "server"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_test_event_says_what_the_delivery_got() {
     let relay = MockRelay::start().await;
     let home = logged_in(&relay, "test-event").await;

@@ -66,6 +66,11 @@ pub fn describe_limit(l: &Limit) -> String {
             "Hook {hook} is paused after a flood of refused deliveries{until}; `00hooks hooks \
              resume {hook}` lifts it."
         ),
+        LimitScope::NoRecipient => format!(
+            "Hook {hook} is paused: no device matches its recipients, so deliveries are refused \
+             ({refused} so far) until one does. Tag a device (`00hooks devices tag`) or change \
+             them (`00hooks hooks deliver-to {hook}`)."
+        ),
         LimitScope::PlanExpired => format!(
             "This account's plan has ended (now {plan}): new deliveries are refused ({refused} so \
              far) until it is renewed; what is waiting can still be read."
@@ -374,6 +379,17 @@ mod tests {
         }))
         .unwrap();
         assert!(describe_limit(&l).contains("plan has ended (now suspended)"));
+        let l: Limit = serde_json::from_value(serde_json::json!({
+            "scope": "no_recipient", "hookId": "hk_2", "refused": 2, "since": 1, "until": null,
+            "plan": "default"
+        }))
+        .unwrap();
+        let line = describe_limit(&l);
+        assert!(
+            line.starts_with("Hook hk_2 is paused: no device matches")
+                && line.contains("2 deliveries"),
+            "{line}"
+        );
         let l: Limit = serde_json::from_value(serde_json::json!({
             "scope": "future\u{1b}[31m", "refused": 1, "since": 1, "plan": "p"
         }))
