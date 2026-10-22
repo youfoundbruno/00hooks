@@ -15,6 +15,7 @@ import {
   randomBytes,
   sha256Hex,
   toBase64,
+  toHex,
   toBase64Url,
   utf8,
 } from "./encoding.ts";
@@ -30,6 +31,12 @@ export const PRESETS = [
   "shopify",
   "twilio",
   "meta",
+  "calendly",
+  "typeform",
+  "paddle",
+  "twitch",
+  "zoom",
+  "pagerduty",
   "hmac",
   "token",
   "unverified",
@@ -65,8 +72,8 @@ export type SigFormat =
   | { kind: "single"; prefix?: string }
   /** Space-separated `version,signature` pairs (Standard Webhooks); any one may match. */
   | { kind: "versioned"; version: string }
-  /** Comma-separated `k=v` pairs (Stripe); every `param` value is a candidate. */
-  | { kind: "params"; param: string };
+  /** `k=v` pairs, comma-separated (Stripe) or `;`-separated (Paddle); every `param` value is a candidate. */
+  | { kind: "params"; param: string; separator?: "," | ";" };
 
 export type DedupeRule = { header: string; signed: boolean } | { bodyField: string } | { bodyHash: true };
 
@@ -80,7 +87,11 @@ export interface Spec {
   sig?: { header: string; format: SigFormat; encoding: "hex" | "base64" };
   signed: Part[];
   /** A signed timestamp and how far it may be from the relay's clock. */
-  timestamp?: ({ header: string } | { sigParam: string } | { bodyField: string }) & { unit: "s" | "ms"; toleranceS: number };
+  timestamp?: ({ header: string } | { sigParam: string } | { bodyField: string }) & {
+    /** Unix seconds, Unix ms, or an RFC 3339 date-time (Twitch's). */
+    unit: "s" | "ms" | "rfc3339";
+    toleranceS: number;
+  };
   /** Replay marks; a delivery is a duplicate when any is seen. */
   dedupe: DedupeRule[];
   /** Where `eventType` comes from, first match wins. */
@@ -88,8 +99,12 @@ export interface Spec {
   eventTypeSource: "signed" | "claimed" | "none";
   /** Provider headers kept with the event (besides content-type and user-agent). */
   keep: string[];
-  /** An endpoint check the preset answers after verification. */
-  handshake?: "slack-url-verification";
+  /**
+   * An endpoint check the preset answers after verification, and doesn't store: Slack's and
+   * Twitch's echo a challenge; Zoom's wants an HMAC of its token under the secret, so it needs the
+   * secret at the relay and a strict Zoom hook can't answer it.
+   */
+  handshake?: "slack-url-verification" | "twitch-verification" | "zoom-url-validation";
   /**
    * An endpoint check made with a GET before the provider sends anything (Meta's `hub.challenge`):
    * answered at the edge when the request carries the hook's verify token. Never stored.
@@ -235,6 +250,110 @@ export const SPECS: Record<Preset, Spec> = {
     keep: [],
     getHandshake: "meta-subscribe",
   },
+  // Calendly: `Calendly-Webhook-Signature: t=<s>,v1=<hex>`, HMAC-SHA256 of `t.body` under the
+  // webhook signing key (chosen when a subscription is created with a personal access token, or
+  // issued with an OAuth app, so it is generated when absent). Calendly's own examples refuse a `t`
+  // older than 3 minutes. The body carries no event id, so the body hash is the mark.
+  // https://developer.calendly.com/api-docs/overview/webhooks/webhook-signatures
+  calendly: {
+    secret: "generated",
+    mac: "hmac-sha256",
+    key: "utf8",
+    sig: { header: "calendly-webhook-signature", format: { kind: "params", param: "v1" }, encoding: "hex" },
+    signed: [{ sigParam: "t" }, { text: "." }, { body: true }],
+    timestamp: { sigParam: "t", unit: "s", toleranceS: 180 },
+    dedupe: [{ bodyHash: true }],
+    eventType: { bodyFields: ["event"] },
+    eventTypeSource: "signed",
+    keep: [],
+  },
+  // Typeform: `Typeform-Signature: sha256=<base64 HMAC-SHA256(body)>` under a secret you set on the
+  // webhook (so it is generated when absent). No timestamp: the body's signed `event_id` and its
+  // hash are the marks. https://www.typeform.com/developers/webhooks/secure-your-webhooks/
+  typeform: {
+    secret: "generated",
+    mac: "hmac-sha256",
+    key: "utf8",
+    sig: { header: "typeform-signature", format: { kind: "single", prefix: "sha256=" }, encoding: "base64" },
+    signed: [{ body: true }],
+    dedupe: [{ bodyField: "event_id" }, { bodyHash: true }],
+    eventType: { bodyFields: ["event_type"] },
+    eventTypeSource: "signed",
+    keep: [],
+  },
+  // Paddle Billing: `Paddle-Signature: ts=<s>;h1=<hex>` (`;`-separated; more than one `h1` while a
+  // secret rotates), HMAC-SHA256 of `ts:body` under the destination's secret key (`pdl_ntfset_…`,
+  // issued by Paddle). Paddle's SDKs refuse a `ts` more than 5 seconds off, and so does the relay.
+  // https://developer.paddle.com/webhooks/signature-verification
+  paddle: {
+    secret: "provided",
+    mac: "hmac-sha256",
+    key: "utf8",
+    sig: { header: "paddle-signature", format: { kind: "params", param: "h1", separator: ";" }, encoding: "hex" },
+    signed: [{ sigParam: "ts" }, { text: ":" }, { body: true }],
+    timestamp: { sigParam: "ts", unit: "s", toleranceS: 5 },
+    dedupe: [{ bodyField: "event_id" }, { bodyHash: true }],
+    eventType: { bodyFields: ["event_type"] },
+    eventTypeSource: "signed",
+    keep: [],
+  },
+  // Twitch EventSub: `Twitch-Eventsub-Message-Signature: sha256=<hex HMAC-SHA256(id timestamp body)>`
+  // under the secret you give when subscribing (so it is generated when absent). The message id and
+  // its RFC 3339 timestamp are signed: Twitch says to refuse messages older than 10 minutes and to
+  // dedupe on the id, which a resend keeps. A `webhook_callback_verification` is answered with its
+  // challenge; a `revocation` is stored like any event. The subscription type is read from the
+  // signed body. https://dev.twitch.tv/docs/eventsub/handling-webhook-events/
+  twitch: {
+    secret: "generated",
+    mac: "hmac-sha256",
+    key: "utf8",
+    sig: { header: "twitch-eventsub-message-signature", format: { kind: "single", prefix: "sha256=" }, encoding: "hex" },
+    signed: [{ header: "twitch-eventsub-message-id" }, { header: "twitch-eventsub-message-timestamp" }, { body: true }],
+    timestamp: { header: "twitch-eventsub-message-timestamp", unit: "rfc3339", toleranceS: 600 },
+    dedupe: [{ header: "twitch-eventsub-message-id", signed: true }],
+    eventType: { bodyFields: ["subscription.type"] },
+    eventTypeSource: "signed",
+    keep: [
+      "twitch-eventsub-message-id",
+      "twitch-eventsub-message-type",
+      "twitch-eventsub-message-retry",
+      "twitch-eventsub-subscription-type",
+      "twitch-eventsub-subscription-version",
+    ],
+    handshake: "twitch-verification",
+  },
+  // Zoom: `x-zm-signature: v0=<hex HMAC-SHA256("v0:" ts ":" body)>` under the app's secret token
+  // (issued by Zoom). The timestamp is signed, but Zoom documents no window and doesn't say whether
+  // its retries (up to 85 minutes later) are signed afresh, so it isn't checked: like GitHub, the
+  // body hash is the replay defence and is kept long. `endpoint.url_validation` is answered with
+  // the HMAC of its token. https://developers.zoom.us/docs/api/webhooks/
+  zoom: {
+    secret: "provided",
+    mac: "hmac-sha256",
+    key: "utf8",
+    sig: { header: "x-zm-signature", format: { kind: "single", prefix: "v0=" }, encoding: "hex" },
+    signed: [{ text: "v0:" }, { header: "x-zm-request-timestamp" }, { text: ":" }, { body: true }],
+    dedupe: [{ bodyHash: true }],
+    eventType: { bodyFields: ["event"] },
+    eventTypeSource: "signed",
+    keep: ["x-zm-request-timestamp", "x-zm-trackingid"],
+    handshake: "zoom-url-validation",
+  },
+  // PagerDuty (v3 webhooks): `X-PagerDuty-Signature: v1=<hex HMAC-SHA256(body)>`, comma-separated
+  // while a secret rotates, under the secret PagerDuty issues with the subscription. No timestamp:
+  // the body's signed `event.id` and its hash are the marks.
+  // https://docs.pagerduty.com/developer/verifying-webhook-signatures
+  pagerduty: {
+    secret: "provided",
+    mac: "hmac-sha256",
+    key: "utf8",
+    sig: { header: "x-pagerduty-signature", format: { kind: "params", param: "v1" }, encoding: "hex" },
+    signed: [{ body: true }],
+    dedupe: [{ bodyField: "event.id" }, { bodyHash: true }],
+    eventType: { bodyFields: ["event.event_type"] },
+    eventTypeSource: "signed",
+    keep: ["x-webhook-id", "x-webhook-subscription"],
+  },
   hmac: {
     secret: "generated",
     mac: "hmac-sha256",
@@ -304,6 +423,11 @@ export function parseVerify(raw: unknown): { config: VerifyConfig; secret: strin
   // A token proves only that the sender knows it, and covers no content: a device given the token
   // could check nothing the relay couldn't fake, so devices refuse to verify strict token hooks.
   if (strict && p === "token") field("verify.strict", "A token hook can't be strict: the token signs nothing a device could check.");
+  // Zoom's endpoint check (repeated every 72 hours) is answered with an HMAC under the secret, which
+  // a strict hook's relay doesn't have: Zoom would switch the webhook off.
+  if (strict && spec.handshake === "zoom-url-validation") {
+    field("verify.strict", "A zoom hook can't be strict: Zoom's endpoint check needs the secret at the relay.");
+  }
 
   let secret: string | null = null;
   if (v.secret !== undefined) {
@@ -451,10 +575,10 @@ export function signsTimestamp(config: VerifyConfig): boolean {
   return effectiveSpec(config).timestamp !== undefined;
 }
 
-/** Parses Stripe-style `k=v,k=v` parameters; every value of a repeated key is kept. */
-function sigParams(value: string): Map<string, string[]> {
+/** Parses Stripe-style `k=v,k=v` parameters (or Paddle's `k=v;k=v`); every value of a repeated key is kept. */
+function sigParams(value: string, separator: string): Map<string, string[]> {
   const out = new Map<string, string[]>();
-  for (const part of value.split(",")) {
+  for (const part of value.split(separator)) {
     const eq = part.indexOf("=");
     if (eq <= 0) continue;
     const k = part.slice(0, eq).trim();
@@ -485,7 +609,7 @@ function candidates(spec: Spec, headers: Headers): { sigs: Uint8Array<ArrayBuffe
       .filter((s) => s.startsWith(`${f.version},`))
       .map((s) => s.slice(f.version.length + 1));
   } else {
-    const parsed = sigParams(value);
+    const parsed = sigParams(value, f.separator ?? ",");
     for (const [k, v] of parsed) params.set(k, v);
     raw = parsed.get(f.param) ?? [];
   }
@@ -596,8 +720,36 @@ function timestampMs(spec: Spec, d: Delivery, params: Map<string, string[]>, jso
   } else raw = bodyPath(json(), t.bodyField);
   if (raw === null) return null;
   const s = String(raw);
+  if (t.unit === "rfc3339") return rfc3339Ms(s);
   if (!/^\d{1,16}$/.test(s)) return null;
   return t.unit === "s" ? Number(s) * 1000 : Number(s);
+}
+
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * An RFC 3339 date-time (`2019-11-16T10:11:12.634234626Z`) in Unix ms, the fraction cut to whole
+ * ms; null unless it is exactly that form with every field in range (no leap second). The CLI's
+ * strict verifier parses it the same way.
+ */
+export function rfc3339Ms(s: string): number | null {
+  const m = RFC3339.exec(s);
+  if (!m) return null;
+  const [y, mo, d, h, mi, se] = m.slice(1, 7).map(Number) as [number, number, number, number, number, number];
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1];
+  // From 1970: Date.UTC would read a two-digit year as 19xx, and no provider signs an earlier time.
+  if (y < 1970 || days === undefined || d < 1 || d > days || h > 23 || mi > 59 || se > 59) return null;
+  let offsetMin = 0;
+  const z = m[8]!;
+  if (z !== "Z") {
+    const oh = Number(z.slice(1, 3));
+    const om = Number(z.slice(4, 6));
+    if (oh > 23 || om > 59) return null;
+    offsetMin = (z[0] === "-" ? -1 : 1) * (oh * 60 + om);
+  }
+  const ms = m[7] ? Number(m[7].padEnd(3, "0").slice(0, 3)) : 0;
+  return Date.UTC(y, mo - 1, d, h, mi, se, ms) - offsetMin * 60_000;
 }
 
 function withinTolerance(spec: Spec, ts: number | null | undefined, now: number): boolean {
@@ -749,20 +901,46 @@ async function checkStrict(config: VerifyConfig, d: Delivery): Promise<Verdict> 
   return { ok: true, verified: false, dedupeKeys: await dedupeKeys(spec, d, none, true), eventType: eventType(spec, d, none, true) };
 }
 
+const PLAIN_TEXT = { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };
+
+/** Zoom's `plainToken`: short, and no `:` or `.`, so its HMAC can never be a signature over `v0:…`. */
+const ZOOM_TOKEN = /^[A-Za-z0-9_-]{1,200}$/;
+
 /**
- * Slack's endpoint check (`url_verification`), answered after the delivery verified (or, for a
- * strict hook, passed the edge's checks): the challenge echoed as plain text. Null when this isn't one.
+ * An endpoint check, answered after the delivery verified (or, for a strict hook, passed the edge's
+ * checks) and never stored: it carries no event. Null when this delivery isn't one.
+ * - Slack's `url_verification`: the challenge echoed as plain text.
+ * - Twitch's `webhook_callback_verification` (the message type header, and a challenge in the
+ *   signed body): the same.
+ * - Zoom's `endpoint.url_validation`: `{ plainToken, encryptedToken }`, the token's hex HMAC-SHA256
+ *   under the secret that verified the delivery. The token comes from the signed body, so only
+ *   Zoom can ask, and it can't contain `:`, so the answer is never a valid delivery signature.
  */
-export function handshakeAnswer(config: VerifyConfig, body: Uint8Array): Response | null {
-  if (SPECS[config.preset].handshake !== "slack-url-verification") return null;
-  const v = parseJson(body);
-  if (typeof v !== "object" || v === null || (v as { type?: unknown }).type !== "url_verification") return null;
-  const challenge = (v as { challenge?: unknown }).challenge;
-  if (typeof challenge !== "string" || challenge.length > 200 || !/^[A-Za-z0-9._~-]+$/.test(challenge)) return null;
-  return new Response(challenge, {
-    status: 200,
-    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
-  });
+export async function handshakeAnswer(config: VerifyConfig, secrets: string[], d: Delivery): Promise<Response | null> {
+  const how = SPECS[config.preset].handshake;
+  if (!how) return null;
+  if (how === "twitch-verification" && d.headers.get("twitch-eventsub-message-type") !== "webhook_callback_verification") return null;
+  const v = parseJson(d.body);
+  if (typeof v !== "object" || v === null) return null;
+  const o = v as Record<string, unknown>;
+  if (how === "zoom-url-validation") {
+    if (config.strict || o.event !== "endpoint.url_validation") return null;
+    const token = bodyPath(v, "payload.plainToken");
+    if (typeof token !== "string" || !ZOOM_TOKEN.test(token)) return null;
+    for (const s of secrets) {
+      if (!(await verifyDelivery(config, [s], d)).ok) continue;
+      const encryptedToken = toHex(await hmac("SHA-256", utf8(s), utf8(token)));
+      return new Response(JSON.stringify({ plainToken: token, encryptedToken }), {
+        status: 200,
+        headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+      });
+    }
+    return null;
+  }
+  if (how === "slack-url-verification" && o.type !== "url_verification") return null;
+  const challenge = o.challenge;
+  if (typeof challenge !== "string" || !CHALLENGE.test(challenge)) return null;
+  return new Response(challenge, { status: 200, headers: PLAIN_TEXT });
 }
 
 // `00hooks-origin` and `00hooks-hop` are what a 00hooks runner puts on its own outbound calls, so
@@ -782,6 +960,12 @@ const NEVER_KEPT = new Set([
   "linear-signature",
   "x-shopify-hmac-sha256",
   "x-twilio-signature",
+  "calendly-webhook-signature",
+  "typeform-signature",
+  "paddle-signature",
+  "twitch-eventsub-message-signature",
+  "x-zm-signature",
+  "x-pagerduty-signature",
 ]);
 
 /** A header that carries this hook's signature or token, whatever the preset calls it. */
@@ -844,10 +1028,7 @@ export function metaSubscribe(url: URL): { token: string; challenge: string } | 
 }
 
 export function challengeAnswer(challenge: string): Response {
-  return new Response(challenge, {
-    status: 200,
-    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
-  });
+  return new Response(challenge, { status: 200, headers: PLAIN_TEXT });
 }
 
 /** A fresh verify token: 24 random bytes, base64url (32 characters). */

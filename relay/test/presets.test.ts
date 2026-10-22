@@ -7,11 +7,17 @@ import {
   EVENT_TYPE_SOURCE,
   PRESETS,
   generateSecret,
+  handshakeAnswer,
   keptHeaders,
   parseVerify,
+  relayGeneratesSecret,
+  rfc3339Ms,
+  signsTimestamp,
+  strictHeaders,
   verifyDelivery,
   type VerifyConfig,
 } from "../src/presets.ts";
+import { hmac, toBase64, toHex } from "../src/encoding.ts";
 import { HttpError } from "../src/http.ts";
 import { fromBase64 } from "../src/encoding.ts";
 
@@ -280,9 +286,220 @@ describe("what each preset signs", () => {
       shopify: "claimed",
       twilio: "none",
       meta: "signed",
+      calendly: "signed",
+      typeform: "signed",
+      paddle: "signed",
+      twitch: "signed",
+      zoom: "signed",
+      pagerduty: "signed",
       hmac: "none",
       token: "none",
       unverified: "none",
     });
+  });
+});
+
+// The presets added from the providers' documented schemes (PLAN §4.2). Their known-answer vectors
+// are in fixtures/presets.v1.json; these pin what the vectors can't: marks, types, kept headers,
+// the strict edge and the endpoint checks.
+describe("calendly, typeform, paddle, twitch, zoom, pagerduty", () => {
+  const T = 1_792_233_600;
+  const hex = async (key: string, msg: string) => toHex(await hmac("SHA-256", utf8(key), utf8(msg)));
+  const b64 = async (key: string, msg: string) => toBase64(await hmac("SHA-256", utf8(key), utf8(msg)));
+
+  it("signs a timestamp where the provider does; Zoom's isn't checked (no documented window)", () => {
+    for (const p of ["calendly", "paddle", "twitch"] as const) expect(signsTimestamp({ preset: p }), p).toBe(true);
+    // No checked timestamp: their body-hash marks are kept REPLAY_MARK_DAYS (receive.ts).
+    for (const p of ["typeform", "zoom", "pagerduty"] as const) expect(signsTimestamp({ preset: p }), p).toBe(false);
+  });
+
+  it("generates the secret only where the receiver chooses it", () => {
+    expect(["calendly", "typeform", "twitch"].every((p) => relayGeneratesSecret(p as never))).toBe(true);
+    expect(["paddle", "zoom", "pagerduty"].some((p) => relayGeneratesSecret(p as never))).toBe(false);
+    const bad = (v: unknown) => {
+      try {
+        parseVerify(v);
+      } catch (e) {
+        return e instanceof HttpError ? (e.response.status as number) : 0;
+      }
+      return 200;
+    };
+    for (const p of ["paddle", "zoom", "pagerduty"]) expect(bad({ preset: p }), p).toBe(400);
+    for (const p of ["calendly", "typeform", "twitch"]) expect(bad({ preset: p }), p).toBe(200);
+    // Zoom's endpoint check needs the secret at the relay, so a strict zoom hook could never pass it.
+    expect(bad({ preset: "zoom", strict: true })).toBe(400);
+    expect(bad({ preset: "twitch", strict: true })).toBe(200);
+  });
+
+  it("calendly: dedupes on the body hash, types from the signed body", async () => {
+    const body = '{"event":"invitee.canceled","payload":{}}';
+    const v = await verifyDelivery({ preset: "calendly" }, ["calendly-key"], delivery(body, {
+      "Calendly-Webhook-Signature": `t=${T},v1=${await hex("calendly-key", `${T}.${body}`)}`,
+    }, T * 1000));
+    expect(v).toEqual({ ok: true, verified: true, dedupeKeys: [expect.stringMatching(/^body:[0-9a-f]{64}$/)], eventType: "invitee.canceled" });
+    // A `t` in the future beyond 3 minutes is refused too.
+    const ahead = await verifyDelivery({ preset: "calendly" }, ["calendly-key"], delivery(body, {
+      "Calendly-Webhook-Signature": `t=${T + 181},v1=${await hex("calendly-key", `${T + 181}.${body}`)}`,
+    }, T * 1000));
+    expect(ahead.ok).toBe(false);
+  });
+
+  it("typeform: the signed event_id and the body hash are the marks", async () => {
+    const body = '{"event_id":"01ABC","event_type":"form_response"}';
+    const v = await verifyDelivery({ preset: "typeform" }, ["tf-secret"], delivery(body, { "Typeform-Signature": `sha256=${await b64("tf-secret", body)}` }));
+    expect(v.dedupeKeys).toEqual(["id:01ABC", expect.stringMatching(/^body:/)]);
+    expect(v.eventType).toBe("form_response");
+  });
+
+  it("paddle: the signed event_id is the mark; a lone h1 without ts is refused", async () => {
+    const body = '{"event_id":"evt_01","event_type":"subscription.created"}';
+    const sig = await hex("pdl_ntfset_x", `${T}:${body}`);
+    const v = await verifyDelivery({ preset: "paddle" }, ["pdl_ntfset_x"], delivery(body, { "Paddle-Signature": `ts=${T};h1=${sig}` }, T * 1000));
+    expect(v).toMatchObject({ ok: true, dedupeKeys: ["id:evt_01", expect.stringMatching(/^body:/)], eventType: "subscription.created" });
+    expect((await verifyDelivery({ preset: "paddle" }, ["pdl_ntfset_x"], delivery(body, { "Paddle-Signature": `h1=${sig}` }, T * 1000))).ok).toBe(false);
+    // Two ts values: which one was signed is ambiguous, so neither is taken.
+    const two = `ts=${T};ts=${T + 1};h1=${sig}`;
+    expect((await verifyDelivery({ preset: "paddle" }, ["pdl_ntfset_x"], delivery(body, { "Paddle-Signature": two }, T * 1000))).ok).toBe(false);
+  });
+
+  it("twitch: the signed message id is the mark, a revocation is an ordinary event", async () => {
+    const id = "msg-1";
+    const ts = new Date(T * 1000).toISOString();
+    const body = '{"subscription":{"type":"channel.follow","status":"authorization_revoked"}}';
+    const headers = {
+      "Twitch-Eventsub-Message-Id": id,
+      "Twitch-Eventsub-Message-Timestamp": ts,
+      "Twitch-Eventsub-Message-Signature": `sha256=${await hex("twitch-secret", id + ts + body)}`,
+      "Twitch-Eventsub-Message-Type": "revocation",
+    };
+    const v = await verifyDelivery({ preset: "twitch" }, ["twitch-secret"], delivery(body, headers, T * 1000));
+    expect(v).toEqual({ ok: true, verified: true, dedupeKeys: [`id:${id}`], eventType: "channel.follow" });
+    expect(await handshakeAnswer({ preset: "twitch" }, ["twitch-secret"], delivery(body, headers, T * 1000))).toBeNull();
+    expect(keptHeaders({ preset: "twitch" }, new Headers(headers))).toEqual({
+      "twitch-eventsub-message-id": id,
+      "twitch-eventsub-message-type": "revocation",
+    });
+  });
+
+  it("parses RFC 3339 exactly, and nothing else", () => {
+    expect(rfc3339Ms("2019-11-16T10:11:12.634234626Z")).toBe(Date.UTC(2019, 10, 16, 10, 11, 12, 634));
+    expect(rfc3339Ms("2019-11-16T10:11:12Z")).toBe(Date.UTC(2019, 10, 16, 10, 11, 12));
+    expect(rfc3339Ms("2019-11-16T12:11:12.5+02:00")).toBe(Date.UTC(2019, 10, 16, 10, 11, 12, 500));
+    expect(rfc3339Ms("2019-11-16T05:41:12-04:30")).toBe(Date.UTC(2019, 10, 16, 10, 11, 12));
+    expect(rfc3339Ms("2024-02-29T00:00:00Z")).toBe(Date.UTC(2024, 1, 29));
+    for (const bad of [
+      "2023-02-29T00:00:00Z",
+      "2019-13-01T00:00:00Z",
+      "2019-11-16T24:00:00Z",
+      "2019-11-16T23:59:60Z",
+      "2019-11-16 10:11:12Z",
+      "2019-11-16T10:11:12",
+      "2019-11-16t10:11:12z",
+      "2019-11-16T10:11:12.Z",
+      "2019-11-16T10:11:12.1234567890Z",
+      "0050-01-01T00:00:00Z",
+      "1792233600",
+      " 2019-11-16T10:11:12Z",
+    ]) {
+      expect(rfc3339Ms(bad), bad).toBeNull();
+    }
+  });
+
+  it("strict at the edge: header timestamps (Twitch's RFC 3339, Paddle's ts) are checked, nothing else", async () => {
+    const now = T * 1000;
+    const twitch = (ts: string) =>
+      verifyDelivery({ preset: "twitch", strict: true }, [], delivery("{}", {
+        "Twitch-Eventsub-Message-Id": "m",
+        "Twitch-Eventsub-Message-Timestamp": ts,
+        "Twitch-Eventsub-Message-Signature": `sha256=${"ab".repeat(32)}`,
+      }, now));
+    expect((await twitch(new Date(now - 599_000).toISOString())).ok).toBe(true);
+    expect((await twitch(new Date(now - 601_000).toISOString())).ok).toBe(false);
+    expect((await twitch("yesterday")).ok).toBe(false);
+    const paddle = (ts: number) =>
+      verifyDelivery({ preset: "paddle", strict: true }, [], delivery("{}", { "Paddle-Signature": `ts=${ts};h1=${"ab".repeat(32)}` }, now));
+    expect(await paddle(T)).toMatchObject({ ok: true, verified: false, eventType: null });
+    expect((await paddle(T - 6)).ok).toBe(false);
+    // Sealed for the device: the signature and every signed header.
+    expect(
+      strictHeaders({ preset: "twitch", strict: true }, new Headers({
+        "Twitch-Eventsub-Message-Id": "m",
+        "Twitch-Eventsub-Message-Timestamp": "t",
+        "Twitch-Eventsub-Message-Signature": "sha256=00",
+      })),
+    ).toEqual({ "twitch-eventsub-message-id": "m", "twitch-eventsub-message-timestamp": "t", "twitch-eventsub-message-signature": "sha256=00" });
+  });
+
+  it("never keeps the new presets' signature headers", () => {
+    const h = new Headers({
+      "Calendly-Webhook-Signature": "t=1,v1=00",
+      "Typeform-Signature": "sha256=AA==",
+      "Paddle-Signature": "ts=1;h1=00",
+      "Twitch-Eventsub-Message-Signature": "sha256=00",
+      "x-zm-signature": "v0=00",
+      "X-PagerDuty-Signature": "v1=00",
+      "x-zm-request-timestamp": "1",
+      "X-Webhook-Id": "w1",
+    });
+    for (const preset of ["calendly", "typeform", "paddle", "twitch", "zoom", "pagerduty"] as const) {
+      const kept = keptHeaders({ preset }, h);
+      for (const name of Object.keys(kept)) expect(name, preset).not.toMatch(/signature/);
+    }
+    expect(keptHeaders({ preset: "zoom" }, h)).toEqual({ "x-zm-request-timestamp": "1" });
+    expect(keptHeaders({ preset: "pagerduty" }, h)).toEqual({ "x-webhook-id": "w1" });
+  });
+
+  it("pagerduty: the signed event.id is the mark", async () => {
+    const body = '{"event":{"id":"e-1","event_type":"incident.triggered"}}';
+    const v = await verifyDelivery({ preset: "pagerduty" }, ["pd"], delivery(body, { "X-PagerDuty-Signature": `v1=${await hex("pd", body)}` }));
+    expect(v).toMatchObject({ ok: true, dedupeKeys: ["id:e-1", expect.stringMatching(/^body:/)], eventType: "incident.triggered" });
+  });
+});
+
+describe("endpoint checks (handshakeAnswer)", () => {
+  const T = 1_792_233_600;
+  const hex = async (key: string, msg: string) => toHex(await hmac("SHA-256", utf8(key), utf8(msg)));
+
+  it("slack: echoes a safe challenge, ignores anything else", async () => {
+    const ok = await handshakeAnswer({ preset: "slack" }, [], delivery('{"type":"url_verification","challenge":"abc-123"}', {}));
+    expect(ok?.headers.get("Content-Type")).toContain("text/plain");
+    expect(await ok?.text()).toBe("abc-123");
+    expect(await handshakeAnswer({ preset: "slack" }, [], delivery('{"type":"url_verification","challenge":"<b>"}', {}))).toBeNull();
+    expect(await handshakeAnswer({ preset: "slack" }, [], delivery('{"type":"event_callback","challenge":"abc"}', {}))).toBeNull();
+    expect(await handshakeAnswer({ preset: "github" }, [], delivery('{"type":"url_verification","challenge":"abc"}', {}))).toBeNull();
+  });
+
+  it("twitch: only a webhook_callback_verification with a safe challenge", async () => {
+    const body = '{"challenge":"pogchamp-kappa-360noscope-vohiyo","subscription":{"type":"channel.follow"}}';
+    const verification = { "Twitch-Eventsub-Message-Type": "webhook_callback_verification" };
+    const ok = await handshakeAnswer({ preset: "twitch" }, [], delivery(body, verification));
+    expect(ok?.status).toBe(200);
+    expect(ok?.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
+    expect(await ok?.text()).toBe("pogchamp-kappa-360noscope-vohiyo");
+    expect(await handshakeAnswer({ preset: "twitch" }, [], delivery(body, { "Twitch-Eventsub-Message-Type": "notification" }))).toBeNull();
+    expect(await handshakeAnswer({ preset: "twitch" }, [], delivery(body, {}))).toBeNull();
+    const long = JSON.stringify({ challenge: "a".repeat(201) });
+    expect(await handshakeAnswer({ preset: "twitch" }, [], delivery(long, verification))).toBeNull();
+    expect(await handshakeAnswer({ preset: "twitch" }, [], delivery('{"challenge":"a\nb"}', verification))).toBeNull();
+  });
+
+  it("zoom: the token's HMAC under the secret that verified, from a signed body only", async () => {
+    const secret = "zoom-secret-token";
+    const body = '{"payload":{"plainToken":"qgg8vlvZRS6UYooatFL8Aw"},"event_ts":1654503849680,"event":"endpoint.url_validation"}';
+    const headers = { "x-zm-request-timestamp": String(T), "x-zm-signature": `v0=${await hex(secret, `v0:${T}:${body}`)}` };
+    // The previous secret first: the answer uses the one that verified.
+    const res = await handshakeAnswer({ preset: "zoom" }, ["an-older-secret", secret], delivery(body, headers));
+    expect(res?.headers.get("Content-Type")).toContain("application/json");
+    expect(await res?.json()).toEqual({ plainToken: "qgg8vlvZRS6UYooatFL8Aw", encryptedToken: await hex(secret, "qgg8vlvZRS6UYooatFL8Aw") });
+    // Signed with another secret: no answer (receive.ts has refused it already; this is the backstop).
+    expect(await handshakeAnswer({ preset: "zoom" }, ["another"], delivery(body, headers))).toBeNull();
+    // A token that could make the answer a signature over "v0:…" is never answered.
+    const colon = '{"payload":{"plainToken":"v0:1:{}"},"event":"endpoint.url_validation"}';
+    const colonHeaders = { "x-zm-request-timestamp": String(T), "x-zm-signature": `v0=${await hex(secret, `v0:${T}:${colon}`)}` };
+    expect(await handshakeAnswer({ preset: "zoom" }, [secret], delivery(colon, colonHeaders))).toBeNull();
+    // An ordinary event isn't a check.
+    const event = '{"event":"meeting.started","payload":{"plainToken":"x"}}';
+    const eventHeaders = { "x-zm-request-timestamp": String(T), "x-zm-signature": `v0=${await hex(secret, `v0:${T}:${event}`)}` };
+    expect(await handshakeAnswer({ preset: "zoom" }, [secret], delivery(event, eventHeaders))).toBeNull();
   });
 });

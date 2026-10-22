@@ -67,15 +67,18 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   const config = JSON.parse(hook.verify) as VerifyConfig;
   // The URL as the sender reached it: Workers don't rewrite it, and Twilio signs it.
   const url = request.url;
-  const verdict = await verifyDelivery(config, await currentSecrets(env, hook, now), { body, headers: request.headers, now, url });
+  const secrets = await currentSecrets(env, hook, now);
+  const delivery = { body, headers: request.headers, now, url };
+  const verdict = await verifyDelivery(config, secrets, delivery);
   if (!verdict.ok) {
     // Counted at the edge, not written per request: a public URL's junk never wakes the account.
     countAtEdge(env, ctx, hook.account_id, "verify.failed", hookId);
     return error(401, "signature", "The delivery's signature doesn't verify.");
   }
   const stub = accountStub(env, hook.account_id);
-  // An endpoint check (Slack's url_verification) is answered, not stored: it carries no event.
-  const handshake = handshakeAnswer(config, body);
+  // An endpoint check (Slack's url_verification, Twitch's, Zoom's) is answered, not stored: it
+  // carries no event.
+  const handshake = await handshakeAnswer(config, secrets, delivery);
   if (handshake) return handshake;
 
   const strict = config.strict === true;

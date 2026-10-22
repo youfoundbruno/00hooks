@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const hmac = (alg, key, data, enc) => createHmac(alg, key).update(data).digest(enc);
-const T = 1792233600; // 2026-10-17T00:00:00Z, the vectors' "now" unless a published one says otherwise
+const T = 1792233600; // 2026-10-17T10:40:00Z, the vectors' "now" unless a published one says otherwise
 const vectors = [];
 const add = (v) => vectors.push(v);
 
@@ -311,6 +311,229 @@ add({
   now: T * 1000,
   headers: { "x-hub-signature-256": `sha256=${hmac("sha256", "another-app-secret", metaBody, "hex")}` },
   body: metaBody,
+  expect: { ok: false },
+});
+
+// ── calendly ── https://developer.calendly.com/api-docs/overview/webhooks/webhook-signatures
+// (scheme: `t=<s>,v1=<hex HMAC-SHA256(t "." body)>`, `t` within 3 minutes; Calendly publishes no fixed vector)
+const caSecret = "5mEzn9C-00hooks-vector-signing-key";
+const caBody = '{"created_at":"2026-10-17T00:00:00.000000Z","created_by":"https://api.calendly.com/users/AAAA","event":"invitee.created","payload":{"uri":"https://api.calendly.com/scheduled_events/BBBB/invitees/CCCC"}}';
+const caSig = hmac("sha256", caSecret, `${T}.${caBody}`, "hex");
+add({
+  name: "calendly: t= and v1, within 3 minutes",
+  source: "computed (Calendly's documented scheme)",
+  verify: { preset: "calendly" },
+  secrets: [caSecret],
+  now: (T + 170) * 1000,
+  headers: { "calendly-webhook-signature": `t=${T},v1=${caSig}` },
+  body: caBody,
+  expect: { ok: true, eventType: "invitee.created" },
+});
+add({
+  name: "calendly: outside 180 s",
+  source: "computed, late",
+  verify: { preset: "calendly" },
+  secrets: [caSecret],
+  now: (T + 181) * 1000,
+  headers: { "calendly-webhook-signature": `t=${T},v1=${caSig}` },
+  body: caBody,
+  expect: { ok: false },
+});
+add({
+  name: "calendly: a new t= with the old signature",
+  source: "computed, tampered",
+  verify: { preset: "calendly" },
+  secrets: [caSecret],
+  now: (T + 1) * 1000,
+  headers: { "calendly-webhook-signature": `t=${T + 1},v1=${caSig}` },
+  body: caBody,
+  expect: { ok: false },
+});
+
+// ── typeform ── https://www.typeform.com/developers/webhooks/secure-your-webhooks/
+// (scheme: `Typeform-Signature: sha256=<base64 HMAC-SHA256(body)>`; Typeform publishes no fixed vector)
+const tfSecret = "typeform-00hooks-vector-secret";
+const tfBody = '{"event_id":"01HXYZ00HOOKSVECTOR0000000","event_type":"form_response","form_response":{"form_id":"lT4Z3j","answers":[]}}';
+add({
+  name: "typeform: sha256= and the base64 HMAC of the body",
+  source: "computed (Typeform's documented scheme)",
+  verify: { preset: "typeform" },
+  secrets: [tfSecret],
+  now: T * 1000,
+  headers: { "typeform-signature": `sha256=${hmac("sha256", tfSecret, tfBody, "base64")}` },
+  body: tfBody,
+  expect: { ok: true, eventType: "form_response" },
+});
+add({
+  name: "typeform: the hex form of the right HMAC is refused",
+  source: "computed, wrong encoding",
+  verify: { preset: "typeform" },
+  secrets: [tfSecret],
+  now: T * 1000,
+  headers: { "typeform-signature": `sha256=${hmac("sha256", tfSecret, tfBody, "hex")}` },
+  body: tfBody,
+  expect: { ok: false },
+});
+
+// ── paddle ── https://developer.paddle.com/webhooks/signature-verification
+// (scheme: `Paddle-Signature: ts=<s>;h1=<hex HMAC-SHA256(ts ":" body)>`, `ts` within 5 s, under the
+// `pdl_ntfset_` secret key; the documented header has no body to go with it, so the vector is computed)
+const pdSecret = "pdl_ntfset_01gkpjp8bkm3tm53kdgkx6sms7_00hooksVectorSecretKey00";
+const pdBody = '{"event_id":"evt_01h8bzakzx3hm2fmen703n5q45","event_type":"transaction.completed","occurred_at":"2026-10-17T00:00:00.000000Z","notification_id":"ntf_01h8bzam1z32agrxjwhjgqk8w6","data":{"id":"txn_01h8bz"}}';
+const pdSig = hmac("sha256", pdSecret, `${T}:${pdBody}`, "hex");
+add({
+  name: "paddle: ts= and two h1 (the second is the right one, as during a rotation), 5 s late",
+  source: "computed (Paddle's documented scheme)",
+  verify: { preset: "paddle" },
+  secrets: [pdSecret],
+  now: (T + 5) * 1000,
+  headers: { "paddle-signature": `ts=${T};h1=${"0".repeat(64)};h1=${pdSig}` },
+  body: pdBody,
+  expect: { ok: true, eventType: "transaction.completed" },
+});
+add({
+  name: "paddle: 6 s late",
+  source: "computed, late",
+  verify: { preset: "paddle" },
+  secrets: [pdSecret],
+  now: (T + 6) * 1000,
+  headers: { "paddle-signature": `ts=${T};h1=${pdSig}` },
+  body: pdBody,
+  expect: { ok: false },
+});
+add({
+  name: "paddle: Stripe's comma instead of Paddle's semicolon",
+  source: "computed, malformed",
+  verify: { preset: "paddle" },
+  secrets: [pdSecret],
+  now: T * 1000,
+  headers: { "paddle-signature": `ts=${T},h1=${pdSig}` },
+  body: pdBody,
+  expect: { ok: false },
+});
+
+// ── twitch ── https://dev.twitch.tv/docs/eventsub/handling-webhook-events/
+// (scheme: `sha256=<hex HMAC-SHA256(message id, timestamp, body)>`, the RFC 3339 timestamp at most
+// 10 minutes old; Twitch publishes no fixed vector)
+const twSecret = "twitch-00hooks-vector-secret";
+const twId = "e76c6bd4-55c9-4987-8304-da1588d8988b";
+const twTs = new Date(T * 1000).toISOString().replace(".000Z", ".634234626Z"); // 2026-10-17T10:40:00.634234626Z
+const twBody = '{"subscription":{"id":"f1c2a387-161a-49f9-a165-0f21d7a4e1c4","status":"enabled","type":"channel.follow","version":"2","condition":{"broadcaster_user_id":"12826"}},"event":{"user_id":"1337","broadcaster_user_id":"12826"}}';
+const twSig = `sha256=${hmac("sha256", twSecret, twId + twTs + twBody, "hex")}`;
+const twHeaders = { "twitch-eventsub-message-id": twId, "twitch-eventsub-message-timestamp": twTs, "twitch-eventsub-message-signature": twSig, "twitch-eventsub-message-type": "notification" };
+add({
+  name: "twitch: a notification, 9 minutes later",
+  source: "computed (Twitch's documented scheme)",
+  verify: { preset: "twitch" },
+  secrets: [twSecret],
+  now: T * 1000 + 9 * 60_000,
+  headers: twHeaders,
+  body: twBody,
+  expect: { ok: true, eventType: "channel.follow" },
+});
+add({
+  name: "twitch: more than 10 minutes old",
+  source: "computed, late",
+  verify: { preset: "twitch" },
+  secrets: [twSecret],
+  now: T * 1000 + 634 + 600_001,
+  headers: twHeaders,
+  body: twBody,
+  expect: { ok: false },
+});
+add({
+  name: "twitch: another message id",
+  source: "computed, tampered",
+  verify: { preset: "twitch" },
+  secrets: [twSecret],
+  now: T * 1000,
+  headers: { ...twHeaders, "twitch-eventsub-message-id": "another" },
+  body: twBody,
+  expect: { ok: false },
+});
+const twOffsetTs = new Date((T + 2 * 3600) * 1000).toISOString().replace(".000Z", "+02:00"); // T, two hours east
+add({
+  name: "twitch: a timestamp with an offset",
+  source: "computed (RFC 3339)",
+  verify: { preset: "twitch" },
+  secrets: [twSecret],
+  now: T * 1000 + 60_000,
+  headers: { ...twHeaders, "twitch-eventsub-message-timestamp": twOffsetTs, "twitch-eventsub-message-signature": `sha256=${hmac("sha256", twSecret, twId + twOffsetTs + twBody, "hex")}` },
+  body: twBody,
+  expect: { ok: true, eventType: "channel.follow" },
+});
+const twBadTs = "2026-02-30T00:00:00Z";
+add({
+  name: "twitch: a signed but impossible date",
+  source: "computed, malformed",
+  verify: { preset: "twitch" },
+  secrets: [twSecret],
+  now: T * 1000,
+  headers: { ...twHeaders, "twitch-eventsub-message-timestamp": twBadTs, "twitch-eventsub-message-signature": `sha256=${hmac("sha256", twSecret, twId + twBadTs + twBody, "hex")}` },
+  body: twBody,
+  expect: { ok: false },
+});
+
+// ── zoom ── https://developers.zoom.us/docs/api/webhooks/
+// (scheme: `x-zm-signature: v0=<hex HMAC-SHA256("v0:" ts ":" body)>`; the published example
+// signature isn't hex, so the vectors are computed. No window is documented, so none is checked.)
+const zmSecret = "zoom-00hooks-vector-secret-token";
+const zmBody = '{"event":"meeting.started","event_ts":1792233600000,"payload":{"account_id":"AAAA","object":{"id":"1234567890"}}}';
+const zmSigned = (ts, body, secret = zmSecret) => `v0=${hmac("sha256", secret, `v0:${ts}:${body}`, "hex")}`;
+add({
+  name: "zoom: a meeting event, a day after its timestamp",
+  source: "computed (Zoom's documented scheme)",
+  verify: { preset: "zoom" },
+  secrets: [zmSecret],
+  now: (T + 86_400) * 1000,
+  headers: { "x-zm-request-timestamp": String(T), "x-zm-signature": zmSigned(T, zmBody) },
+  body: zmBody,
+  expect: { ok: true, eventType: "meeting.started" },
+});
+add({
+  name: "zoom: another timestamp with the same signature",
+  source: "computed, tampered",
+  verify: { preset: "zoom" },
+  secrets: [zmSecret],
+  now: T * 1000,
+  headers: { "x-zm-request-timestamp": String(T + 1), "x-zm-signature": zmSigned(T, zmBody) },
+  body: zmBody,
+  expect: { ok: false },
+});
+const zmValidation = '{"payload":{"plainToken":"qgg8vlvZRS6UYooatFL8Aw"},"event_ts":1654503849680,"event":"endpoint.url_validation"}';
+add({
+  name: "zoom: the endpoint check verifies like any delivery",
+  source: "computed (Zoom's documented validation body)",
+  verify: { preset: "zoom" },
+  secrets: [zmSecret],
+  now: T * 1000,
+  headers: { "x-zm-request-timestamp": String(T), "x-zm-signature": zmSigned(T, zmValidation) },
+  body: zmValidation,
+  expect: { ok: true, eventType: "endpoint.url_validation" },
+});
+
+// ── pagerduty ── https://docs.pagerduty.com/developer/verifying-webhook-signatures
+// (scheme: `X-PagerDuty-Signature: v1=<hex HMAC-SHA256(body)>[,v1=…]`; PagerDuty publishes no fixed vector)
+const pgSecret = "pagerduty-00hooks-vector-secret";
+const pgBody = '{"event":{"id":"5ac64822-4adc-4fda-ade0-410becf0de4f","event_type":"incident.priority_updated","resource_type":"incident","occurred_at":"2020-10-02T18:45:22.169Z","data":{"id":"PGR0VU2"}}}';
+add({
+  name: "pagerduty: two v1 (the second is the right one, as during a rotation)",
+  source: "computed (PagerDuty's documented scheme)",
+  verify: { preset: "pagerduty" },
+  secrets: [pgSecret],
+  now: T * 1000,
+  headers: { "x-pagerduty-signature": `v1=${"f0".repeat(32)},v1=${hmac("sha256", pgSecret, pgBody, "hex")}`, "x-webhook-id": "d1" },
+  body: pgBody,
+  expect: { ok: true, eventType: "incident.priority_updated" },
+});
+add({
+  name: "pagerduty: one changed byte",
+  source: "computed, tampered",
+  verify: { preset: "pagerduty" },
+  secrets: [pgSecret],
+  now: T * 1000,
+  headers: { "x-pagerduty-signature": `v1=${hmac("sha256", pgSecret, pgBody, "hex")}` },
+  body: pgBody.replace("PGR0VU2", "PGR0VU3"),
   expect: { ok: false },
 });
 
