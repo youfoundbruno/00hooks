@@ -295,52 +295,60 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
     let mut batch_clock = tokio::time::interval(Duration::from_secs(1));
     batch_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut connected_before = false;
-    let result = loop {
-        let next = tokio::select! {
-            _ = &mut ctrl_c => break Ok(()),
-            _ = terminated!() => break Ok(()),
-            _ = batch_clock.tick() => {
-                let runs = tokio::select! {
-                    r = runner.tick() => r,
-                    _ = &mut ctrl_c => break Ok(()),
-                    _ = terminated!() => break Ok(()),
-                };
-                flush(&mut runner);
-                show_batch_runs(&runs);
-                continue;
-            }
-            Some((answer_at, ask)) = rx.recv() => {
-                // A signal stops a replay half-way too: its command is killed with the run, and
-                // the run is reported as interrupted on the next start.
-                let done = tokio::select! {
-                    r = async {
-                        match &ask {
-                            mailbox::Ask::Replay(event) => runner.replay(event).await.map(|r| (Some(r), None)),
-                            mailbox::Ask::Flush(name) => runner.flush_batch(name).await.map(|r| (Some(r), None)),
-                            mailbox::Ask::Drop(name) => runner.drop_batch(name).map(|b| {
-                                (None, Some(dropped_note(name, &b)))
-                            }),
-                        }
-                    } => r,
-                    _ = &mut ctrl_c => break Ok(()),
-                    _ = terminated!() => break Ok(()),
-                };
-                let answer = match done {
-                    Ok((record, note)) => {
-                        if let Some(r) = &record {
-                            for l in describe_run(r) { err(l); }
-                        }
-                        mailbox::Answer { record, error: None, note }
+    let result = 'outer: loop {
+        // The stream's `next` lives on across ticks and requests: cancelling it would start a
+        // connection being opened, or a reconnect's wait, over again.
+        let next = {
+            let pending = sub.next();
+            tokio::pin!(pending);
+            loop {
+                tokio::select! {
+                    _ = &mut ctrl_c => break 'outer Ok(()),
+                    _ = terminated!() => break 'outer Ok(()),
+                    _ = batch_clock.tick() => {
+                        let runs = tokio::select! {
+                            r = runner.tick() => r,
+                            _ = &mut ctrl_c => break 'outer Ok(()),
+                            _ = terminated!() => break 'outer Ok(()),
+                        };
+                        flush(&mut runner);
+                        show_batch_runs(&runs);
+                        continue;
                     }
-                    Err(e) => mailbox::Answer { record: None, error: Some(e.to_string()), note: None },
-                };
-                if let Err(e) = mailbox::answer(&answer_at, &answer) {
-                    err(format!("Couldn't answer a replay request: {e}"));
+                    Some((answer_at, ask)) = rx.recv() => {
+                        // A signal stops a replay half-way too: its command is killed with the run, and
+                        // the run is reported as interrupted on the next start.
+                        let done = tokio::select! {
+                            r = async {
+                                match &ask {
+                                    mailbox::Ask::Replay(event) => runner.replay(event).await.map(|r| (Some(r), None)),
+                                    mailbox::Ask::Flush(name) => runner.flush_batch(name).await.map(|r| (Some(r), None)),
+                                    mailbox::Ask::Drop(name) => runner.drop_batch(name).map(|b| {
+                                        (None, Some(dropped_note(name, &b)))
+                                    }),
+                                }
+                            } => r,
+                            _ = &mut ctrl_c => break 'outer Ok(()),
+                            _ = terminated!() => break 'outer Ok(()),
+                        };
+                        let answer = match done {
+                            Ok((record, note)) => {
+                                if let Some(r) = &record {
+                                    for l in describe_run(r) { err(l); }
+                                }
+                                mailbox::Answer { record, error: None, note }
+                            }
+                            Err(e) => mailbox::Answer { record: None, error: Some(e.to_string()), note: None },
+                        };
+                        if let Err(e) = mailbox::answer(&answer_at, &answer) {
+                            err(format!("Couldn't answer a replay request: {e}"));
+                        }
+                        flush(&mut runner);
+                        continue;
+                    }
+                    next = &mut pending => break next,
                 }
-                flush(&mut runner);
-                continue;
             }
-            next = sub.next() => next,
         };
         let ev = match next {
             None => break Ok(()),
