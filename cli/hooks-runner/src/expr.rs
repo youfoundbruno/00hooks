@@ -284,6 +284,13 @@ impl Parser<'_> {
                     self.pos -= 1;
                     return self.err(m);
                 }
+                if path::is_batch_root(p.root()) {
+                    self.pos -= 1;
+                    return self.err(format!(
+                        "`{p}`: only_if tests each event before it joins a batch, so it can't \
+                         read `batch` or `events` (the actions can)"
+                    ));
+                }
                 self.paths.push(p.clone());
                 Ok(Expr::Path(p))
             }
@@ -625,6 +632,13 @@ mod tests {
         assert!(Filter::parse("\"open").is_err());
         assert!(Filter::parse("").is_err());
         assert!(Filter::parse("event.nope == 1").is_err());
+        // A filter tests one event: a batch's fields aren't there yet.
+        let e = Filter::parse("batch.count > 3").unwrap_err();
+        assert!(
+            e.message.contains("each event before it joins a batch"),
+            "{e}"
+        );
+        assert!(Filter::parse("events[0].payload.a == 1").is_err());
     }
 
     #[test]
