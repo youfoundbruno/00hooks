@@ -363,6 +363,38 @@ impl Client {
         Ok(r.device)
     }
 
+    /// `PATCH /v1/devices/<id>` `{ "tags" }`: replace a node device's tags (an empty list clears
+    /// them). Each tag is checked as the relay checks it ([`crate::valid_tag`]) before the call.
+    pub async fn set_device_tags(&self, id: &str, tags: &[String]) -> Result<DeviceInfo> {
+        check_id("dev_", id)?;
+        if tags.len() > crate::MAX_DEVICE_TAGS {
+            return Err(Error::Invalid(format!(
+                "a device carries at most {} tags",
+                crate::MAX_DEVICE_TAGS
+            )));
+        }
+        if let Some(bad) = tags.iter().find(|t| !crate::valid_tag(t)) {
+            return Err(Error::Invalid(format!(
+                "{bad:?} isn't a tag: 1 to {} lowercase letters, digits, '.', '_' or '-', \
+                 starting and ending with a letter or digit",
+                crate::MAX_TAG_LEN
+            )));
+        }
+        #[derive(serde::Deserialize)]
+        struct R {
+            device: DeviceInfo,
+        }
+        let r: R = self
+            .call(
+                Method::PATCH,
+                &format!("/v1/devices/{id}"),
+                Some(json!({ "tags": tags })),
+                Auth::Signed,
+            )
+            .await?;
+        Ok(r.device)
+    }
+
     /// `PUT /v1/devices/<id>/seal-key`: this device's sealing key; returns its kid.
     pub async fn set_seal_key(&self, seal_key: &str) -> Result<String> {
         #[derive(serde::Deserialize)]
