@@ -268,9 +268,42 @@ automations:
 
 ## Costs and limits
 
+### What it costs on Cloudflare (estimate, prices as of 2026-10-22)
+
+You need the Workers Paid plan: $5 a month per Cloudflare account, which includes allowances. What
+one webhook uses, read from the code and counted in the test runtime:
+
+| Per webhook | 1 device | Each extra device adds |
+| --- | --- | --- |
+| Worker requests (the delivery, the ack) | 2 | 1 |
+| Durable Object requests | 3 | 2 |
+| SQLite rows written | about 36 | about 11 |
+| Worker CPU | about 2 to 5 ms | about 1 ms |
+| Durable Object awake time | about 15 ms (we plan with 0.1 s) | a few ms |
+
+- **The $5 covers about 300,000 webhooks a month** to one device (about 140,000 to three). Durable
+  Object requests (1 million included) run out first; rows written (50 million) next, at about
+  1.4 million webhooks.
+- **After that, about $37 per extra million webhooks** to one device, almost all of it rows written
+  ($1 per million). Each extra device adds about $12 per million. For example: 100,000 a month,
+  $5; 1 million, about $5.30; 2 million, about $28; 10 million to 3 devices, about $555.
+- **Idle connections cost fractions of a cent a month.** The Worker writes the heartbeats, and the
+  Durable Object answers the Worker's pings without waking, so it sleeps between events and isn't
+  billed while it does. Measure yours with [`relay/docs/IDLE-COST.md`](relay/docs/IDLE-COST.md).
+- **Caveats:** big bodies take storage for each device's sealed copy while they wait (up to 7 days);
+  many devices multiply the writes (send a hook only to the device that needs it); long offline
+  periods cost little, but events older than 7 days are dropped. Other Workers on the account share
+  the allowances.
+
+The full arithmetic, the assumptions, a formula and what each count comes from are in
+[`relay/docs/COSTS.md`](relay/docs/COSTS.md). Prices are from Cloudflare's
+[pricing page](https://developers.cloudflare.com/workers/platform/pricing/); check it, and your own
+dashboard, before relying on these numbers.
+
+### Limits
+
 - **Cloudflare:** the Workers Paid plan (Durable Objects with SQLite storage, and the Rate Limiting
-  binding, need it). An idle stream is designed to cost close to nothing; measure yours with
-  [`relay/docs/IDLE-COST.md`](relay/docs/IDLE-COST.md).
+  binding, need it).
 - **Bodies:** 1 MiB per delivery by default, up to 1.75 MiB per hook (they live in the Durable
   Object's rows).
 - **Rates:** 60 deliveries per 10 s per hook and 600 per 10 s per sending address at the edge, by
