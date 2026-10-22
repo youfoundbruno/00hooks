@@ -15,7 +15,7 @@ accounts come with the Overblast Plan (§4.6). The CLI works on its own, and its
 embedded by other programs.
 
 Status: phases 0 to 3, 5 and 6 are built (§7): the relay (hooks, presets, replay protection,
-sealing, device pairing, API keys, the audit, the edge screen, one-device delivery, static
+sealing, device pairing, API keys, the audit, the edge screen, recipients (devices and tags), static
 responses, signed test events, a one-command installer), the CLI (`login`, `devices`,
 `hooks`, `keys`, `audit`, `listen`, `doctor`, `run`, `automations`, `kinds`, `runs`, `replay`,
 `service`, `secrets`, `screen`, `test`, `relay status`), the runner, the `hooks-screen` crate, the runner's interface
@@ -138,9 +138,15 @@ Three rules hold it together:
 - **Deploys drop connections** (Cloudflare closes every socket on a code update), so resume isn't an
   edge case: it's exercised on every release.
 - **Several devices**: each has its own cursor, and every hook is delivered to all of the account's
-  devices, unless the hook names **one device** (`deliverTo`, *the Mac in the office*): then only
-  that device gets an envelope, the others' streams pass the event by, and an automation doesn't run
-  twice. A revoked target sends the hook back to every device rather than to nobody.
+  devices, unless the hook names its **recipients** (built): a list of devices (*the Mac in the
+  office*), the devices carrying a tag (*office-macs*), or both. Then only they get an envelope
+  (held events too), the others' streams pass the event by, and an automation doesn't run where it
+  shouldn't. Recipients are decided as each event arrives, so a device tagged later gets the events
+  from then on, never older ones (the relay kept no plaintext to seal them again). An event waits
+  for every recipient's acknowledgement, and only theirs. A revoked device leaves the lists; a hook
+  whose target matches nobody is **paused** (`no_recipient`: deliveries get a retryable `503`, the
+  devices a `limit` notice) rather than sealed to nobody or sent to every device, and resumes as soon
+  as a device matches again or the target changes. `deliverTo`, the one-device form, still works.
 
 **How it stays cheap while always on.** The account's Durable Object talks to each device over a
 *hibernatable WebSocket*, so it costs nothing while nothing happens; the Worker in front bridges that
@@ -446,8 +452,8 @@ AI actions, only in a program that embeds the runner and runs agents:
 ```
 
 `00hooks test <hook>` sends a signed sample event (§3.3), `00hooks devices rename` renames a
-device, `00hooks hooks deliver-to` and `00hooks hooks response` set a hook's one device and static
-response, and `00hooks relay status` checks a relay (`/v1/info`).
+device and `00hooks devices tag`/`untag` labels it, `00hooks hooks deliver-to <hook> [device…]
+[--tag T…] [--all]` sets a hook's recipients, `00hooks hooks response` its static response, and `00hooks relay status` checks a relay (`/v1/info`).
 
 Written in Rust: one binary, for macOS and Linux. Its core (`hooks-client`: pair, stream, unseal,
 ack) is a library crate, as are the runner and the screen, so another program can embed them
