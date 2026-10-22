@@ -135,6 +135,13 @@ export class SseBridge {
         this.push(`event: hook-change\ndata: ${JSON.stringify(change)}\n\n`);
         break;
       }
+      case "limit": {
+        // A plan's limit is biting (PROTOCOL §6): no `id`, like a hook change, never acknowledged.
+        if (this.overflowed) break;
+        const { t: _t, ...limit } = msg;
+        this.push(`event: limit\ndata: ${JSON.stringify(limit)}\n\n`);
+        break;
+      }
       case "more":
         this.awaitingMore = true;
         if (this.queue.length === 0) this.drained();
@@ -203,7 +210,8 @@ export class SseBridge {
       return;
     }
     this.push(text);
-    this.lastWritten = seq;
+    // A gap said after the event that followed it (PROTOCOL §6) never moves the resume point back.
+    this.lastWritten = Math.max(this.lastWritten, seq);
   }
 
   private heartbeat(): void {

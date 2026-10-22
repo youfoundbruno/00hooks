@@ -7,6 +7,9 @@ import { parseSealKey, sealKid, sealTo } from "./envelope.ts";
 import { HttpError, error, invalid, json, notFound, parseJsonObject, unavailable } from "./http.ts";
 import { clientKey } from "./ip.ts";
 import { pepperedHash } from "./seal.ts";
+import { verifyEntitlement, workspaceConflict, workspaceTaken, type Entitlement } from "./entitlements.ts";
+import { resolvePlan } from "./plans.ts";
+import { accountPlan } from "./hooks.ts";
 
 export const ENROLMENT_TTL_MS = 10 * 60_000;
 export const ENROLMENT_MAX_FAILURES = 5;
@@ -18,6 +21,11 @@ export const DEFAULT_MAX_DEVICES = 10;
 export function maxDevices(env: Env): number {
   const n = Number(env.ACCOUNT_MAX_DEVICES);
   return Number.isInteger(n) && n > 0 ? n : DEFAULT_MAX_DEVICES;
+}
+
+/** The account's device cap: its plan's (PROTOCOL §2a), which is `ACCOUNT_MAX_DEVICES` on `default`. */
+async function deviceCap(env: Env, accountId: string): Promise<number | null> {
+  return (await accountPlan(env, accountId, Date.now())).limits.devices;
 }
 
 const tooManyDevices = () =>
@@ -67,13 +75,13 @@ export async function sealKeyField(v: unknown): Promise<{ text: string; raw: Uin
 
 type SealField = { text: string; raw: Uint8Array; kid: string } | null;
 
-/** The statement that inserts a node device, only while the account is under its device cap. */
-function insertDevice(env: Env, deviceId: string, accountId: string, name: string, key: string, seal: SealField, now: number) {
+/** The statement that inserts a node device, only while the account is under its device cap (null: none). */
+function insertDevice(env: Env, deviceId: string, accountId: string, name: string, key: string, seal: SealField, now: number, cap: number | null) {
   return env.DB.prepare(
     `INSERT INTO devices (id, account_id, name, public_key, created_at, seal_key, seal_kid)
      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-     WHERE (SELECT count(*) FROM devices WHERE account_id = ?2 AND kind = 'device' AND revoked_at IS NULL) < ?8`,
-  ).bind(deviceId, accountId, name, key, now, seal?.text ?? null, seal?.kid ?? null, maxDevices(env));
+     WHERE ?8 IS NULL OR (SELECT count(*) FROM devices WHERE account_id = ?2 AND kind = 'device' AND revoked_at IS NULL) < ?8`,
+  ).bind(deviceId, accountId, name, key, now, seal?.text ?? null, seal?.kid ?? null, cap);
 }
 
 /**
@@ -94,7 +102,7 @@ async function registerDevice(env: Env, accountId: string, deviceId: string, nam
 /** Inserts a device in D1 (within the account's device cap), then registers it with the account's object. */
 async function addDevice(env: Env, accountId: string, name: string, key: string, seal: SealField, now: number, actor: string | null): Promise<string> {
   const deviceId = newId("dev");
-  const r = await insertDevice(env, deviceId, accountId, name, key, seal, now)
+  const r = await insertDevice(env, deviceId, accountId, name, key, seal, now, await deviceCap(env, accountId))
     .run()
     .catch((e: unknown) => {
       if (keyTaken(e)) throw new HttpError(error(409, "conflict", "That public key already belongs to a device."));
@@ -111,7 +119,22 @@ export async function createAccount(request: Request, env: Env, body: Uint8Array
   if (!(await env.SIGNUP_IP_LIMIT.limit({ key: clientKey(request) })).success) {
     return error(429, "rate_limited", "Too many signups from this address; try again later.", {}, { "Retry-After": "60" });
   }
-  if (env.SIGNUP_TOKEN) {
+  let early: Record<string, unknown> | null = null;
+  try {
+    early = parseJsonObject(body);
+  } catch {
+    early = null;
+  }
+  const now = Date.now();
+  // An Overblast entitlement for this device's key (PROTOCOL §2b) takes the place of the signup
+  // token: the account is created on the entitled plan.
+  let entitlement: Entitlement | null = null;
+  if (early && early.entitlement !== undefined) {
+    entitlement = await verifyEntitlement(env, early.entitlement, now);
+    if (!("dev" in entitlement.sub) || entitlement.sub.dev !== early.publicKey) {
+      return error(403, "forbidden", "This entitlement is for another device.");
+    }
+  } else if (env.SIGNUP_TOKEN) {
     const auth = request.headers.get("Authorization") ?? "";
     if (!constantTimeEqualStrings(auth, `Bearer ${env.SIGNUP_TOKEN}`)) {
       return error(401, "unauthorized", "Signing up on this relay needs its signup token.");
@@ -120,29 +143,43 @@ export async function createAccount(request: Request, env: Env, body: Uint8Array
     // Signups fail closed: a relay without a signup token takes none unless OPEN_SIGNUP=1 says so.
     return error(403, "forbidden", "This relay doesn't take signups.");
   }
-  const input = parseJsonObject(body);
+  const input = early ?? parseJsonObject(body);
   const name = deviceName(input.deviceName);
   const key = await publicKey(env, input.publicKey);
   const seal = await sealKeyField(input.sealKey);
-  const now = Date.now();
   const accountId = newId("acc");
   const deviceId = newId("dev");
+  const planCols = entitlement
+    ? { plan: entitlement.plan, plan_until: entitlement.exp * 1000, limits: entitlement.limits ? JSON.stringify(entitlement.limits) : null }
+    : { plan: null, plan_until: null, limits: null };
+  const cap = resolvePlan(env, planCols, now).limits.devices;
   // One transaction: the account never exists without its first device. A lost race on the public
-  // key answers 409, as the check above does.
+  // key answers 409, as the check above does; so does a workspace already linked to an account.
   try {
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO accounts (id, created_at) VALUES (?, ?)").bind(accountId, now),
-      insertDevice(env, deviceId, accountId, name, key, seal, now),
+      env.DB.prepare("INSERT INTO accounts (id, created_at, plan, plan_until, entitlement_ws, limits) VALUES (?, ?, ?, ?, ?, ?)").bind(
+        accountId,
+        now,
+        planCols.plan,
+        planCols.plan_until,
+        entitlement?.ws ?? null,
+        planCols.limits,
+      ),
+      insertDevice(env, deviceId, accountId, name, key, seal, now, cap),
     ]);
   } catch (e) {
     if (keyTaken(e)) return error(409, "conflict", "That public key already belongs to a device.");
+    if (workspaceTaken(e)) throw workspaceConflict();
     throw e;
   }
   await registerDevice(env, accountId, deviceId, name, seal, null, [
     env.DB.prepare("DELETE FROM devices WHERE id = ?").bind(deviceId),
     env.DB.prepare("DELETE FROM accounts WHERE id = ?").bind(accountId),
   ]);
-  return json({ accountId, deviceId }, 201);
+  if (entitlement) {
+    await accountStub(env, accountId).audit({ kind: "account.plan", actor: deviceId, subject: accountId, name: entitlement.plan });
+  }
+  return json({ accountId, deviceId, ...(entitlement ? { plan: entitlement.plan, planUntil: entitlement.exp * 1000 } : {}) }, 201);
 }
 
 const CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -169,7 +206,8 @@ export async function createEnrolment(env: Env, caller: Caller): Promise<Respons
   const n = await env.DB.prepare("SELECT count(*) AS n FROM devices WHERE account_id = ? AND kind = 'device' AND revoked_at IS NULL")
     .bind(caller.accountId)
     .first<{ n: number }>();
-  if ((n?.n ?? 0) >= maxDevices(env)) throw tooManyDevices();
+  const cap = await deviceCap(env, caller.accountId);
+  if (cap !== null && (n?.n ?? 0) >= cap) throw tooManyDevices();
   const code = newCode();
   const now = Date.now();
   const expiresAt = now + ENROLMENT_TTL_MS;
