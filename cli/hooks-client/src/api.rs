@@ -345,6 +345,24 @@ impl Client {
             .await
     }
 
+    /// `PATCH /v1/devices/<id>`: rename a device (1 to 100 characters, trimmed).
+    pub async fn rename_device(&self, id: &str, name: &str) -> Result<DeviceInfo> {
+        check_id("dev_", id)?;
+        #[derive(serde::Deserialize)]
+        struct R {
+            device: DeviceInfo,
+        }
+        let r: R = self
+            .call(
+                Method::PATCH,
+                &format!("/v1/devices/{id}"),
+                Some(json!({ "name": name.trim() })),
+                Auth::Signed,
+            )
+            .await?;
+        Ok(r.device)
+    }
+
     /// `PUT /v1/devices/<id>/seal-key`: this device's sealing key; returns its kid.
     pub async fn set_seal_key(&self, seal_key: &str) -> Result<String> {
         #[derive(serde::Deserialize)]
@@ -484,6 +502,14 @@ impl Client {
             Auth::Signed,
         )
         .await
+    }
+
+    /// `POST /v1/test/<hookId>`: the relay sends the hook a signed sample event of kind
+    /// `00hooks.test`, and says what the delivery got.
+    pub async fn test_hook(&self, id: &str) -> Result<TestSent> {
+        check_id("hk_", id)?;
+        self.call(Method::POST, &format!("/v1/test/{id}"), None, Auth::Signed)
+            .await
     }
 
     /// `DELETE /v1/hooks/<id>`.

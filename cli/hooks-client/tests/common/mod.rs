@@ -109,6 +109,17 @@ pub struct State {
     pub hook_changes: Vec<Value>,
     /// How many of `hook_changes` each device has been sent.
     pub hook_changes_sent: HashMap<String, usize>,
+    /// Names given with `PATCH /v1/devices/<id>` (a device without one is called "test").
+    pub device_names: HashMap<String, String>,
+    /// More entries for `GET /v1/devices` (other devices and phones of the account).
+    pub other_devices: Vec<Value>,
+    /// Every `PATCH /v1/hooks/<id>` body, in order.
+    pub hook_patches: Vec<Value>,
+    /// What `POST /v1/test/<id>` answers: `(status, body)`; by default `200` with a delivery that
+    /// was accepted, and `409` for a strict or `standard-webhooks-ed25519` hook, as the relay does.
+    pub test_answer: Option<(u16, Value)>,
+    /// Fields `/v1/info` adds or replaces (an object; `null` adds none).
+    pub info_extra: Value,
     next_device: usize,
 }
 
@@ -336,12 +347,15 @@ async fn handle(st: Arc<Mutex<State>>, req: Request<Incoming>) -> Result<Resp, I
     }
     let resp = match route {
         ("GET", "/v1/info") => {
-            let offset = st.lock().unwrap().clock_offset_ms;
-            json_resp(
-                StatusCode::OK,
-                json!({ "version": "mock", "protocol": 2, "protocols": [2], "signupOpen": true,
-                        "relayKey": relay_key_b64(), "serverTime": now_ms() + offset }),
-            )
+            let s = st.lock().unwrap();
+            let mut info = json!({ "version": "mock", "protocol": 2, "protocols": [2], "signupOpen": true,
+                                   "relayKey": relay_key_b64(), "serverTime": now_ms() + s.clock_offset_ms });
+            if let (Some(o), Some(extra)) = (info.as_object_mut(), s.info_extra.as_object()) {
+                for (k, v) in extra {
+                    o.insert(k.clone(), v.clone());
+                }
+            }
+            json_resp(StatusCode::OK, info)
         }
         ("POST", "/v1/accounts")
             if st.lock().unwrap().signup_token.as_ref().is_some_and(|t| {
@@ -424,17 +438,119 @@ fn signed_route(
 ) -> Resp {
     match (parts.method.as_str(), parts.uri.path()) {
         ("GET", "/v1/devices") => {
-            let kid = st
-                .lock()
-                .unwrap()
-                .seal_keys
+            let s = st.lock().unwrap();
+            let kid = s.seal_keys.get(device).map(|k| seal_kid(k));
+            let name = s
+                .device_names
                 .get(device)
-                .map(|k| seal_kid(k));
-            json_resp(
-                StatusCode::OK,
-                json!({ "devices": [{ "id": device, "name": "test", "createdAt": 1,
-                                      "lastSeenAt": null, "current": true, "sealKid": kid }] }),
-            )
+                .cloned()
+                .unwrap_or_else(|| "test".into());
+            let mut devices = vec![json!({ "id": device, "name": name, "createdAt": 1,
+                                           "lastSeenAt": null, "current": true, "sealKid": kid })];
+            devices.extend(s.other_devices.iter().cloned());
+            json_resp(StatusCode::OK, json!({ "devices": devices }))
+        }
+        ("PATCH", path) if path.starts_with("/v1/devices/") => {
+            let id = path["/v1/devices/".len()..].to_string();
+            let v: Value = serde_json::from_slice(body).unwrap_or_default();
+            let name = v["name"].as_str().unwrap_or("").trim().to_string();
+            if name.is_empty() || name.chars().count() > 100 {
+                return json_resp(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"invalid","message":"A name is 1 to 100 characters.","field":"name"}),
+                );
+            }
+            let mut s = st.lock().unwrap();
+            if id == device {
+                s.device_names.insert(id.clone(), name.clone());
+                let kid = s.seal_keys.get(device).map(|k| seal_kid(k));
+                return json_resp(
+                    StatusCode::OK,
+                    json!({ "device": { "id": id, "name": name, "createdAt": 1, "lastSeenAt": null,
+                                        "current": true, "sealKid": kid } }),
+                );
+            }
+            match s.other_devices.iter_mut().find(|d| d["id"] == id.as_str()) {
+                Some(d) => {
+                    d["name"] = json!(name);
+                    let d = d.clone();
+                    json_resp(StatusCode::OK, json!({ "device": d }))
+                }
+                None => json_resp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error":"not_found","message":"Nothing is here."}),
+                ),
+            }
+        }
+        ("PATCH", path) if path.starts_with("/v1/hooks/") => {
+            let id = path["/v1/hooks/".len()..].to_string();
+            let v: Value = serde_json::from_slice(body).unwrap_or_default();
+            let mut s = st.lock().unwrap();
+            s.hook_patches.push(v.clone());
+            if let Some(to) = v.get("deliverTo").and_then(Value::as_str) {
+                let sealed = s.seal_keys.contains_key(to)
+                    || s.other_devices
+                        .iter()
+                        .any(|d| d["id"] == to && d["kind"] != "phone" && !d["sealKid"].is_null());
+                if !sealed {
+                    return json_resp(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error":"invalid","message":"Not an active device of this account with a sealing key.","field":"deliverTo"}),
+                    );
+                }
+            }
+            if let Some(r) = v.get("response").filter(|r| !r.is_null()) {
+                let ok = r["status"]
+                    .as_u64()
+                    .is_some_and(|n| (200..300).contains(&n));
+                if !ok {
+                    return json_resp(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error":"invalid","message":"A success status, 200 to 299.","field":"response.status"}),
+                    );
+                }
+            }
+            let Some(h) = s.hooks.iter_mut().find(|h| h["id"] == id.as_str()) else {
+                return json_resp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error":"not_found","message":"Nothing is here."}),
+                );
+            };
+            if let (Some(o), Some(p)) = (h.as_object_mut(), v.as_object()) {
+                for (k, x) in p {
+                    o.insert(k.clone(), x.clone());
+                }
+            }
+            let h = h.clone();
+            json_resp(StatusCode::OK, h)
+        }
+        ("POST", path) if path.starts_with("/v1/test/") => {
+            let id = &path["/v1/test/".len()..];
+            let s = st.lock().unwrap();
+            let Some(h) = s.hooks.iter().find(|h| h["id"] == id) else {
+                return json_resp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error":"not_found","message":"Nothing is here."}),
+                );
+            };
+            if h["verify"]["strict"] == json!(true) {
+                return json_resp(
+                    StatusCode::CONFLICT,
+                    json!({"error":"conflict","message":"This hook is strict: its secret is on your devices, so the relay can't sign a test event."}),
+                );
+            }
+            if h["verify"]["preset"] == "standard-webhooks-ed25519" {
+                return json_resp(
+                    StatusCode::CONFLICT,
+                    json!({"error":"conflict","message":"The relay holds only this hook's public key, so it can't sign a test event."}),
+                );
+            }
+            let (status, answer) = s.test_answer.clone().unwrap_or((
+                200,
+                json!({ "status": 200, "answer": { "received": "evt_test1" },
+                        "eventType": "00hooks.test" }),
+            ));
+            json_resp(StatusCode::from_u16(status).unwrap(), answer)
         }
         ("PUT", path) if path.starts_with("/v1/devices/") && path.ends_with("/seal-key") => {
             let v: Value = serde_json::from_slice(body).unwrap_or_default();

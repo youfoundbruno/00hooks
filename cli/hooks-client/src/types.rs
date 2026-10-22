@@ -29,6 +29,64 @@ pub struct Info {
     /// Optional hosted extras the relay announces (PROTOCOL §2): data, shown only when present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extras: Vec<Extra>,
+    /// Phone links and push (PROTOCOL §2, §10), when the relay carries them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<PhoneInfo>,
+    /// Fields of a newer relay, kept so `00hooks relay status --json` shows them.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `/v1/info`'s `phone`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushInfo>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `/v1/info`'s `phone.push`: whether the relay can wake a phone, and on which platforms.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PushInfo {
+    #[serde(default)]
+    pub available: bool,
+    /// The APNs environment (`sandbox` or `production`), when it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    /// Per platform, from relays that announce it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<PushPlatforms>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `phone.push.platforms`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PushPlatforms {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ios: Option<PlatformPush>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android: Option<PlatformPush>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// One platform's push.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformPush {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// `/v1/info`'s `screen`.
@@ -158,8 +216,49 @@ pub struct Hook {
     /// The offline notice, when one is set (PROTOCOL §4a).
     #[serde(default)]
     pub offline_notice: Option<OfflineNotice>,
+    /// The only device this hook's events are delivered to; `None`: every device (and what an
+    /// older relay, which doesn't send the field, does).
+    #[serde(default)]
+    pub deliver_to: Option<String>,
+    /// The static answer the relay sends the provider for each accepted delivery, when set.
+    #[serde(default)]
+    pub response: Option<HookResponse>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// A hook's static answer to the provider (`Hook.response`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookResponse {
+    /// 200 to 299.
+    pub status: u16,
+    /// `text/plain`, `application/json`, `application/xml` or `text/xml`.
+    pub content_type: String,
+    /// At most 4096 bytes of UTF-8.
+    pub body: String,
+}
+
+/// The content types a hook's static answer may have.
+pub const RESPONSE_CONTENT_TYPES: &[&str] = &[
+    "text/plain",
+    "application/json",
+    "application/xml",
+    "text/xml",
+];
+/// The longest body a hook's static answer may have, in bytes.
+pub const RESPONSE_MAX_BODY: usize = 4096;
+
+/// `POST /v1/test/<hookId>`: what the signed test delivery got.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestSent {
+    /// The HTTP status the delivery was answered with.
+    pub status: u16,
+    /// The delivery's JSON answer, or `None` when it wasn't JSON.
+    #[serde(default)]
+    pub answer: Option<Value>,
+    pub event_type: String,
 }
 
 /// `POST /v1/hooks` → `{ hook, url, secret?, verifyToken? }`. The secret appears here only.
@@ -194,6 +293,12 @@ pub struct HookPatch {
     /// `Some(None)` clears the offline notice; `Some(Some(_))` sets it (PROTOCOL §4a).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offline_notice: Option<Option<OfflineNotice>>,
+    /// `Some(None)`: deliver to every device; `Some(Some(id))`: only to that one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deliver_to: Option<Option<String>>,
+    /// `Some(None)` clears the static answer; `Some(Some(_))` sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<Option<HookResponse>>,
 }
 
 /// A hook's offline notice (PROTOCOL §4a): what the relay answers, at most once a day per sender,
@@ -525,5 +630,69 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(serde_json::to_string(&p).unwrap(), r#"{"enabled":false}"#);
+        let p = HookPatch {
+            deliver_to: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_string(&p).unwrap(), r#"{"deliverTo":null}"#);
+        let p = HookPatch {
+            deliver_to: Some(Some("dev_1".into())),
+            response: Some(Some(HookResponse {
+                status: 200,
+                content_type: "text/plain".into(),
+                body: "ok".into(),
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&p).unwrap(),
+            r#"{"deliverTo":"dev_1","response":{"status":200,"contentType":"text/plain","body":"ok"}}"#
+        );
+        let p = HookPatch {
+            response: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_string(&p).unwrap(), r#"{"response":null}"#);
+    }
+
+    #[test]
+    fn hooks_read_deliver_to_and_response_and_tolerate_their_absence() {
+        let base = serde_json::json!({
+            "id": "hk_1", "name": "n", "url": "https://r.example/h/hk_1", "enabled": true,
+            "verify": {"preset": "github"}, "maxBodyBytes": 1, "createdAt": 0
+        });
+        let old: Hook = serde_json::from_value(base.clone()).unwrap();
+        assert!(old.deliver_to.is_none() && old.response.is_none());
+        let mut v = base;
+        v["deliverTo"] = "dev_9".into();
+        v["response"] =
+            serde_json::json!({"status": 202, "contentType": "application/json", "body": "{}"});
+        let h: Hook = serde_json::from_value(v).unwrap();
+        assert_eq!(h.deliver_to.as_deref(), Some("dev_9"));
+        assert_eq!(h.response.unwrap().status, 202);
+        assert!(h.extra.is_empty());
+    }
+
+    #[test]
+    fn info_reads_push_platforms_and_keeps_new_fields() {
+        let v = serde_json::json!({
+            "version": "1", "protocol": 2, "protocols": [2], "signupOpen": false,
+            "relayKey": "k", "serverTime": 5,
+            "phone": {"protocol": 1, "push": {"available": true, "environment": "production",
+                      "platforms": {"ios": {"available": true, "environment": "production"},
+                                    "android": {"available": false}}}},
+            "later": {"x": 1}
+        });
+        let i: Info = serde_json::from_value(v.clone()).unwrap();
+        let push = i.phone.as_ref().unwrap().push.as_ref().unwrap();
+        let p = push.platforms.as_ref().unwrap();
+        assert!(p.ios.as_ref().unwrap().available && !p.android.as_ref().unwrap().available);
+        assert_eq!(serde_json::to_value(&i).unwrap(), v, "nothing lost");
+        // An older relay: no phone, no protocols.
+        let i: Info = serde_json::from_value(serde_json::json!({
+            "version": "0", "protocol": 2, "signupOpen": true, "serverTime": 1
+        }))
+        .unwrap();
+        assert!(i.phone.is_none() && i.serves(2));
     }
 }

@@ -3,7 +3,10 @@
 use std::io::BufRead;
 
 use clap::ValueEnum;
-use hooks_client::{Hook, HookPatch, StrictHook};
+use hooks_client::{
+    Error, Hook, HookPatch, HookResponse, RESPONSE_CONTENT_TYPES, RESPONSE_MAX_BODY, StrictHook,
+    TestSent,
+};
 use serde_json::{Map, Value, json};
 
 use crate::account::confirm;
@@ -388,6 +391,7 @@ pub async fn list(as_json: bool) -> CliResult {
         "ID".into(),
         "PRESET".into(),
         "STATE".into(),
+        "DELIVERED TO".into(),
         "LAST EVENT".into(),
     ]];
     for h in &hooks {
@@ -396,6 +400,7 @@ pub async fn list(as_json: bool) -> CliResult {
             h.id.clone(),
             sanitize(&h.verify.preset, false),
             state(h).into(),
+            delivered_to(h),
             h.last_event_at
                 .map(date_time)
                 .unwrap_or_else(|| "never".into()),
@@ -424,6 +429,8 @@ pub fn describe(h: &Hook) -> String {
     }
     rows.extend([
         vec!["State".into(), state(h).into()],
+        vec!["Delivered to".into(), delivered_to(h)],
+        vec!["Answers".into(), answers(h)],
         vec!["Max body".into(), size(h.max_body_bytes as usize)],
         vec!["Created".into(), date_time(h.created_at)],
         vec![
@@ -434,6 +441,27 @@ pub fn describe(h: &Hook) -> String {
         ],
     ]);
     table(&rows)
+}
+
+/// Which devices get a hook's events.
+fn delivered_to(h: &Hook) -> String {
+    match &h.deliver_to {
+        Some(id) => sanitize(id, false),
+        None => "every device".into(),
+    }
+}
+
+/// What the relay answers the provider for an accepted delivery.
+fn answers(h: &Hook) -> String {
+    match &h.response {
+        Some(r) => format!(
+            "{} {}, {}",
+            r.status,
+            sanitize(&r.content_type, false),
+            size(r.body.len())
+        ),
+        None => "the default ({\"received\": …})".into(),
+    }
 }
 
 pub async fn show(which: String, as_json: bool) -> CliResult {
@@ -688,6 +716,168 @@ pub async fn set_enabled(which: String, enabled: bool) -> CliResult {
     Ok(())
 }
 
+/// `hooks deliver-to`: deliver a hook's events only to one device (`Some`), or to all (`None`).
+pub async fn deliver_to(which: String, device: Option<String>) -> CliResult {
+    let ctx = Ctx::load()?;
+    let h = resolve(&ctx, &which).await?;
+    let target = match &device {
+        Some(d) => Some(crate::account::resolve_device(&ctx, d).await?),
+        None => None,
+    };
+    let patch = HookPatch {
+        deliver_to: Some(target.as_ref().map(|d| d.id.clone())),
+        ..Default::default()
+    };
+    let h = ctx
+        .client
+        .patch_hook(&h.id, &patch)
+        .await
+        .map_err(|e| ctx.explain(e))?;
+    let name = sanitize(&h.name, false);
+    match target {
+        Some(d) => println!(
+            "{name}'s events now go only to {} ({}): its automations run on that computer \
+             alone. `00hooks hooks deliver-to {} --all` sends them to every device again.",
+            sanitize(&d.name, false),
+            d.id,
+            h.id
+        ),
+        None => println!("{name}'s events now go to every device."),
+    }
+    Ok(())
+}
+
+/// A static answer, checked as the relay checks it, so a mistake is said before the call.
+pub fn response_spec(status: u16, content_type: &str, body: String) -> CliResult<HookResponse> {
+    if !(200..=299).contains(&status) {
+        return Err(Failure::new(
+            "--status must be a success status, 200 to 299 (the provider would retry anything else).",
+        ));
+    }
+    if !RESPONSE_CONTENT_TYPES.contains(&content_type) {
+        return Err(Failure::new(format!(
+            "--content-type must be one of {}.",
+            RESPONSE_CONTENT_TYPES.join(", ")
+        )));
+    }
+    if body.len() > RESPONSE_MAX_BODY {
+        return Err(Failure::new(format!(
+            "The body is {}; an answer's body is at most {}.",
+            size(body.len()),
+            size(RESPONSE_MAX_BODY)
+        )));
+    }
+    Ok(HookResponse {
+        status,
+        content_type: content_type.to_string(),
+        body,
+    })
+}
+
+/// `hooks response`: set (`Some`) or clear (`None`) the static answer the relay gives the provider.
+pub async fn set_response(which: String, response: Option<HookResponse>) -> CliResult {
+    let ctx = Ctx::load()?;
+    let h = resolve(&ctx, &which).await?;
+    let patch = HookPatch {
+        response: Some(response),
+        ..Default::default()
+    };
+    let h = ctx
+        .client
+        .patch_hook(&h.id, &patch)
+        .await
+        .map_err(|e| ctx.explain(e))?;
+    let name = sanitize(&h.name, false);
+    match &h.response {
+        Some(_) => println!(
+            "{name} now answers each accepted delivery with {}.",
+            answers(&h)
+        ),
+        None => println!("{name} answers deliveries with the default again."),
+    }
+    Ok(())
+}
+
+/// `00hooks test`: have the relay send a hook a signed test event, and say what it got.
+pub async fn test(which: String, as_json: bool) -> CliResult {
+    let ctx = Ctx::load()?;
+    let h = resolve(&ctx, &which).await?;
+    let name = sanitize(&h.name, false);
+    let sent = match ctx.client.test_hook(&h.id).await {
+        Ok(s) => s,
+        Err(Error::Api {
+            status: 409,
+            message,
+            ..
+        }) => {
+            let why = if message.is_empty() {
+                "The relay can't sign a test event for this hook.".to_string()
+            } else {
+                sentence(&sanitize(&message, false))
+            };
+            return Err(Failure::new(format!(
+                "{why} Send a test from the provider's dashboard instead (most have a \"send test \
+                 webhook\" or \"redeliver\" button); `00hooks listen` shows it arrive."
+            )));
+        }
+        Err(e) => return Err(ctx.explain(e)),
+    };
+    if as_json {
+        println!("{}", json_line(&sent));
+    } else {
+        println!("{}", describe_test(&name, &sent));
+    }
+    if (200..300).contains(&sent.status) {
+        Ok(())
+    } else {
+        Err(Failure {
+            message: String::new(),
+            code: 1,
+        })
+    }
+}
+
+/// What a test delivery got, in a sentence.
+pub fn describe_test(name: &str, t: &TestSent) -> String {
+    let head = format!("Sent a signed test event to {name}");
+    let answer = t.answer.as_ref();
+    let field = |k: &str| answer.and_then(|a| a.get(k));
+    let says = |k: &str| field(k) == Some(&Value::Bool(true));
+    let status = t.status;
+    if !(200..300).contains(&status) {
+        let why = field("message")
+            .or_else(|| field("error"))
+            .and_then(Value::as_str)
+            .map(|m| format!(": {}", sanitize(m, false)))
+            .unwrap_or_default();
+        return format!("{head}: refused with status {status}{why}.");
+    }
+    if says("duplicate") {
+        return format!(
+            "{head}: the relay took it for a duplicate (status {status}), so it wasn't stored again."
+        );
+    }
+    if says("held") {
+        return format!(
+            "{head}: held by the screen (status {status}). `00hooks screen held` lists it."
+        );
+    }
+    if says("dropped") {
+        return format!("{head}: dropped by the screen (status {status}).");
+    }
+    let tail = format!(
+        "It runs only automations that list the kind {}.",
+        hooks_runner::TEST_KIND
+    );
+    match field("received").and_then(Value::as_str) {
+        Some(id) => format!(
+            "{head}: accepted as {} (status {status}). {tail}",
+            sanitize(id, false)
+        ),
+        None => format!("{head}: accepted (status {status}). {tail}"),
+    }
+}
+
 pub async fn delete(which: String, yes: bool) -> CliResult {
     let ctx = Ctx::load()?;
     let h = resolve(&ctx, &which).await?;
@@ -924,6 +1114,69 @@ mod tests {
             ..Default::default()
         };
         assert!(verify_spec(Preset::Token, &alg).is_err());
+    }
+
+    #[test]
+    fn a_static_answer_is_checked_before_it_is_sent() {
+        assert!(response_spec(200, "text/plain", "ok".into()).is_ok());
+        assert!(response_spec(299, "text/xml", "<x/>".into()).is_ok());
+        assert!(
+            response_spec(302, "text/plain", "".into())
+                .unwrap_err()
+                .message
+                .contains("200 to 299")
+        );
+        assert!(
+            response_spec(200, "text/html", "".into())
+                .unwrap_err()
+                .message
+                .contains("application/json")
+        );
+        assert!(response_spec(200, "text/plain", "x".repeat(4096)).is_ok());
+        assert!(response_spec(200, "text/plain", "x".repeat(4097)).is_err());
+    }
+
+    #[test]
+    fn a_test_delivery_is_described() {
+        let t = |status: u16, answer: Value| TestSent {
+            status,
+            answer: (!answer.is_null()).then_some(answer),
+            event_type: "00hooks.test".into(),
+        };
+        assert_eq!(
+            describe_test("ci", &t(200, json!({"received": "evt_1"}))),
+            "Sent a signed test event to ci: accepted as evt_1 (status 200). It runs only \
+             automations that list the kind 00hooks.test."
+        );
+        assert!(describe_test("ci", &t(200, json!({"duplicate": true}))).contains("duplicate"));
+        assert!(describe_test("ci", &t(200, json!({"held": true}))).contains("held by the screen"));
+        assert!(describe_test("ci", &t(200, json!({"dropped": true}))).contains("dropped"));
+        assert!(describe_test("ci", &t(202, Value::Null)).contains("accepted (status 202)"));
+        assert_eq!(
+            describe_test(
+                "ci",
+                &t(429, json!({"error": "quota", "message": "full\u{1b}[2J"}))
+            ),
+            "Sent a signed test event to ci: refused with status 429: full[2J."
+        );
+    }
+
+    #[test]
+    fn hooks_show_where_they_deliver_and_what_they_answer() {
+        let mut h = hook(json!({"preset": "github"}));
+        let text = describe(&h);
+        assert!(text.contains("every device") && text.contains("the default"));
+        h.deliver_to = Some("dev_2".into());
+        h.response = Some(HookResponse {
+            status: 200,
+            content_type: "text/xml".into(),
+            body: "<Response/>".into(),
+        });
+        let text = describe(&h);
+        assert!(
+            text.contains("dev_2") && text.contains("200 text/xml, 11 B"),
+            "{text}"
+        );
     }
 
     #[test]
