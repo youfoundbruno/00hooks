@@ -272,9 +272,11 @@ rather than guess.
 
 The account's own plan is `accounts.plan` (none: `default`), with an optional per-account override
 of its limits; a plan that came with an entitlement (§2b) also has an end. The token buckets and
-daily counters are rows of the account's object, read and written in the same step that decides a
-delivery: exact, with no timer (the object still hibernates). A delivery is counted only once it is
-taken: a duplicate, a refusal or a full backlog spends nothing.
+daily counters are rows of the account's object, read in the step that decides a delivery and
+written with the delivery itself, in one transaction; deliveries decided but still being sealed
+count as taken meanwhile. Exact, with no timer (the object still hibernates). A delivery is counted
+only once it is taken: a duplicate, a refusal or a full backlog spends nothing, and neither does one
+lost before it was stored.
 
 `GET /v1/account` (signed by a device; never an API key) →
 

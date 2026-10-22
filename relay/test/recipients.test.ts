@@ -385,10 +385,11 @@ describe("schema 7", () => {
         };
       });
       expect(after).toEqual({
-        schema: 7,
+        // Through 7 to 8, which drops the route index nothing reads any more.
+        schema: 8,
         events: [{ recipients: from === 6 ? JSON.stringify([b.deviceId]) : null }, { recipients: null }],
         tags: 3,
-        index: 1,
+        index: 0,
       });
       // The object works on: tags route, the migrated event is acknowledged per recipient.
       await tag(a, a.deviceId, ["t"]);

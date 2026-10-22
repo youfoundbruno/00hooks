@@ -31,10 +31,10 @@ each event on its own. "Each extra device" is what one more recipient adds.
 
 | | 1 device | Each extra device | Where |
 | --- | --- | --- | --- |
-| Worker requests | 2 | +1 | the delivery (`POST /h/<id>`, `src/receive.ts:110`) and the ack (`POST /v1/ack`, `src/index.ts:250`, `src/stream.ts:73`). The event reaches the device over its open SSE stream: no request (`deliverLive`, `src/account-object.ts:2011`; `src/bridge.ts:99`) |
+| Worker requests | 2 | +1 | the delivery (`POST /h/<id>`, `src/receive.ts:110`) and the ack (`POST /v1/ack`, `src/index.ts:250`, `src/stream.ts:73`). The event reaches the device over its open SSE stream: no request (`deliverLive`, `src/account-object.ts:2176`; `src/bridge.ts:99`) |
 | Durable Object requests | 3 | +2 | `append` (`src/receive.ts:205`); the ack's signed-request nonce (`spendNonce`, `src/auth.ts:142`) and the ack itself (`src/stream.ts:79`). The event goes to the bridge as an outgoing WebSocket message: free |
-| SQLite rows written | ~36 | ~+11 | measured, below |
-| SQLite rows read | ~110 | ~+55 | measured, below |
+| SQLite rows written | ~18 | ~+7 | measured, below |
+| SQLite rows read | ~120 | ~+55 | measured, below |
 | D1 rows read | ~3 | +1 | the hook and its account in one query (`src/receive.ts:48`), the device on the ack (`src/auth.ts:100`) |
 | D1 rows written | ~0 | 0 | `last_event_at` at most once a minute per hook (`src/receive.ts:265`), `last_seen_at` at most once a minute per device (`src/auth.ts:145`). The plan's daily counters live in the Durable Object, not D1 |
 | Worker CPU | ~2 to 5 ms | ~+1 ms | estimate: HMAC check, keyed hashes of the dedupe keys (`src/receive.ts:199`), JSON; the ack's Ed25519 check (`src/auth.ts:134`) |
@@ -42,37 +42,69 @@ each event on its own. "Each extra device" is what one more recipient adds.
 
 ### Rows written, measured
 
-Counted with the Durable Object's own per-query `rowsWritten` and `rowsRead` counters, in the test
-runtime (workerd, the same SQLite schema), on one GitHub delivery after a warm-up event:
+Counted with the Durable Object's own per-query `rowsWritten` and `rowsRead` counters (and its
+`setAlarm` calls), in the test runtime (workerd, the same SQLite schema), on one GitHub delivery
+after a warm-up event. `test/costs.ts` runs the scenarios and `test/costs.test.ts` holds them to
+upper bounds, so a change that raises them fails; `pnpm vitest run test/costs.test.ts
+--reporter=verbose` prints them. An insert counts its row and each index entry; in this runtime a
+delete counts one row.
 
 | Step | Rows | Code |
 | --- | --- | --- |
-| `append`: today's counters (account, hook) | 2 | `addDaily`, `src/account-object.ts:1083` (from `countAccepted`, `:1122`) |
-| `append`: the hook's "last seen" | 1 | `seen`, `:1141` |
-| `append`: dedupe marks, 3 per key (row and 2 indexes) | 6 | `writeMarks`, `:792` |
-| `append`: the head | 1 | `:1024` |
-| `append`: the event row (row and 4 indexes) | 5 | `:1028` |
-| `append`: one sealed envelope per device (row and 2 indexes) | 3 per device | `:1044` |
-| `append`: log usage counters | 3 | `setUsage` `:626`, `addHookUsage` `:551` |
-| **`append`, 1 device** | **21** (3 devices: 27) | |
-| ack: nonce (row and index) | 2 | `spendNonce`, `:724` |
-| ack: cursor, delete own envelope, usage counters | 5 | `ack` `:1594`, `deleteEnvelopes` `:636` |
-| last ack of an event: delete the event, counters | +5 | `pruneAcknowledged` `:2061`, `deleteRange` `:656` |
-| **acks, 1 device** | **12** (3 devices: 7 + 7 + 12) | |
-| later, in the hourly alarm: the nonce, and the two dedupe marks after 7 or 180 days | ~3 (+1 per device) | `alarm`, `:2115` |
+| `append`: dedupe marks, 2 per key (row and the `seen_long_at` index) | 4 | `writeMarks`, `src/account-object.ts:914` |
+| `append`: the event row (row and the `events_stored` index) | 2 | `:1154` |
+| `append`: one sealed envelope per device (row and the `envelopes_seq_device` index) | 2 per device | `:1170` |
+| `append`: one row for the hook (its share of the log, today's count, its token bucket, its last delivery) and one for the account (the head, today's count, its token bucket) | 2 | `commitCounts`, `:1262` |
+| **`append`, 1 device** | **10** (3 devices: 14) | |
+| ack: nonce (no index) | 1 | `spendNonce`, `:846` |
+| ack: cursor, delete own envelope, the hook's row | 3 | `ack` `:1751`, `deleteEnvelopes` `:772`, `applyUsage` `:712` |
+| last ack of an event: delete the event (the hook's row is the same write) | +1 | `pruneAcknowledged` `:2226`, `deleteRange` `:786` |
+| **acks, 1 device** | **5** (3 devices: 4 + 4 + 5) | |
+| later, in the hourly alarm: the nonce, and the two dedupe marks after 7 or 180 days | 3 (+1 per device) | `alarm`, `:2280` |
 
-So about **36 rows written per webhook for one device, and about 11 more per extra device**. Rows
-read are about 47 for the `append` and 50 to 60 per ack. Assumptions that move this:
+So about **18 rows written per webhook for one device, and about 7 more per extra device**. The
+alarm's own `setAlarm` (one row) is shared by everything it prunes that hour, so it isn't counted
+per webhook. Rows read are about 35 for the `append`, 40 to 45 per ack and 40 for the alarm.
 
-- **Dedupe keys.** 0 to 2 per preset (3 rows each): `unverified` has none, GitHub two.
+Measured, before and after the schema 8 change that brought it down (rows written):
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| 1 device (append + ack + alarm) | 36 (21 + 12 + 3) | 18 (10 + 5 + 3) |
+| 3 devices | 58 (27 + 26 + 5) | 32 (14 + 13 + 5) |
+| Plan with a hook rate, an account rate and a daily cap, 1 device | 38 | 18 |
+| A duplicate | 0 | 0 |
+| A held delivery | 15 | 12 |
+
+How it stays low (schema 8, `migrateTo8`):
+
+- **Counters share rows.** Every count an append makes (the head, today's count for the account and
+  the hook, the token buckets, the hook's last delivery, its share of the log) is written in the
+  commit's transaction, in one row for the account (`counters`) and one for the hook
+  (`hook_usage`). Deliveries decided but still being sealed are counted from memory until they
+  commit, so the daily cap and the buckets stay exact, and a delivery lost before its commit was
+  never stored and is never counted. What the log holds in all is the sum of the hooks' rows.
+- **Only the indexes a query reads.** The event row keeps `events_stored` (retention), an envelope
+  `envelopes_seq_device`, a dedupe mark `seen_long_at` (its expiry), and nonces none: the hourly
+  alarm scans them (at most the last hour's), and between alarms only a nonce just spent can move
+  the alarm earlier.
+- **A step writes each counter once.** An ack, a revoke or the alarm gathers what its deletes take
+  from each hook and writes the hook's row once, in one transaction.
+
+Assumptions that move this:
+
+- **Dedupe keys.** 0 to 2 per preset (2 rows each, and 1 more when the alarm deletes it):
+  `unverified` has none, GitHub two.
 - **Batched acks.** The reference client acknowledges what it read in one go, so a burst shares one
-  ack (one Worker request, two Durable Object requests, one nonce), though each event's deletes still
-  count.
-- **Plans.** A plan with rate limits adds a token-bucket write per limit (`:1127`).
+  ack (one Worker request, two Durable Object requests, one nonce, one cursor and one write of the
+  hook's row), though each event's deletes still count.
+- **Plans.** Rate limits and the daily cap add no rows: they are columns of the two counter rows.
+  Refusals are counted in rows of their own (`daily`, `refusals`, `limit_notices`).
 - **The screen.** A dropped delivery never reaches the object (counted at the edge,
-  `src/edge-counts.ts`). A held one is written to the hold instead of the log, plus one Durable Object
-  request for its audit count (`src/receive.ts:268`), and a release later is another request.
-- **Duplicates** cost one Durable Object request and no writes (`src/account-object.ts:902`).
+  `src/edge-counts.ts`). A held one is written to the hold instead of the log (12 rows with the
+  GitHub preset and one device), plus one Durable Object request for its audit count
+  (`src/receive.ts:268`), and a release later is another request.
+- **Duplicates** cost one Durable Object request and no writes (`src/account-object.ts:1024`).
   **Forged signatures** cost Worker CPU only; the object hears of them at most once a minute per hook.
 - **Rate Limiting.** Two `limit()` calls per delivery (`src/receive.ts:117`, `:135`), with no listed
   price.
@@ -84,7 +116,7 @@ The object is billed for wall-clock time while it runs a request. It is awake fo
 briefly for the nonce and the ack. In between it holds nothing but hibernatable WebSockets: no timers,
 no pending promises, so it is eligible for hibernation, and Cloudflare doesn't bill duration for an
 idle object that can hibernate. The alarm that prunes runs at most hourly (`ALARM_BUCKET_MS`,
-`src/account-object.ts:2153`).
+`src/account-object.ts:2336`).
 
 That gives roughly **15 ms per webhook for a 1 KB body and one device**, more with large bodies (the
 sealing is in JavaScript, once per device) and many devices. We use **0.1 s** as the planning figure
@@ -94,13 +126,13 @@ reads awake time from the analytics API) to see yours.
 
 ## What $5 covers
 
-With one device, per webhook: 3 Durable Object requests, ~36 rows written, 2 Worker requests,
+With one device, per webhook: 3 Durable Object requests, ~18 rows written, 2 Worker requests,
 ~5 ms CPU, ~0.0128 GB-s. Each allowance runs out at:
 
 | Allowance | Webhooks a month, 1 device | 3 devices |
 | --- | --- | --- |
 | **Durable Object requests (1 M)** | **~330,000 (first)** | **~140,000 (first)** |
-| SQLite rows written (50 M) | ~1.4 million | ~860,000 |
+| SQLite rows written (50 M) | ~2.8 million | ~1.6 million |
 | Worker requests (10 M) | 5 million | 2.5 million |
 | Worker CPU (30 M ms) | ~6 million | ~4 million |
 | Duration (400,000 GB-s) | ~31 million at 0.1 s; ~3 million at 1 s | about the same |
@@ -114,14 +146,14 @@ Per extra million webhooks, once each allowance is used up (1 device):
 
 | | Usage | Cost |
 | --- | --- | --- |
-| SQLite rows written | 36 million | $36.00 |
+| SQLite rows written | 18 million | $18.00 |
 | Worker requests | 2 million | $0.60 |
 | Durable Object requests | 3 million | $0.45 |
 | Duration (0.1 s each) | 12,800 GB-s | $0.16 (at 1 s: $1.60) |
 | Worker CPU | 5 million ms | $0.10 |
-| **Total** | | **~$37** |
+| **Total** | | **~$19** |
 
-Each extra device adds about $11.60 per million (11 million rows written, 1 million Worker requests,
+Each extra device adds about $7.60 per million (7 million rows written, 1 million Worker requests,
 2 million Durable Object requests).
 
 **Formula.** For W webhooks a month to N devices, in millions of W:
@@ -129,7 +161,7 @@ Each extra device adds about $11.60 per million (11 million rows written, 1 mill
 ```
 $5
 + $0.15 × max(0, W × (1 + 2N) − 1)            Durable Object requests
-+ $1.00 × max(0, W × (36 + 11 × (N − 1)) − 50) rows written
++ $1.00 × max(0, W × (18 + 7 × (N − 1)) − 50)  rows written
 + $0.30 × max(0, W × (1 + N) − 10)             Worker requests
 + CPU and duration: cents, until tens of millions
 ```
@@ -138,18 +170,20 @@ $5
 
 | Traffic | Over the allowances | Monthly |
 | --- | --- | --- |
-| 100,000 webhooks, 1 device | nothing (300,000 DO requests, 3.6 M rows written) | **$5** |
+| 100,000 webhooks, 1 device | nothing (300,000 DO requests, 1.8 M rows written) | **$5** |
 | 1 million, 1 device | 2 M DO requests ($0.30) | **~$5.30** |
-| 2 million, 1 device | 5 M DO requests ($0.75), 22 M rows written ($22) | **~$28** |
-| 10 million, 3 devices | 69 M DO requests ($10.35), 530 M rows written ($530), 30 M Worker requests ($9), CPU ($0.60) | **~$555** |
+| 2 million, 1 device | 5 M DO requests ($0.75); 36 M rows written are within the 50 M | **~$5.75** |
+| 5 million, 1 device | 14 M DO requests ($2.10), 40 M rows written ($40) | **~$47** |
+| 10 million, 3 devices | 69 M DO requests ($10.35), 270 M rows written ($270), 30 M Worker requests ($9), CPU ($0.60) | **~$295** |
 
 ## Idle connections
 
 A connected device that receives nothing costs fractions of a cent a month:
 
 - **Connecting** is 1 Worker request, 2 Durable Object requests (the nonce, `src/auth.ts:142`, and the
-  WebSocket, `src/stream.ts:52`), ~3 rows written (the nonce, `streamSeen`,
-  `src/account-object.ts:1866`), and one alarm about 10 minutes later that clears the nonce.
+  WebSocket, `src/stream.ts:52`), ~2 rows written (the nonce, `streamSeen`,
+  `src/account-object.ts:2031`; a `setAlarm` too when none is set), and one alarm about 10 minutes
+  later that clears the nonce.
 - **The 15 s heartbeats** are written by the Worker alone (`src/bridge.ts:217`), and Worker duration
   isn't billed.
 - **The 30 s pings** to the object (`src/bridge.ts:231`) are answered by its WebSocket auto-response
@@ -169,7 +203,7 @@ what [IDLE-COST.md](IDLE-COST.md) measures.
   copy, kept until it acknowledges or for up to 7 days. The account's backlog quota (256 MiB by
   default) caps it, so one account stays well inside the 5 GB included. Large bodies also take longer
   to seal, once per device (awake time).
-- **Many devices** multiply the envelopes, acks and rows written (~11 rows each per webhook).
+- **Many devices** multiply the envelopes, acks and rows written (~7 rows each per webhook).
   Sending a hook to the one device that needs it (`00hooks hooks deliver-to`) saves the rest.
 - **Long offline periods** cost little by themselves (events wait in storage, and reading the backlog
   on reconnect is cheap reads), but events older than 7 days are dropped, and a full backlog
