@@ -22,7 +22,7 @@ CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hiber
   envelope signature. `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE
   bridge. `src/audit.ts`: the audit log and events list. `src/account-object.ts`: the Durable
   Object. `src/phone.ts`: the phone routes; `src/phone-object.ts`: their Durable Object (mailbox,
-  cursors, sockets); `src/phone-push.ts` and `src/apns.ts`: waking a phone through APNs. `migrations/`: the D1 schema.
+  cursors, sockets); `src/phone-push.ts`, `src/apns.ts` and `src/fcm.ts`: waking a phone through APNs or FCM. `migrations/`: the D1 schema.
 - `scripts/seal-interop.ts` seals events with `src/envelope.ts` under Node, for the CLI's interop
   tests (`fixtures/seal-interop.v1.json`).
 
@@ -76,6 +76,7 @@ deployment. Keep your account's ids in a copy that git ignores:
    | `APNS_TEAM_ID` | Your Apple developer team's 10-character id | `wrangler secret put APNS_TEAM_ID -c wrangler.deploy.jsonc` |
    | `APNS_TOPIC` | The phone app's bundle id | `wrangler secret put APNS_TOPIC -c wrangler.deploy.jsonc` |
    | `APNS_ENVIRONMENT` | `sandbox` for development builds of the app, `production` (the default when unset) for TestFlight and the App Store | `wrangler secret put APNS_ENVIRONMENT -c wrangler.deploy.jsonc` |
+   | `FCM_SERVICE_ACCOUNT` | Optional, for Android push (below): the whole JSON key file of a service account of your Firebase project (Project settings → Service accounts → Generate new private key) | `wrangler secret put FCM_SERVICE_ACCOUNT -c wrangler.deploy.jsonc < service-account.json` |
 
    With `npx`: `npx wrangler secret put APNS_KEY -c wrangler.deploy.jsonc < AuthKey_XXXXXXXXXX.p8`,
    and so on for each name.
@@ -155,14 +156,19 @@ Variables (`vars`), all optional unless noted:
 
 ### Push
 
-Push is off until the APNs secrets above are set: every `POST /v1/phone/push` answers
-`{ "sent": false, "reason": "unavailable" }` and nothing goes to Apple. Once `APNS_KEY`, `APNS_KEY_ID`,
-`APNS_TEAM_ID` and `APNS_TOPIC` are set and the key imports, `/v1/info` says
-`"push": { "available": true, "environment": … }` under `phone`. The node keeps each phone's device
-token and sends it with each request; the relay keeps no token, sends a fixed alert per kind, and
-limits each phone to one push per kind a minute and 30 an hour (PROTOCOL §10.7). The requests to
-Apple were checked against a mock in the tests, not against Apple's service: try one push on a
-sandbox build before relying on it.
+Push is off until its secrets above are set: every `POST /v1/phone/push` answers
+`{ "sent": false, "reason": "unavailable" }` and nothing goes to Apple or Google. iPhones (requests
+with no `platform`, or `"ios"`) need `APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID` and `APNS_TOPIC`, with
+a key that imports; Android phones (`"platform": "android"`) need `FCM_SERVICE_ACCOUNT`. Either can
+be set without the other. `/v1/info` says which under `phone.push.platforms`
+(`{ "ios": { "available", "environment" }, "android": { "available" } }`), and keeps
+`phone.push.available` and `environment` for iOS. The node keeps each phone's device token and
+sends it with each request; the relay keeps no token, sends a fixed alert per kind, and limits each
+phone to one push per kind a minute and 30 an hour, whichever platform (PROTOCOL §10.7). The
+service account is used only to get a token for sending messages
+(`https://www.googleapis.com/auth/firebase.messaging`). The requests to Apple and Google were checked
+against mocks in the tests, not against the real services: try one push on a development build
+before relying on it.
 
 ## Security notes
 
@@ -215,7 +221,7 @@ sandbox build before relying on it.
   and never opens them; it keeps a pairing only as a verifier of its proof (spent once, atomically),
   checks only routing (`from` is the signed-in device, `to` its peer), sizes, rates and queues, and
   stores envelopes as received until acknowledged. A phone may use only the phone routes. Push
-  (PROTOCOL §10.7) sends only fixed alert texts and the node's sealed preview; the device token is
-  never stored or logged.
+  (PROTOCOL §10.7) sends only fixed alert texts and the node's sealed preview, to Apple or Google
+  hosts that aren't configurable; the device token is never stored or logged.
 - **Errors** are fixed sentences: they never quote a secret, a signature or payload content.
 - **Webhook content is data**: the relay never acts on it.

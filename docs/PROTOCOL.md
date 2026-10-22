@@ -207,10 +207,13 @@ characters); both sides compute it.
 - `GET /v1/info` (unsigned) → `{ "version", "protocol": 2, "protocols": [2], "signupOpen": bool,
   "relayKey", "serverTime", "screen": { "edge": true, "maxRules": 200, "heldDays" }, "extras": [],
   "phone": { "protocol": 1, "push": { "available": bool, "environment": "sandbox" | "production" |
-  null } } }`. `signupOpen` is true only when a signup needs no token
+  null, "platforms": { "ios": { "available": bool, "environment": … }, "android": { "available": bool } } } } }`.
+  `signupOpen` is true only when a signup needs no token
   (`OPEN_SIGNUP=1` and no `SIGNUP_TOKEN`). `phone` says the relay carries phone links (§10) and the
-  version of their socket protocol; `phone.push` says whether it can wake a phone through APNs
-  (§10.7) and which APNs environment it sends to (null when it can't).
+  version of their socket protocol; `phone.push.platforms` says, per platform, whether it can wake a
+  phone (§10.7): `ios` through APNs, with the APNs environment it sends to (null when it can't), and
+  `android` through FCM. `phone.push.available` and `environment` are the same as `ios`'s, for
+  clients written before Android.
   `screen` says what the edge screen takes (§4b). `extras` lists the optional hosted extras this
   relay offers (fingerprint sync across devices, reputation lists shared as hashes, a longer hold,
   evaluator credits…), each `{ "id", "title", "description"?, "url"? }`, as the operator sets them
@@ -1157,22 +1160,30 @@ request, then hands it to the object, whose `101` goes back to the client.
 
 ### 10.7 Push
 
-A node can ask the relay to wake one of its phones through Apple's push service (APNs) when the
-phone's socket isn't online. The **node** keeps each phone's APNs device token (the phone sends it to
-its node, sealed, like everything else) and decides what is worth a push; the **relay** holds only
-the operator's APNs key, checks that the phone is the node's, applies the limits, and sends a fixed,
-opaque alert. The relay stores no device token and puts nothing the node wrote into the alert.
+A node can ask the relay to wake one of its phones when the phone's socket isn't online: an iPhone
+through Apple's push service (APNs), an Android phone through Firebase Cloud Messaging (FCM, below).
+The **node** keeps each phone's device token (the phone sends it to its node, sealed, like everything
+else) and decides what is worth a push; the **relay** holds only the operator's APNs key and FCM
+service account, checks that the phone is the node's, applies the limits, and sends a fixed, opaque
+alert. The relay stores no device token and puts nothing the node wrote into the alert.
 
 **`POST /v1/phone/push`** (signed by a device of kind `device`; a phone, or an API key, is `403`
 `forbidden` as on the other node-only phone routes):
 
 ```
-{ "device": "dev_…", "token": <the APNs device token: lowercase hex, 32 to 400 characters, an even number>,
+{ "device": "dev_…", "platform"?: "ios" | "android",
+  "token": <ios: the APNs device token: lowercase hex, 32 to 400 characters, an even number;
+            android: the FCM registration token: 32 to 1,024 of A–Z a–z 0–9 - _ :>,
   "environment"?: "sandbox" | "production",
   "kind": "approval" | "ask" | "finished" | "handoff" | "reconnect" | "task" | "done" | "drive",
   "ref": <22 characters of unpadded base64url>,
   "preview"?: { "at": <integer ms>, "enc": <43 base64url>, "ct": <standard padded base64, at most 1,400 characters>, "sig": <86 base64url> } }
 ```
+
+`platform` is `ios` when absent, so requests written before Android are iOS ones; `environment` is
+for iOS only (with `android` it is `400` `invalid`). Steps 1 to 6 are the same for both platforms,
+and a phone's limits are its own whichever platform it is pushed on; steps 7 and 8 are APNs', and
+FCM's are under "Android" below.
 
 `ref` is the node's own reference (what the phone opens when the alert is tapped); `preview`, when
 given, is sealed to the phone by the node and carried as it is, so the phone's notification extension
@@ -1183,7 +1194,8 @@ can show the real text on the device. The relay reads neither. Checks, in order:
 2. `device` must be one of the calling node's own phones, confirmed and not revoked: anything else
    (a pending phone, a revoked one, another node's, another account's, an unknown id) is `403`
    `forbidden` "That phone isn't paired with this device.". Nothing is sent.
-3. Push isn't configured on this relay (below): `200` `{ "sent": false, "reason": "unavailable" }`.
+3. Push isn't configured on this relay for the request's platform (below): `200`
+   `{ "sent": false, "reason": "unavailable" }`.
 4. `environment` is given and isn't the relay's: `200` `{ "sent": false, "reason": "environment" }`.
    Without `environment` it isn't checked.
 5. The phone's socket is online (§10.3): `200` `{ "sent": false, "reason": "online" }`. It gets the
@@ -1242,6 +1254,48 @@ imports; `/v1/info` says so (§2). The APNs hosts aren't configurable.
 
 The requests were checked against a mock of APNs in the relay's tests, not against Apple's service.
 APNs needs HTTP/2, which the Workers runtime negotiates for outbound HTTPS.
+
+**Android.** With `"platform": "android"`, steps 1 to 6 are as above; then:
+
+7. The relay sends `POST https://fcm.googleapis.com/v1/projects/<project_id>/messages:send` with
+   `authorization: Bearer <access token>` and `content-type: application/json`. The body is built by
+   the relay alone, with the same texts as the table above:
+
+   ```
+   { "message": { "token": "<token>",
+                  "notification": { "title": T, "body": B },
+                  "data": { "zn": "<the APNs payload's zn object, as JSON text>" },
+                  "android": { "priority": "high", "ttl": "86400s", "collapse_key": "<kind>",
+                               "notification": { "tag": "<kind>" } } } }
+   ```
+
+   `data.zn` is the same object APNs carries in `zn` (`v`, `kind`, `ref`, and `p` only when a preview
+   is given), as a string because FCM's data values are strings. Nothing else from the request goes
+   into the message.
+8. FCM's answer: `200` → `200` `{ "sent": true }`. `404`, or the error code `UNREGISTERED` or
+   `SENDER_ID_MISMATCH`, or `400` `INVALID_ARGUMENT` whose field violation is `message.token` →
+   `200` `{ "sent": false, "reason": "unregistered" }`: the node forgets that token, as for APNs.
+   Any other `INVALID_ARGUMENT` is about the relay's message and keeps the token. `401` → the relay
+   fetches a fresh access token and tries once more, and answers from that second try. `429` →
+   `429` `rate_limited` with `Retry-After: 60`. Anything else, a network error, a redirect, or no
+   access token from Google → `502` `push_failed`. The relay logs the kind, FCM's status and error
+   word, never the token, the access token or the message.
+
+**The access token** is an OAuth2 token from `POST https://oauth2.googleapis.com/token`
+(`application/x-www-form-urlencoded`: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and
+`assertion=<JWT>`). The assertion is an RS256 JWT: header `{"alg":"RS256","typ":"JWT","kid":<private_key_id>}`
+(no `kid` when the service account has none), claims `{"iss":<client_email>,"scope":"https://www.googleapis.com/auth/firebase.messaging","aud":"https://oauth2.googleapis.com/token","iat":<Unix seconds>,"exp":<iat + 3600>}`,
+signed with RSASSA-PKCS1-v1_5 and SHA-256. Each instance reuses its access token until five
+minutes before the `expires_in` Google gave (at most an hour), shares one exchange between parallel
+pushes, and fetches a new one when the service account changes. A refused exchange isn't cached.
+
+**Configuration** (Worker secret): `FCM_SERVICE_ACCOUNT`, the whole JSON key file of a Google service
+account of the Firebase project (Firebase console → Project settings → Service accounts → Generate
+new private key). The relay reads `type` (must be `service_account`), `project_id` (6 to 30 of
+a–z 0–9 -), `client_email`, `private_key` (a PKCS#8 PEM of an RSA key of at least 2,048 bits) and,
+when present, `private_key_id`; it ignores the rest, `token_uri` included. Android push is available
+when it parses and the key imports; `/v1/info` says so (§2). The token endpoint and the FCM host
+aren't configurable. As for APNs, the requests were checked against mocks, not against Google.
 
 The envelope's `push` field (§10.4) is from an earlier design, in which the relay pushed when it
 queued a tagged envelope. It is still accepted from a node and carried, and ignored.
