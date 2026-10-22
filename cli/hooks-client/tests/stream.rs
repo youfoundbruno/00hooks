@@ -881,6 +881,7 @@ fn describe(ev: &StreamEvent) -> String {
         StreamEvent::Warning(w) => format!("warning: {w}"),
         StreamEvent::Resync(_) => "resync".into(),
         StreamEvent::HookChange(c) => format!("hook-change {c:?}"),
+        StreamEvent::Limit(l) => format!("limit {}", l.scope),
         _ => "other".into(),
     }
 }
@@ -1163,4 +1164,69 @@ async fn failing_acks_do_not_keep_a_silent_connection_alive() {
     // Ack retries fired at 1, 3, 7, 15, 31 and 61 s; none of them moved the deadline.
     assert_eq!(virtual_now, Duration::from_secs(70));
     assert!(relay.with(|s| s.failed_acks) >= 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limits_are_handed_over_as_notices_never_recorded_or_acknowledged() {
+    let relay = MockRelay::start().await;
+    relay.push_events(1..=2);
+    relay.with(|s| {
+        s.limits.push(serde_json::json!({
+            "scope": "hook_rate", "hookId": "hk_1", "refused": 12, "since": 1,
+            "until": 2, "plan": "overblast"
+        }));
+        // Unreadable data is reported, never fatal.
+        s.limits.push(serde_json::json!({ "scope": 5 }));
+    });
+    let (client, state, _home, _) = sealed_device(&relay, "limits").await;
+    let mut sub = subscribe(client.clone(), state.open_events().unwrap(), fast());
+    let evs = read_hooks(&mut sub, 2).await;
+    let limits: Vec<&hooks_client::Limit> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Limit(l) => Some(l),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(limits.len(), 1, "{evs:?}");
+    assert_eq!(limits[0].kind(), hooks_client::LimitScope::HookRate);
+    assert_eq!(limits[0].refused, 12);
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, StreamEvent::Warning(w) if w.contains("`limit`"))),
+        "{evs:?}"
+    );
+    assert_eq!(hook_seqs(&evs), vec![1, 2]);
+    assert_eq!(sub.store().cursor(), 2);
+    relay.with(|s| {
+        assert_eq!(s.acked, 2);
+        assert!(s.violations.is_empty(), "{:?}", s.violations);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_limit_gap_said_after_the_next_event_is_taken_not_ignored() {
+    let relay = MockRelay::start().await;
+    // Seq 2 was dropped past the daily cap: the relay says so after event 3 (PROTOCOL §6).
+    relay.push_events([1, 3]);
+    relay.with(|s| {
+        s.trailing.push(
+            "id: 2\nevent: gap\ndata: {\"from\":2,\"to\":2,\"reason\":\"over_limit\"}\n\n".into(),
+        )
+    });
+    let (client, state, _home, _) = sealed_device(&relay, "overlimit").await;
+    let mut sub = subscribe(client, state.open_events().unwrap(), fast());
+    let seen = read_until(&mut sub, |e| matches!(e, StreamEvent::Gap(_))).await;
+    assert_eq!(
+        seen.iter().filter(|d| d.starts_with("hook")).count(),
+        2,
+        "{seen:?}"
+    );
+    assert!(seen.last().unwrap().starts_with("gap 2-2"), "{seen:?}");
+    assert!(
+        !seen.iter().any(|d| d.contains("ignored a gap")),
+        "{seen:?}"
+    );
+    // The cursor stays at the highest seq, not the gap's end.
+    assert_eq!(sub.store().cursor(), 3);
 }

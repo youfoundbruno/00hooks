@@ -109,6 +109,10 @@ pub struct State {
     pub hook_changes: Vec<Value>,
     /// How many of `hook_changes` each device has been sent.
     pub hook_changes_sent: HashMap<String, usize>,
+    /// `limit` messages (PROTOCOL §6): sent after `ready` on every connection, without an `id:`.
+    pub limits: Vec<Value>,
+    /// Raw frames sent after the backlog on every connection (a gap the relay says late, say).
+    pub trailing: Vec<String>,
     next_device: usize,
 }
 
@@ -724,6 +728,18 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn, device:
                 return;
             }
         }
+        let limits: Vec<String> = st
+            .lock()
+            .unwrap()
+            .limits
+            .iter()
+            .map(|l| format!("event: limit\ndata: {l}\n\n"))
+            .collect();
+        for f in limits {
+            if !send(f).await {
+                return;
+            }
+        }
         if let Conn::Gap(from, to) = conn {
             let gap = json!({ "from": from, "to": to, "reason": "retention" });
             if !send(format!("event: gap\ndata: {gap}\n\n")).await {
@@ -778,6 +794,12 @@ fn stream_response(st: Arc<Mutex<State>>, last: Option<u64>, conn: Conn, device:
                 return;
             }
             _ => {}
+        }
+        let trailing: Vec<String> = st.lock().unwrap().trailing.clone();
+        for f in trailing {
+            if !send(f).await {
+                return;
+            }
         }
         // Live: heartbeats, and any events appended to the log meanwhile.
         loop {

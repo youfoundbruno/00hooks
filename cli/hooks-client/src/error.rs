@@ -58,6 +58,22 @@ impl Error {
         }
     }
 
+    /// Which of the relay's limits refused the request (PROTOCOL §8): a `429` or a cap's `409`
+    /// that names its `scope`. `None` for any other error, or a scope this client doesn't know.
+    pub fn limit_scope(&self) -> Option<crate::types::LimitScope> {
+        match self {
+            Error::Api {
+                status: 429 | 409,
+                field: Some(f),
+                ..
+            } => match crate::types::LimitScope::parse(f) {
+                crate::types::LimitScope::Other => None,
+                s => Some(s),
+            },
+            _ => None,
+        }
+    }
+
     /// The machine is offline or the relay is down: worth retrying later.
     pub fn is_transient(&self) -> bool {
         match self {

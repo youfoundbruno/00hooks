@@ -348,6 +348,7 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
                 path.display()
             )),
             StreamEvent::Warning(w) => err(sentence(&sanitize(&w, false))),
+            StreamEvent::Limit(l) => err(crate::listen::describe_limit(&l)),
             // The runner says what changed, warns the person when it matters (a secret rotated by
             // someone else, a name the automations use taken), and keeps the names current.
             StreamEvent::HookChange(c) => {

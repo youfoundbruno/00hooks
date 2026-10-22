@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use hooks_client::{
-    Event, HookChange, HookChangeKind, StreamEvent, SubscribeOptions, describe_skew, subscribe,
+    Event, HookChange, HookChangeKind, Limit, LimitScope, StreamEvent, SubscribeOptions,
+    describe_skew, subscribe,
 };
 
 use crate::ctx::{CliResult, Ctx, Failure, sentence};
@@ -26,6 +27,48 @@ pub fn summary(e: &Event, hook_name: Option<&str>) -> String {
         size(e.body_len()),
         sanitize(&e.id, false),
     )
+}
+
+/// One human line about a plan's limit refusing deliveries (`event: limit`, PROTOCOL §6).
+pub fn describe_limit(l: &Limit) -> String {
+    let hook = l
+        .hook_id
+        .as_deref()
+        .map(|h| sanitize(h, false))
+        .unwrap_or_else(|| "?".into());
+    let plan = sanitize(&l.plan, false);
+    let refused = match l.refused {
+        1 => "1 delivery".to_string(),
+        n => format!("{n} deliveries"),
+    };
+    let until = l
+        .until
+        .map(|u| format!(" until {}", clock(u)))
+        .unwrap_or_default();
+    match l.kind() {
+        LimitScope::HookRate => {
+            format!("Hook {hook} is over its plan's rate ({plan}): {refused} refused{until}.")
+        }
+        LimitScope::AccountRate => {
+            format!("This account is over its plan's rate ({plan}): {refused} refused{until}.")
+        }
+        LimitScope::Daily => format!(
+            "This account reached its plan's deliveries for today ({plan}): {refused} refused \
+             or dropped{until}."
+        ),
+        LimitScope::Paused => format!(
+            "Hook {hook} is paused after a flood of refused deliveries{until}; `00hooks hooks \
+             resume {hook}` lifts it."
+        ),
+        LimitScope::PlanExpired => format!(
+            "This account's plan has ended (now {plan}): new deliveries are refused ({refused} so \
+             far) until it is renewed; what is waiting can still be read."
+        ),
+        _ => format!(
+            "A limit of this account's plan ({plan}, {}) refused {refused}{until}.",
+            sanitize(&l.scope, false)
+        ),
+    }
 }
 
 /// One human line about a hook change (`event: hook-change`): what happened to which hook, and who
@@ -283,6 +326,7 @@ pub async fn run(as_json: bool, filters: Vec<String>) -> CliResult {
                 ))]
             }
             StreamEvent::Warning(w) => vec![Line::Err(sentence(&sanitize(&w, false)))],
+            StreamEvent::Limit(l) => vec![Line::Err(describe_limit(&l))],
             StreamEvent::HookChange(c) => {
                 let line = describe_change(&c, names.map.get(&c.hook_id).map(String::as_str));
                 names.apply(&c);
@@ -310,6 +354,26 @@ pub async fn run(as_json: bool, filters: Vec<String>) -> CliResult {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn limits_read_as_one_plain_line() {
+        let l: Limit = serde_json::from_value(serde_json::json!({
+            "scope": "paused", "hookId": "hk_1", "refused": 0, "since": 1, "until": null,
+            "plan": "overblast"
+        }))
+        .unwrap();
+        assert!(describe_limit(&l).starts_with("Hook hk_1 is paused"));
+        let l: Limit = serde_json::from_value(serde_json::json!({
+            "scope": "plan_expired", "refused": 3, "since": 1, "until": null, "plan": "suspended"
+        }))
+        .unwrap();
+        assert!(describe_limit(&l).contains("plan has ended (now suspended)"));
+        let l: Limit = serde_json::from_value(serde_json::json!({
+            "scope": "future\u{1b}[31m", "refused": 1, "since": 1, "plan": "p"
+        }))
+        .unwrap();
+        assert!(!describe_limit(&l).contains('\u{1b}'));
+    }
 
     fn event(body: &[u8], event_type: Option<&str>, verified: bool) -> Event {
         serde_json::from_value(serde_json::json!({
