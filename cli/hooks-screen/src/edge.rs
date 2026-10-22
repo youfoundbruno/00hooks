@@ -11,6 +11,9 @@
 //!   (`consent.words`). A pattern must also be in the subset the relay's linear-time matcher takes
 //!   ([`crate::fields::edge_pattern_weight`]), and the different patterns of one hook weigh at most
 //!   [`crate::fields::EDGE_MAX_SCREEN_WEIGHT`] together.
+//! - Time windows go as they are; the relay reads its clock when the delivery arrives, the same
+//!   instant the harness later reads from the event's `receivedAt`. One hook's screen names at most
+//!   [`crate::window::MAX_EDGE_ZONES`] different zones.
 //! - Whether the sender is known is the harness's alone: a rule using it stays home.
 
 use serde_json::{Value, json};
@@ -19,6 +22,7 @@ use std::collections::BTreeMap;
 
 use crate::fields::{self, EDGE_MAX_SCREEN_WEIGHT, domain_of, fold, keyed_hash};
 use crate::rules::{Condition, FieldOp, HeaderOp, Rule};
+use crate::window::MAX_EDGE_ZONES;
 use crate::{SourceKind, now_ms};
 
 /// The most rules the relay takes for one hook.
@@ -126,6 +130,8 @@ pub fn export(rules: &[Rule], hook_id: &str, key: &[u8], words: bool, expiry_day
     let mut needs_words = false;
     // The different patterns sent so far, and what they weigh together.
     let mut patterns: BTreeMap<String, u32> = BTreeMap::new();
+    // The different time zones sent so far.
+    let mut zones: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for r in rules {
         if !r.edge
             || !r.enabled
@@ -169,7 +175,23 @@ pub fn export(rules: &[Rule], hook_id: &str, key: &[u8], words: bool, expiry_day
                     ));
                     continue;
                 }
+                let mut more_zones = zones.clone();
+                for c in &r.conditions {
+                    if let Condition::Time { tz, .. } = c {
+                        more_zones.insert(tz.clone().unwrap_or_else(|| "UTC".into()));
+                    }
+                }
+                if more_zones.len() > MAX_EDGE_ZONES {
+                    skipped.push((
+                        r.name.clone(),
+                        format!(
+                            "the relay takes time windows in at most {MAX_EDGE_ZONES} different time zones a hook"
+                        ),
+                    ));
+                    continue;
+                }
                 patterns = more;
+                zones = more_zones;
                 needs_words |= r.needs_words();
                 let mut v = json!({"id": r.id, "verdict": r.verdict, "conditions": conds});
                 if r.any {
@@ -241,6 +263,50 @@ mod tests {
         );
         assert_eq!(out.screen["consent"]["words"], json!(true));
         assert!(rules[1].needs_words() && !rules[0].needs_words());
+    }
+
+    #[test]
+    fn time_windows_go_as_they_are_in_at_most_eight_zones() {
+        let key = [7u8; 32];
+        let window = |id: &str, tz: Option<&str>| {
+            let mut c =
+                json!({"on": "time", "from": "22:00", "to": "06:00", "days": [5], "not": true});
+            if let Some(tz) = tz {
+                c["tz"] = json!(tz);
+            }
+            rule(id, json!([c]))
+        };
+        let zones = [
+            "Europe/Lisbon",
+            "America/New_York",
+            "Asia/Tokyo",
+            "Asia/Kolkata",
+            "Pacific/Auckland",
+            "Europe/Berlin",
+            "America/Sao_Paulo",
+        ];
+        let mut rules: Vec<Rule> = zones
+            .iter()
+            .enumerate()
+            .map(|(i, z)| window(&format!("z{i}"), Some(z)))
+            .collect();
+        rules.push(window("utc", None));
+        rules.push(window("again", Some("Asia/Tokyo")));
+        rules.push(window("ninth", Some("Africa/Lagos")));
+        let out = export(&rules, "hk_x", &key, false, 90);
+        let sent = out.screen["rules"].as_array().unwrap();
+        assert_eq!(sent.len(), 9);
+        assert_eq!(
+            sent[0]["conditions"][0],
+            json!({"on": "time", "from": "22:00", "to": "06:00", "days": [5], "tz": "Europe/Lisbon", "not": true})
+        );
+        assert_eq!(
+            sent[7]["conditions"][0],
+            json!({"on": "time", "from": "22:00", "to": "06:00", "days": [5], "not": true})
+        );
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].0, "ninth");
+        assert_eq!(out.screen["consent"]["words"], json!(false));
     }
 
     #[test]

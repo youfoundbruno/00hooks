@@ -1035,5 +1035,738 @@
       "similarity": 0.0
     }
   ],
+  "timeWindows": {
+    "accepted": [
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "UTC"
+      },
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "Europe/Lisbon"
+      },
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "europe/lisbon"
+      },
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "US/Eastern"
+      },
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "Asia/Calcutta"
+      },
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "Europe/Kyiv"
+      },
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "Etc/GMT+5"
+      },
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "America/Argentina/Buenos_Aires"
+      },
+      {
+        "from": "09:00",
+        "on": "time",
+        "to": "17:00",
+        "tz": "America/Port-au-Prince"
+      }
+    ],
+    "cases": [
+      {
+        "at": 1768519800000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": true,
+        "utc": "2026-01-15T23:30:00Z"
+      },
+      {
+        "at": 1768514400000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": true,
+        "utc": "2026-01-15T22:00:00Z"
+      },
+      {
+        "at": 1768456799000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": true,
+        "utc": "2026-01-15T05:59:59Z"
+      },
+      {
+        "at": 1768456800000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": false,
+        "utc": "2026-01-15T06:00:00Z"
+      },
+      {
+        "at": 1768478400000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": false,
+        "utc": "2026-01-15T12:00:00Z"
+      },
+      {
+        "at": 1784151000000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": true,
+        "utc": "2026-07-15T21:30:00Z"
+      },
+      {
+        "at": 1784093400000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": false,
+        "utc": "2026-07-15T05:30:00Z"
+      },
+      {
+        "at": 1774745999000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": true,
+        "utc": "2026-03-29T00:59:59Z"
+      },
+      {
+        "at": 1774760400000,
+        "condition": {
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00",
+          "tz": "Europe/Lisbon"
+        },
+        "holds": false,
+        "utc": "2026-03-29T05:00:00Z"
+      },
+      {
+        "at": 1792796400000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00"
+        },
+        "holds": true,
+        "utc": "2026-10-23T23:00:00Z"
+      },
+      {
+        "at": 1792810800000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00"
+        },
+        "holds": true,
+        "utc": "2026-10-24T03:00:00Z"
+      },
+      {
+        "at": 1792882800000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00"
+        },
+        "holds": false,
+        "utc": "2026-10-24T23:00:00Z"
+      },
+      {
+        "at": 1792724400000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "22:00",
+          "on": "time",
+          "to": "06:00"
+        },
+        "holds": false,
+        "utc": "2026-10-23T03:00:00Z"
+      },
+      {
+        "at": 1792810800000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "22:00",
+          "not": true,
+          "on": "time",
+          "to": "06:00"
+        },
+        "holds": false,
+        "utc": "2026-10-24T03:00:00Z"
+      },
+      {
+        "at": 1792724400000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "22:00",
+          "not": true,
+          "on": "time",
+          "to": "06:00"
+        },
+        "holds": true,
+        "utc": "2026-10-23T03:00:00Z"
+      },
+      {
+        "at": 1792843200000,
+        "condition": {
+          "days": [
+            0,
+            6
+          ],
+          "from": "00:00",
+          "on": "time",
+          "to": "24:00"
+        },
+        "holds": true,
+        "utc": "2026-10-24T12:00:00Z"
+      },
+      {
+        "at": 1792972799000,
+        "condition": {
+          "days": [
+            0,
+            6
+          ],
+          "from": "00:00",
+          "on": "time",
+          "to": "24:00"
+        },
+        "holds": true,
+        "utc": "2026-10-25T23:59:59Z"
+      },
+      {
+        "at": 1792972800000,
+        "condition": {
+          "days": [
+            0,
+            6
+          ],
+          "from": "00:00",
+          "on": "time",
+          "to": "24:00"
+        },
+        "holds": false,
+        "utc": "2026-10-26T00:00:00Z"
+      },
+      {
+        "at": 1792799999000,
+        "condition": {
+          "days": [
+            0,
+            6
+          ],
+          "from": "00:00",
+          "on": "time",
+          "to": "24:00"
+        },
+        "holds": false,
+        "utc": "2026-10-23T23:59:59Z"
+      },
+      {
+        "at": 1772803800000,
+        "condition": {
+          "days": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "America/New_York"
+        },
+        "holds": false,
+        "utc": "2026-03-06T13:30:00Z"
+      },
+      {
+        "at": 1773063000000,
+        "condition": {
+          "days": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "America/New_York"
+        },
+        "holds": true,
+        "utc": "2026-03-09T13:30:00Z"
+      },
+      {
+        "at": 1773090000000,
+        "condition": {
+          "days": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "America/New_York"
+        },
+        "holds": false,
+        "utc": "2026-03-09T21:00:00Z"
+      },
+      {
+        "at": 1772895600000,
+        "condition": {
+          "days": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "America/New_York"
+        },
+        "holds": false,
+        "utc": "2026-03-07T15:00:00Z"
+      },
+      {
+        "at": 1772953199000,
+        "condition": {
+          "from": "02:00",
+          "on": "time",
+          "to": "03:00",
+          "tz": "America/New_York"
+        },
+        "holds": false,
+        "utc": "2026-03-08T06:59:59Z"
+      },
+      {
+        "at": 1772953200000,
+        "condition": {
+          "from": "02:00",
+          "on": "time",
+          "to": "03:00",
+          "tz": "America/New_York"
+        },
+        "holds": false,
+        "utc": "2026-03-08T07:00:00Z"
+      },
+      {
+        "at": 1773037800000,
+        "condition": {
+          "from": "02:00",
+          "on": "time",
+          "to": "03:00",
+          "tz": "America/New_York"
+        },
+        "holds": true,
+        "utc": "2026-03-09T06:30:00Z"
+      },
+      {
+        "at": 1793511000000,
+        "condition": {
+          "from": "01:00",
+          "on": "time",
+          "to": "02:00",
+          "tz": "America/New_York"
+        },
+        "holds": true,
+        "utc": "2026-11-01T05:30:00Z"
+      },
+      {
+        "at": 1793514600000,
+        "condition": {
+          "from": "01:00",
+          "on": "time",
+          "to": "02:00",
+          "tz": "America/New_York"
+        },
+        "holds": true,
+        "utc": "2026-11-01T06:30:00Z"
+      },
+      {
+        "at": 1793516400000,
+        "condition": {
+          "from": "01:00",
+          "on": "time",
+          "to": "02:00",
+          "tz": "America/New_York"
+        },
+        "holds": false,
+        "utc": "2026-11-01T07:00:00Z"
+      },
+      {
+        "at": 1792670400000,
+        "condition": {
+          "from": "09:00",
+          "not": true,
+          "on": "time",
+          "to": "17:00"
+        },
+        "holds": false,
+        "utc": "2026-10-22T12:00:00Z"
+      },
+      {
+        "at": 1792692000000,
+        "condition": {
+          "from": "09:00",
+          "not": true,
+          "on": "time",
+          "to": "17:00"
+        },
+        "holds": true,
+        "utc": "2026-10-22T18:00:00Z"
+      },
+      {
+        "at": 1792659599000,
+        "condition": {
+          "from": "09:00",
+          "not": true,
+          "on": "time",
+          "to": "17:00"
+        },
+        "holds": true,
+        "utc": "2026-10-22T08:59:59Z"
+      },
+      {
+        "at": 1768447800000,
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "Asia/Kolkata"
+        },
+        "holds": true,
+        "utc": "2026-01-15T03:30:00Z"
+      },
+      {
+        "at": 1768447799000,
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "Asia/Kolkata"
+        },
+        "holds": false,
+        "utc": "2026-01-15T03:29:59Z"
+      },
+      {
+        "at": 1768509000000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "10:00",
+          "tz": "Pacific/Auckland"
+        },
+        "holds": true,
+        "utc": "2026-01-15T20:30:00Z"
+      },
+      {
+        "at": 1784237400000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "10:00",
+          "tz": "Pacific/Auckland"
+        },
+        "holds": true,
+        "utc": "2026-07-16T21:30:00Z"
+      },
+      {
+        "at": 1784233800000,
+        "condition": {
+          "days": [
+            5
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "10:00",
+          "tz": "Pacific/Auckland"
+        },
+        "holds": false,
+        "utc": "2026-07-16T20:30:00Z"
+      },
+      {
+        "at": 1792713599000,
+        "condition": {
+          "days": [
+            4
+          ],
+          "from": "22:00",
+          "on": "time",
+          "to": "00:00"
+        },
+        "holds": true,
+        "utc": "2026-10-22T23:59:59Z"
+      },
+      {
+        "at": 1792713600000,
+        "condition": {
+          "days": [
+            4
+          ],
+          "from": "22:00",
+          "on": "time",
+          "to": "00:00"
+        },
+        "holds": false,
+        "utc": "2026-10-23T00:00:00Z"
+      }
+    ],
+    "refused": [
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "Mars/Olympus"
+        },
+        "field": "tz"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "+01:00"
+        },
+        "field": "tz"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "Etc/Unknown"
+        },
+        "field": "tz"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "Factory"
+        },
+        "field": "tz"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": ""
+        },
+        "field": "tz"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "../zoneinfo/UTC"
+        },
+        "field": "tz"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": "Europe/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL"
+        },
+        "field": "tz"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00",
+          "tz": 1
+        },
+        "field": "tz"
+      },
+      {
+        "condition": {
+          "from": "24:00",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "from"
+      },
+      {
+        "condition": {
+          "from": "9:00",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "from"
+      },
+      {
+        "condition": {
+          "from": "09:60",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "from"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "24:01"
+        },
+        "field": "to"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "on": "time",
+          "to": "09:00"
+        },
+        "field": "to"
+      },
+      {
+        "condition": {
+          "days": [
+            7
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "days"
+      },
+      {
+        "condition": {
+          "days": [],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "days"
+      },
+      {
+        "condition": {
+          "days": [
+            1,
+            1
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "days"
+      },
+      {
+        "condition": {
+          "days": [
+            "1"
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "days"
+      },
+      {
+        "condition": {
+          "days": [
+            1.5
+          ],
+          "from": "09:00",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "days"
+      },
+      {
+        "condition": {
+          "from": "09:00",
+          "not": "yes",
+          "on": "time",
+          "to": "17:00"
+        },
+        "field": "not"
+      }
+    ]
+  },
   "version": 1
 }

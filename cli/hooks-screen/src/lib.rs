@@ -4,9 +4,9 @@
 //! automation or agent sees them.
 //!
 //! - [`rules`]: ordered rules on origin (address, network, country), headers, size, whether the
-//!   sender is known, fields of the item ([`fields`]: *is*, *domain is*, *contains*, *pattern*,
-//!   *similar text*, *one of*, joined by and/or), and similarity to items you decided on
-//!   ([`shape`] and [`minhash`] fingerprints). Learned rules expire unless they keep matching.
+//!   sender is known, when it arrived ([`window`]: time windows), fields of the item ([`fields`]:
+//!   *is*, *domain is*, *contains*, *pattern*, *similar text*, *one of*, joined by and/or), and
+//!   similarity to items you decided on ([`shape`] and [`minhash`] fingerprints). Learned rules expire unless they keep matching.
 //! - [`evaluator`]: the optional AI evaluator, asked bounded questions with typed answers, never
 //!   tools; it fails closed to the source's default.
 //! - [`screen`]: the decision for an item, the quarantine list (Release, Drop, Always…), the
@@ -24,6 +24,7 @@ pub mod rules;
 pub mod screen;
 pub mod shape;
 pub mod text;
+pub mod window;
 
 use std::collections::BTreeMap;
 

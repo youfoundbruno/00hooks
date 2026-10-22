@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::fields::{self, compile_pattern, contains_words, domain_is, fold, pattern_matches};
 use crate::minhash::{DEFAULT_THRESHOLD, Signature};
+use crate::window::Window;
 use crate::{Item, Verdict};
 
 pub const MAX_RULES: usize = 500;
@@ -129,6 +130,19 @@ pub enum Condition {
         signature: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         threshold: Option<f64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        not: bool,
+    },
+    /// The item arrived within a time window ([`crate::window`]): `from` to `to` (`HH:MM`; past
+    /// midnight when `from` is later), on `days` (0 is Sunday; every day when absent), in the IANA
+    /// zone `tz` (UTC when absent), by its `received_at`.
+    Time {
+        from: String,
+        to: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        days: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tz: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         not: bool,
     },
@@ -271,6 +285,30 @@ fn describe(c: &Condition) -> String {
             };
             format!("{path} {}{} {what}", neg(*not), op.label())
         }
+        Condition::Time {
+            from,
+            to,
+            days,
+            tz,
+            not,
+        } => {
+            const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            let on = match days {
+                Some(d) => format!(
+                    " on {}",
+                    d.iter()
+                        .map(|&x| NAMES.get(usize::from(x)).copied().unwrap_or("?"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => String::new(),
+            };
+            format!(
+                "it arrived {}between {from} and {to}{on} ({})",
+                neg(*not),
+                tz.as_deref().unwrap_or("UTC")
+            )
+        }
         Condition::Similar { .. } => "it is similar to the item it was made from".into(),
     }
 }
@@ -316,6 +354,7 @@ enum Cond {
         not: bool,
     },
     Similar(Option<String>, Option<Box<Signature>>, f64),
+    Time(Box<Window>, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +571,16 @@ fn compile(c: &Condition) -> Result<Cond, String> {
                 not: *not,
             }
         }
+        Condition::Time {
+            from,
+            to,
+            days,
+            tz,
+            not,
+        } => Cond::Time(
+            Box::new(Window::new(from, to, days.as_deref(), tz.as_deref())?),
+            *not,
+        ),
         Condition::Similar {
             shape,
             text,
@@ -621,6 +670,8 @@ fn holds(c: &Cond, item: &Item, view: &mut View) -> bool {
             Cmp::Lt => (item.size as u64) < *n,
         },
         Cond::Known(want) => item.origin.known == Some(*want),
+        // When the item arrived (for a webhook, the relay's signed receivedAt), not now.
+        Cond::Time(w, not) => w.holds(item.received_at) != *not,
         Cond::Field { path, test, not } => {
             let values = fields::values_at(&item.payload, &item.headers, path);
             if values.is_empty() {
