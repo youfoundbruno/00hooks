@@ -344,6 +344,7 @@ pub async fn devices_list() -> CliResult {
         "ADDED".into(),
         "LAST SEEN".into(),
         "SEALING KEY".into(),
+        "TAGS".into(),
     ]];
     for d in devices {
         let mut name = sanitize(&d.name, false);
@@ -365,6 +366,7 @@ pub async fn devices_list() -> CliResult {
                 }
                 Some(k) => sanitize(k, false),
             },
+            tags_text(&d.tags),
         ]);
     }
     print!("{}", table(&rows));
@@ -445,6 +447,77 @@ pub async fn devices_rename(which: String, name: String) -> CliResult {
             .map_err(|e| Failure::new(sentence(&e.to_string())))?;
     }
     println!("Renamed {old} ({}) to {}.", d.id, sanitize(&d.name, false));
+    Ok(())
+}
+
+/// A device's tags in words, sanitised: `office, mac` or `-`.
+fn tags_text(tags: &[String]) -> String {
+    if tags.is_empty() {
+        return "-".into();
+    }
+    tags.iter()
+        .map(|t| sanitize(t, false))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `devices tag`: adds tags to a device (the relay keeps the whole list).
+pub async fn devices_tag(which: String, tags: Vec<String>) -> CliResult {
+    let add = crate::hooks::tag_list(tags, hooks_client::MAX_DEVICE_TAGS)?;
+    let ctx = Ctx::load()?;
+    let d = resolve_device(&ctx, &which).await?;
+    let mut tags = d.tags.clone();
+    for t in add {
+        if !tags.contains(&t) {
+            tags.push(t);
+        }
+    }
+    if tags.len() > hooks_client::MAX_DEVICE_TAGS {
+        return Err(Failure::new(format!(
+            "A device carries at most {} tags; untag one first.",
+            hooks_client::MAX_DEVICE_TAGS
+        )));
+    }
+    let d = ctx
+        .client
+        .set_device_tags(&d.id, &tags)
+        .await
+        .map_err(|e| ctx.explain(e))?;
+    println!(
+        "{} ({}) is tagged {}. Hooks delivered to these tags reach it from their next event.",
+        sanitize(&d.name, false),
+        d.id,
+        tags_text(&d.tags)
+    );
+    Ok(())
+}
+
+/// `devices untag`: removes tags from a device, or all of them.
+pub async fn devices_untag(which: String, tags: Vec<String>, all: bool) -> CliResult {
+    let ctx = Ctx::load()?;
+    let d = resolve_device(&ctx, &which).await?;
+    let keep: Vec<String> = if all {
+        Vec::new()
+    } else {
+        let drop: Vec<String> = tags.iter().map(|t| t.trim().to_string()).collect();
+        d.tags
+            .iter()
+            .filter(|t| !drop.contains(t))
+            .cloned()
+            .collect()
+    };
+    let d = ctx
+        .client
+        .set_device_tags(&d.id, &keep)
+        .await
+        .map_err(|e| ctx.explain(e))?;
+    println!(
+        "{} ({}) now has tags: {}. A hook whose recipients no device matches any more is paused \
+         until one does.",
+        sanitize(&d.name, false),
+        d.id,
+        tags_text(&d.tags)
+    );
     Ok(())
 }
 

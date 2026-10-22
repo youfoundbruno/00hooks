@@ -4,8 +4,9 @@ use std::io::BufRead;
 
 use clap::ValueEnum;
 use hooks_client::{
-    Error, Hook, HookPatch, HookResponse, RESPONSE_CONTENT_TYPES, RESPONSE_MAX_BODY, StrictHook,
-    TestSent,
+    DeliveryTarget, Error, Hook, HookPatch, HookResponse, MAX_TAG_LEN, MAX_TARGET_DEVICES,
+    MAX_TARGET_TAGS, RESPONSE_CONTENT_TYPES, RESPONSE_MAX_BODY, Recipients, StrictHook, TestSent,
+    valid_tag,
 };
 use serde_json::{Map, Value, json};
 
@@ -370,7 +371,13 @@ async fn resolve(ctx: &Ctx, which: &str) -> CliResult<Hook> {
 }
 
 fn state(h: &Hook) -> &'static str {
-    if h.enabled { "active" } else { "paused" }
+    if !h.enabled {
+        "paused"
+    } else if h.paused_for_no_recipient() {
+        "paused: no recipient"
+    } else {
+        "active"
+    }
 }
 
 pub async fn list(as_json: bool) -> CliResult {
@@ -445,9 +452,37 @@ pub fn describe(h: &Hook) -> String {
 
 /// Which devices get a hook's events.
 fn delivered_to(h: &Hook) -> String {
-    match &h.deliver_to {
-        Some(id) => sanitize(id, false),
-        None => "every device".into(),
+    match h.target() {
+        DeliveryTarget::All => "every device".into(),
+        DeliveryTarget::Only(r) => describe_recipients(&r),
+    }
+}
+
+/// A target in words: `dev_1, dev_2 + tag office-macs`.
+pub fn describe_recipients(r: &Recipients) -> String {
+    let devices = r
+        .devices
+        .iter()
+        .map(|d| sanitize(d, false))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tags = match r.tags.len() {
+        0 => String::new(),
+        1 => format!("tag {}", sanitize(&r.tags[0], false)),
+        _ => format!(
+            "tags {}",
+            r.tags
+                .iter()
+                .map(|t| sanitize(t, false))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    match (devices.is_empty(), tags.is_empty()) {
+        (false, false) => format!("{devices} + {tags}"),
+        (false, true) => devices,
+        (true, false) => tags,
+        (true, true) => "nobody".into(),
     }
 }
 
@@ -716,33 +751,132 @@ pub async fn set_enabled(which: String, enabled: bool) -> CliResult {
     Ok(())
 }
 
-/// `hooks deliver-to`: deliver a hook's events only to one device (`Some`), or to all (`None`).
-pub async fn deliver_to(which: String, device: Option<String>) -> CliResult {
+/// Tags given on the command line, checked as the relay checks them, without repeats.
+pub fn tag_list(tags: Vec<String>, max: usize) -> CliResult<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let t = t.trim().to_string();
+        if !valid_tag(&t) {
+            return Err(Failure::new(format!(
+                "{} isn't a tag: use 1 to {MAX_TAG_LEN} lowercase letters, digits, '.', '_' or \
+                 '-', starting and ending with a letter or digit.",
+                sanitize(&t, false)
+            )));
+        }
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    if out.len() > max {
+        return Err(Failure::new(format!("At most {max} tags, please.")));
+    }
+    Ok(out)
+}
+
+/// `hooks deliver-to`: deliver a hook's events to every device (`all`), or only to the given
+/// devices (by id or name) and the devices carrying any of the tags.
+pub async fn deliver_to(
+    which: String,
+    devices: Vec<String>,
+    tags: Vec<String>,
+    all: bool,
+) -> CliResult {
+    let tags = tag_list(tags, MAX_TARGET_TAGS)?;
+    if !all && devices.is_empty() && tags.is_empty() {
+        return Err(Failure::new(
+            "Name a device, a --tag, or --all for every device.",
+        ));
+    }
     let ctx = Ctx::load()?;
     let h = resolve(&ctx, &which).await?;
-    let target = match &device {
-        Some(d) => Some(crate::account::resolve_device(&ctx, d).await?),
-        None => None,
-    };
-    let patch = HookPatch {
-        deliver_to: Some(target.as_ref().map(|d| d.id.clone())),
-        ..Default::default()
+    let mut targets = Vec::new();
+    for d in &devices {
+        let d = crate::account::resolve_device(&ctx, d).await?;
+        if !targets
+            .iter()
+            .any(|t: &hooks_client::DeviceInfo| t.id == d.id)
+        {
+            targets.push(d);
+        }
+    }
+    if targets.len() > MAX_TARGET_DEVICES {
+        return Err(Failure::new(format!(
+            "A hook delivers to at most {MAX_TARGET_DEVICES} devices."
+        )));
+    }
+    // One device and no tags is what every relay understands (`deliverTo`); lists and tags need
+    // a relay that knows `recipients`.
+    let general = !all && !(targets.len() == 1 && tags.is_empty());
+    let patch = if all {
+        HookPatch {
+            deliver_to: Some(None),
+            ..Default::default()
+        }
+    } else if !general {
+        HookPatch {
+            deliver_to: Some(Some(targets[0].id.clone())),
+            ..Default::default()
+        }
+    } else {
+        HookPatch {
+            recipients: Some(Some(Recipients {
+                devices: targets.iter().map(|d| d.id.clone()).collect(),
+                tags: tags.clone(),
+            })),
+            ..Default::default()
+        }
     };
     let h = ctx
         .client
         .patch_hook(&h.id, &patch)
         .await
         .map_err(|e| ctx.explain(e))?;
+    if general && h.recipients().is_none() {
+        return Err(Failure::new(
+            "This relay is too old for lists of devices or tags (it ignored them); update it, \
+             or deliver to one device.",
+        ));
+    }
     let name = sanitize(&h.name, false);
-    match target {
-        Some(d) => println!(
+    if all {
+        println!("{name}'s events now go to every device.");
+    } else if !general {
+        let d = &targets[0];
+        println!(
             "{name}'s events now go only to {} ({}): its automations run on that computer \
              alone. `00hooks hooks deliver-to {} --all` sends them to every device again.",
             sanitize(&d.name, false),
             d.id,
             h.id
-        ),
-        None => println!("{name}'s events now go to every device."),
+        );
+    } else {
+        let mut who: Vec<String> = targets
+            .iter()
+            .map(|d| format!("{} ({})", sanitize(&d.name, false), d.id))
+            .collect();
+        match tags.len() {
+            0 => {}
+            1 => who.push(format!("devices tagged {}", sanitize(&tags[0], false))),
+            _ => who.push(format!(
+                "devices tagged any of {}",
+                tags.iter()
+                    .map(|t| sanitize(t, false))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+        println!(
+            "{name}'s events now go only to {}. `00hooks hooks deliver-to {} --all` sends them \
+             to every device again.",
+            who.join(" and "),
+            h.id
+        );
+    }
+    if h.paused_for_no_recipient() {
+        println!(
+            "No device matches yet, so {name} is paused: deliveries are refused (the provider \
+             retries) until one does. Tag a device with `00hooks devices tag <device> <tag>`."
+        );
     }
     Ok(())
 }
@@ -1179,6 +1313,41 @@ mod tests {
             text.contains("dev_2") && text.contains("200 text/xml, 11 B"),
             "{text}"
         );
+        // Recipients from a relay that knows them win over `deliverTo`.
+        h.deliver_to = None;
+        h.extra.insert(
+            "recipients".into(),
+            json!({"devices": ["dev_1", "dev_2"], "tags": ["office-macs"]}),
+        );
+        h.extra.insert("pausedReason".into(), json!("no_recipient"));
+        let text = describe(&h);
+        assert!(
+            text.contains("dev_1, dev_2 + tag office-macs")
+                && text.contains("paused: no recipient"),
+            "{text}"
+        );
+        h.extra.insert("recipients".into(), json!(null));
+        assert!(describe(&h).contains("every device"));
+    }
+
+    #[test]
+    fn recipients_and_tags_are_described_and_checked() {
+        let r = |d: &[&str], t: &[&str]| Recipients {
+            devices: d.iter().map(|s| s.to_string()).collect(),
+            tags: t.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(describe_recipients(&r(&["dev_1"], &[])), "dev_1");
+        assert_eq!(describe_recipients(&r(&[], &["a", "b"])), "tags a, b");
+        assert_eq!(
+            describe_recipients(&r(&["dev_1"], &["evil\u{1b}[2J"])),
+            "dev_1 + tag evil[2J"
+        );
+        assert_eq!(
+            tag_list(vec!["a".into(), " a ".into(), "b".into()], 10).unwrap(),
+            ["a", "b"]
+        );
+        assert!(tag_list(vec!["Office".into()], 10).is_err());
+        assert!(tag_list(vec!["a".into(), "b".into()], 1).is_err());
     }
 
     #[test]
