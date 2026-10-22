@@ -110,6 +110,26 @@ impl States {
         Admit::Run
     }
 
+    /// Whether `name` could run now, without counting a run (a batch checks before it is cut).
+    pub fn peek(&self, name: &str, rate: Option<RateLimit>, now: i64) -> Admit {
+        let Some(s) = self.map.get(name) else {
+            return Admit::Run;
+        };
+        if let Some(until) = s.paused_until
+            && now < until
+        {
+            return Admit::Paused { until };
+        }
+        if let Some(r) = rate {
+            let window = r.per.as_millis() as i64;
+            let recent = s.runs.iter().filter(|t| now - **t < window).count();
+            if recent >= r.max as usize {
+                return Admit::RateLimited { tell: false };
+            }
+        }
+        Admit::Run
+    }
+
     /// Record how a run went.
     pub fn record(
         &mut self,
@@ -227,6 +247,19 @@ mod tests {
         assert!(s.resume("b"));
         assert_eq!(s.admit("b", None, t0 + 10), Admit::Run);
         assert!(!s.resume("nobody"));
+        // Peeking never counts a run.
+        let rate = Some(RateLimit {
+            max: 1,
+            per: Duration::from_secs(60),
+        });
+        assert_eq!(s.peek("c", rate, t0), Admit::Run);
+        assert_eq!(s.peek("c", rate, t0), Admit::Run);
+        assert_eq!(s.admit("c", rate, t0), Admit::Run);
+        assert_eq!(
+            s.peek("c", rate, t0 + 1),
+            Admit::RateLimited { tell: false }
+        );
+        assert_eq!(s.peek("c", rate, t0 + 60_001), Admit::Run);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

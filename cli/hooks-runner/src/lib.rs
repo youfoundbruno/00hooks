@@ -32,6 +32,7 @@
 
 pub mod actions;
 pub mod ask;
+pub mod batch;
 pub mod catalogue;
 pub mod check;
 pub mod config;
