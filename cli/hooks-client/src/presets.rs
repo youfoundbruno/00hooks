@@ -562,6 +562,21 @@ fn signed_bytes(
     Some(out)
 }
 
+/// Whether a preset's deliveries carry content the provider signs but no timestamp the relay
+/// checks, so a captured delivery verifies forever and its replay defence rests on the body's hash
+/// (PROTOCOL §3, "replay marks"; the relay's `signsTimestamp`). False for `token` and `unverified`,
+/// which sign no content, and for an unknown preset.
+pub fn signs_no_timestamp(preset: &str) -> bool {
+    // The generic hmac preset needs a header to make a spec; its algorithm doesn't matter here.
+    match spec(&serde_json::json!({ "preset": preset, "header": "x-signature" })) {
+        Some(s) => {
+            s.timestamp.is_none()
+                && matches!(s.mac, Mac_::HmacSha256 | Mac_::HmacSha1 | Mac_::Ed25519)
+        }
+        None => false,
+    }
+}
+
 /// The strings Twilio may have signed (PROTOCOL §3): the URL as reached, without its port, and with
 /// the scheme's default port, each followed (for a form body) by the sorted parameters.
 pub fn twilio_signed(d: &Delivery) -> Option<Vec<String>> {

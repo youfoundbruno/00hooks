@@ -24,12 +24,15 @@ use sha2::{Digest, Sha256};
 use crate::Result;
 use crate::jsonl::Jsonl;
 
-/// The presets whose relay replay marks rest on the body's hash because the provider signs no
-/// timestamp (PROTOCOL §3, "replay marks"). Keep this list in step with that table: a preset added
-/// there that signs no timestamp belongs here too. Never `token` or `unverified` (the relay doesn't
-/// dedupe them, and identical bodies are legitimate there), nor a preset that signs a timestamp
-/// (the timestamp already refuses old replays, and identical bodies can be legitimate).
-pub const BODY_HASH_PRESETS: &[&str] = &["github", "shopify", "twilio", "meta", "hmac"];
+/// Whether a preset's relay replay marks rest on the body's hash because the provider signs no
+/// timestamp the relay checks (PROTOCOL §3, "replay marks"). Read from the client's preset table
+/// (`hooks_client::presets`, held to the relay's by the shared vectors), so a preset added there is
+/// covered here. Never `token` or `unverified` (the relay doesn't dedupe them, and identical bodies
+/// are legitimate there), nor a preset that signs a timestamp (the timestamp already refuses old
+/// replays, and identical bodies can be legitimate).
+pub fn body_hash_preset(preset: &str) -> bool {
+    hooks_client::presets::signs_no_timestamp(preset)
+}
 
 /// The most marks kept; the oldest go first.
 pub const KEEP_MARKS: usize = 100_000;
@@ -42,7 +45,7 @@ const DAY_MS: i64 = 86_400_000;
 /// Whether an event's content is deduped: verified (by the relay, or by this device for a strict
 /// hook) and of a preset that signs no timestamp.
 pub fn applies(e: &Event) -> bool {
-    e.verified && BODY_HASH_PRESETS.contains(&e.preset.as_str())
+    e.verified && body_hash_preset(&e.preset)
 }
 
 /// The content's hash: SHA-256 over a label, the hook id and the body bytes.
@@ -187,7 +190,16 @@ mod tests {
     #[test]
     fn only_verified_events_of_untimestamped_presets() {
         let mut e = test_event(1, Some("push"), &json!({}));
-        for p in ["github", "shopify", "twilio", "meta", "hmac"] {
+        for p in [
+            "github",
+            "shopify",
+            "twilio",
+            "meta",
+            "hmac",
+            "typeform",
+            "pagerduty",
+            "zoom",
+        ] {
             e.preset = p.into();
             assert!(applies(&e), "{p}");
         }
@@ -199,6 +211,10 @@ mod tests {
             "linear",
             "standard-webhooks",
             "standard-webhooks-ed25519",
+            "calendly",
+            "paddle",
+            "twitch",
+            "no-such-preset",
         ] {
             e.preset = p.into();
             assert!(!applies(&e), "{p}");
