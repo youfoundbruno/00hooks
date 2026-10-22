@@ -149,8 +149,10 @@ export type FullScope = "account" | "hook" | "held";
 
 /**
  * The plan's limits the Worker passes with each delivery (PROTOCOL §2a), counted exactly here: the
- * token buckets and daily counters are rows of this object's SQLite, read and written in the same
- * synchronous step that decides the append, so no timer runs and hibernation is unaffected.
+ * token buckets and daily counters are rows of this object's SQLite (`counters`, `hook_usage`), read
+ * in the synchronous step that decides the append and written in its commit's transaction, with
+ * the appends in between counted from memory (`Reservation.count`). No timer runs and hibernation
+ * is unaffected; an append lost before its commit was never stored, and is never counted.
  */
 export interface PlanInput {
   /** The plan's name, as the `limit` stream event says it. */
@@ -264,7 +266,50 @@ interface Reservation {
   marks: string[];
   /** `hook_id\nsender mark` of an offline notice it decided to send. */
   notice?: string;
+  /** When it was taken (ms): what its counts are dated, and its tokens taken, at commit. */
+  at?: number;
+  /**
+   * A delivery the plan counts (PROTOCOL §2a): one more today for the account and the hook, and a
+   * token from each rate's bucket. Written with the commit, in the rows it writes anyway; until then
+   * the limits count it from here, so the plan stays exact, and an append lost before its commit
+   * (an eviction) was never taken and is never counted.
+   */
+  count?: { day: number; hook: Rate | null; account: Rate | null };
+  /** An append to the log (not held, not a release): the hook's "last seen" moves at commit. */
+  seen?: boolean;
+  /** D1's `last_event_at` is due a write for this append (at most once a minute per hook). */
+  touch?: boolean;
 }
+
+/** A token bucket's rate and size (PROTOCOL §2a). */
+interface Rate {
+  perMin: number;
+  burst: number;
+}
+
+/** A hook's row in `hook_usage`: its share of the log, today's count, last delivery, and bucket. */
+interface HookCounters extends Record<string, SqlStorageValue> {
+  events: number;
+  bytes: number;
+  day: number;
+  taken: number;
+  last_at: number | null;
+  written_at: number;
+  tokens: number | null;
+  tokens_at: number | null;
+}
+
+/** The account's row in `counters`: the head, today's count, and the account's bucket. */
+interface AccountCounters extends Record<string, SqlStorageValue> {
+  head: number;
+  day: number;
+  taken: number;
+  tokens: number | null;
+  tokens_at: number | null;
+}
+
+/** Usage changes gathered while deleting, written once per hook when the step ends. */
+type UsageDelta = Map<string, Quota>;
 
 /** The per-socket state, kept in the WebSocket's attachment so it survives hibernation. */
 interface Attachment {
@@ -468,6 +513,71 @@ export class AccountObject extends DurableObject<Env> {
     for (const index of ["events_received", "events_hook", "events_route", "seen_at", "envelopes_device", "held_hook", "nonces_at"]) {
       this.sql.exec(`DROP INDEX IF EXISTS ${index}`);
     }
+    // Counters that every append wrote as rows of their own now share one row each, written once
+    // per append: the account's (`counters`: the head, today's count, the account's bucket, which
+    // were rows of `meta`, `daily` and `buckets`) and each hook's (`hook_usage`, which takes in its
+    // `daily` count, its `buckets` row and its `hook_seen` row). What the log holds in all is the
+    // sum of the hooks' rows, no longer a counter of its own.
+    for (const col of [
+      "day INTEGER NOT NULL DEFAULT 0",
+      "taken INTEGER NOT NULL DEFAULT 0",
+      "last_at INTEGER",
+      "written_at INTEGER NOT NULL DEFAULT 0",
+      "tokens REAL",
+      "tokens_at INTEGER",
+    ]) {
+      try {
+        this.sql.exec(`ALTER TABLE hook_usage ADD COLUMN ${col}`);
+      } catch {
+        // A new object: the table was created with it.
+      }
+    }
+    const head = this.sql.exec<{ value: number }>("SELECT value FROM meta WHERE key = 'head'").toArray()[0]?.value ?? 0;
+    this.sql.exec("INSERT INTO counters (id, head) VALUES (1, ?) ON CONFLICT(id) DO NOTHING", head);
+    // Each hook's share of the log, counted from the log itself (as `usage()` once did for objects
+    // without counters), so the hooks' rows add up to exactly what the log holds. An envelope whose
+    // event is gone can never be streamed (it was always deleted with it): it goes now.
+    this.sql.exec("DELETE FROM envelopes WHERE seq NOT IN (SELECT seq FROM events)");
+    this.sql.exec("UPDATE hook_usage SET events = 0, bytes = 0");
+    this.sql.exec(
+      `INSERT INTO hook_usage (hook_id, events, bytes)
+       SELECT ev.hook_id, count(*), sum(length(ev.body) + length(ev.headers)) + coalesce(sum(
+         (SELECT sum(length(e.ct) + ${ENVELOPE_OVERHEAD}) FROM envelopes e WHERE e.seq = ev.seq)), 0)
+       FROM events ev GROUP BY ev.hook_id
+       ON CONFLICT(hook_id) DO UPDATE SET events = excluded.events, bytes = excluded.bytes`,
+    );
+    const tables = new Set(this.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'").toArray().map((r) => r.name));
+    // Today's counts: the newest day kept of each.
+    const daily = this.sql
+      .exec<{ key: string; day: number; count: number }>(
+        "SELECT key, day, count FROM daily d WHERE (key = 'a' OR key LIKE 'h:%') AND day = (SELECT max(day) FROM daily x WHERE x.key = d.key)",
+      )
+      .toArray();
+    for (const d of daily) {
+      if (d.key === "a") this.sql.exec("UPDATE counters SET day = ?, taken = ? WHERE id = 1", d.day, d.count);
+      else this.upsertHookColumns(d.key.slice(2), "day = ?2, taken = ?3", d.day, d.count);
+    }
+    this.sql.exec("DELETE FROM daily WHERE key = 'a' OR key LIKE 'h:%'");
+    if (tables.has("buckets")) {
+      for (const b of this.sql.exec<{ key: string; tokens: number; at: number }>("SELECT key, tokens, at FROM buckets").toArray()) {
+        if (b.key === "a") this.sql.exec("UPDATE counters SET tokens = ?, tokens_at = ? WHERE id = 1", b.tokens, b.at);
+        else if (b.key.startsWith("h:")) this.upsertHookColumns(b.key.slice(2), "tokens = ?2, tokens_at = ?3", b.tokens, b.at);
+      }
+      this.sql.exec("DROP TABLE buckets");
+    }
+    if (tables.has("hook_seen")) {
+      for (const h of this.sql.exec<{ hook_id: string; last_at: number; written_at: number }>("SELECT hook_id, last_at, written_at FROM hook_seen").toArray()) {
+        this.upsertHookColumns(h.hook_id, "last_at = ?2, written_at = ?3", h.last_at, h.written_at);
+      }
+      this.sql.exec("DROP TABLE hook_seen");
+    }
+    this.sql.exec("DELETE FROM meta WHERE key IN ('head', 'log_events', 'log_bytes')");
+  }
+
+  /** Sets columns of a hook's row (`set` names them as ?2, ?3), creating the row when it has none. */
+  private upsertHookColumns(hookId: string, set: string, a: SqlStorageValue, b: SqlStorageValue): void {
+    this.sql.exec(`INSERT INTO hook_usage (hook_id, events, bytes) VALUES (?1, 0, 0) ON CONFLICT(hook_id) DO NOTHING`, hookId);
+    this.sql.exec(`UPDATE hook_usage SET ${set} WHERE hook_id = ?1`, hookId, a, b);
   }
 
   private signingKey(): Promise<RelayKey | null> {
@@ -478,8 +588,27 @@ export class AccountObject extends DurableObject<Env> {
   // ── bookkeeping ────────────────────────────────────────────────────────────
 
   private head(): number {
-    const row = this.sql.exec<{ value: number }>("SELECT value FROM meta WHERE key = 'head'").toArray()[0];
-    return row?.value ?? 0;
+    return this.accountCounters().head;
+  }
+
+  private accountCounters(): AccountCounters {
+    return (
+      this.sql.exec<AccountCounters>("SELECT head, day, taken, tokens, tokens_at FROM counters WHERE id = 1").toArray()[0] ?? {
+        head: 0,
+        day: 0,
+        taken: 0,
+        tokens: null,
+        tokens_at: null,
+      }
+    );
+  }
+
+  private hookCounters(hookId: string): HookCounters {
+    return (
+      this.sql
+        .exec<HookCounters>("SELECT events, bytes, day, taken, last_at, written_at, tokens, tokens_at FROM hook_usage WHERE hook_id = ?", hookId)
+        .toArray()[0] ?? { events: 0, bytes: 0, day: 0, taken: 0, last_at: null, written_at: 0, tokens: null, tokens_at: null }
+    );
   }
 
   private quota(): Quota {
@@ -564,7 +693,10 @@ export class AccountObject extends DurableObject<Env> {
     return { events: r?.events ?? 0, bytes: r?.bytes ?? 0 };
   }
 
-  /** Adds (or with negative numbers, removes) to one hook's counters, dropping rows that reach zero. */
+  /**
+   * Adds (or with negative numbers, removes) to one hook's counters: in the log (its row keeps its
+   * other counters, so it stays), or in the hold (dropping rows that reach zero).
+   */
   private addHookUsage(table: "hook_usage" | "held_usage", hookId: string, events: number, bytes: number): void {
     this.sql.exec(
       `INSERT INTO ${table} (hook_id, events, bytes) VALUES (?1, max(?2, 0), max(?3, 0))
@@ -573,7 +705,12 @@ export class AccountObject extends DurableObject<Env> {
       events,
       bytes,
     );
-    this.sql.exec(`DELETE FROM ${table} WHERE hook_id = ? AND events = 0 AND bytes = 0`, hookId);
+    if (table === "held_usage") this.sql.exec(`DELETE FROM held_usage WHERE hook_id = ? AND events = 0 AND bytes = 0`, hookId);
+  }
+
+  /** Writes what a step's deletes took from each hook's share of the log: one write per hook. */
+  private applyUsage(delta: UsageDelta): void {
+    for (const [hookId, d] of delta) if (d.events !== 0 || d.bytes !== 0) this.addHookUsage("hook_usage", hookId, d.events, d.bytes);
   }
 
   /** Everything the hold has, across hooks. */
@@ -619,38 +756,20 @@ export class AccountObject extends DurableObject<Env> {
   }
 
   /**
-   * What the log holds: events, and bytes (envelopes, plus any legacy body and headers), kept as
-   * counters in `meta` so an append doesn't scan the log. An object from before the counters
-   * existed counts once.
+   * What the log holds: events, and bytes (envelopes, plus any legacy body and headers): the sum of
+   * the hooks' counters, which every append, release and delete keeps exact, so an append doesn't
+   * scan the log and a delete writes one row per hook rather than another for the account.
    */
   private usage(): Quota {
-    const rows = this.sql
-      .exec<{ key: string; value: number }>("SELECT key, value FROM meta WHERE key IN ('log_events', 'log_bytes')")
-      .toArray();
-    if (rows.length === 2) {
-      const get = (k: string) => rows.find((r) => r.key === k)!.value;
-      return { events: get("log_events"), bytes: get("log_bytes") };
-    }
-    const r = this.sql
-      .exec<{ n: number; b: number | null }>("SELECT count(*) AS n, sum(length(body) + length(headers)) AS b FROM events")
-      .one();
-    const e = this.sql.exec<{ b: number | null }>(`SELECT sum(length(ct) + ${ENVELOPE_OVERHEAD}) AS b FROM envelopes`).one();
-    const u = { events: r.n, bytes: (r.b ?? 0) + (e.b ?? 0) };
-    this.setUsage(u);
-    return u;
-  }
-
-  private setUsage(u: Quota): void {
-    const up = "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
-    this.sql.exec(up, "log_events", Math.max(0, u.events));
-    this.sql.exec(up, "log_bytes", Math.max(0, u.bytes));
+    const r = this.sql.exec<{ e: number | null; b: number | null }>("SELECT sum(events) AS e, sum(bytes) AS b FROM hook_usage").one();
+    return { events: r.e ?? 0, bytes: r.b ?? 0 };
   }
 
   /**
-   * Deletes envelopes matching `where` (written against the alias `e`), keeping the account's and
-   * each hook's usage counters right.
+   * Deletes envelopes matching `where` (written against the alias `e`), adding what they held to
+   * `delta` for the caller to write once (`applyUsage`).
    */
-  private deleteEnvelopes(where: string, ...args: SqlStorageValue[]): void {
+  private deleteEnvelopes(delta: UsageDelta, where: string, ...args: SqlStorageValue[]): void {
     const groups = this.sql
       .exec<{ h: string | null; b: number | null }>(
         `SELECT ev.hook_id AS h, sum(length(e.ct) + ${ENVELOPE_OVERHEAD}) AS b
@@ -659,19 +778,13 @@ export class AccountObject extends DurableObject<Env> {
       )
       .toArray();
     if (groups.length === 0) return;
-    const u = this.usage();
     this.sql.exec(`DELETE FROM envelopes AS e WHERE ${where}`, ...args);
-    let total = 0;
-    for (const g of groups) {
-      total += g.b ?? 0;
-      if (g.h !== null) this.addHookUsage("hook_usage", g.h, 0, -(g.b ?? 0));
-    }
-    this.setUsage({ events: u.events, bytes: u.bytes - total });
+    for (const g of groups) if (g.h !== null) addDelta(delta, g.h, 0, -(g.b ?? 0));
   }
 
-  /** Deletes the events with seq in [lo, hi] and their envelopes, keeping the usage counters right. */
-  private deleteRange(lo: number, hi: number): void {
-    this.deleteEnvelopes("e.seq BETWEEN ? AND ?", lo, hi);
+  /** Deletes the events with seq in [lo, hi] and their envelopes, adding what they held to `delta`. */
+  private deleteRange(delta: UsageDelta, lo: number, hi: number): void {
+    this.deleteEnvelopes(delta, "e.seq BETWEEN ? AND ?", lo, hi);
     const groups = this.sql
       .exec<{ h: string; n: number; b: number | null }>(
         `SELECT hook_id AS h, count(*) AS n, sum(length(body) + length(headers)) AS b FROM events
@@ -681,17 +794,9 @@ export class AccountObject extends DurableObject<Env> {
       )
       .toArray();
     if (groups.length === 0) return;
-    const u = this.usage();
     this.sql.exec("DELETE FROM events WHERE seq BETWEEN ? AND ?", lo, hi);
-    let n = 0;
-    let b = 0;
-    for (const g of groups) {
-      n += g.n;
-      b += g.b ?? 0;
-      // An event row's own bytes (its empty headers and body) were counted with it.
-      this.addHookUsage("hook_usage", g.h, -g.n, -(g.b ?? 0));
-    }
-    this.setUsage({ events: u.events - n, bytes: u.bytes - b });
+    // An event row's own bytes (its empty headers and body) were counted with it.
+    for (const g of groups) addDelta(delta, g.h, -g.n, -(g.b ?? 0));
   }
 
   private retentionMs(): number {
@@ -955,10 +1060,14 @@ export class AccountObject extends DurableObject<Env> {
     }
     const id = newId("evt");
     const seq = held ? 0 : this.takeSeq();
+    // Taken: it counts against the plan's buckets and today's counters, and the hook was seen. The
+    // counts are written with the commit; the limits count the reservation until then.
+    reservation.at = now;
+    if (input.plan) reservation.count = planCount(input.plan, now);
+    reservation.seen = !held;
+    const touch = held ? false : this.touchDue(input.hookId, now);
+    reservation.touch = touch;
     this.reservations.add(reservation);
-    // Taken: it counts against the plan's buckets and today's counters, and the hook was seen.
-    if (input.plan) this.countAccepted(input.hookId, input.plan, now);
-    const touch = held ? false : this.seen(input.hookId, now);
 
     try {
       if (held) {
@@ -993,6 +1102,7 @@ export class AccountObject extends DurableObject<Env> {
           }
           // The hold is counted apart from the log: a held flood can't refuse the hook's deliveries.
           this.addHookUsage("held_usage", input.hookId, 1, bytes);
+          this.commitCounts(reservation, null, null);
         });
         await this.ensureAlarm();
         return { duplicate: false, full: false, held: true, id, sealedFor: sealed.length - revoked.size, notice: false };
@@ -1038,7 +1148,6 @@ export class AccountObject extends DurableObject<Env> {
                 input.receivedAt,
               );
             }
-            this.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", seq);
             // Routing metadata only: the body and headers columns stay empty (they held plaintext in
             // phase 0, and are kept so older rows still read).
             this.sql.exec(
@@ -1069,9 +1178,8 @@ export class AccountObject extends DurableObject<Env> {
               bytes += e.ct.byteLength + ENVELOPE_OVERHEAD;
               sealedFor++;
             }
-            const u = this.usage();
-            this.setUsage({ events: u.events + 1, bytes: u.bytes + bytes });
-            this.addHookUsage("hook_usage", input.hookId, 1, bytes);
+            // The head, the hook's share of the log, today's counts, buckets and "last seen": two rows.
+            this.commitCounts(reservation, { events: 1, bytes }, seq);
           });
           this.deliverLive(seq);
         },
@@ -1086,17 +1194,20 @@ export class AccountObject extends DurableObject<Env> {
 
   // ── plans: rates, daily caps, pauses and notices (PROTOCOL §2a) ────────────
 
-  /** A token bucket's tokens now, refilled at `perMin` up to `burst`; full when it has no row. */
-  private bucket(key: string, perMin: number, burst: number, now: number): number {
-    const r = this.sql.exec<{ tokens: number; at: number }>("SELECT tokens, at FROM buckets WHERE key = ?", key).toArray()[0];
-    if (!r) return burst;
-    return Math.min(burst, r.tokens + (Math.max(0, now - r.at) * perMin) / 60_000);
+  /** Reservations the plan counts that haven't committed yet, matching `which`. */
+  private pending(which: (r: Reservation) => boolean): number {
+    let n = 0;
+    for (const r of this.reservations) if (r.count && which(r)) n++;
+    return n;
   }
 
-  private dailyCount(key: string, day: number): number {
-    return this.sql.exec<{ count: number }>("SELECT count FROM daily WHERE key = ? AND day = ?", key, day).toArray()[0]?.count ?? 0;
+  /** Deliveries the account has taken today: committed, and in flight. */
+  private takenToday(day: number): number {
+    const a = this.accountCounters();
+    return (a.day === day ? a.taken : 0) + this.pending((r) => r.count!.day === day);
   }
 
+  /** Counts refusals and drops (`ar`, `r:<hook>`, `ad`) for the day: rare, so rows of their own. */
   private addDaily(key: string, day: number, n = 1): void {
     if (this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM daily WHERE day = ?", day).one().n === 0) {
       // The first count of a new UTC day: yesterday's are of no more use.
@@ -1113,60 +1224,91 @@ export class AccountObject extends DurableObject<Env> {
   /**
    * Whether the plan refuses one more delivery to `hookId` now, without counting anything: an
    * expired plan that takes nothing, the account's daily cap, then the hook's and the account's
-   * token buckets. Null when every limit passes.
+   * token buckets. Null when every limit passes. Deliveries taken but not yet committed count as
+   * taken, so the limits are exactly what they were when each was counted as it was taken.
    */
   private limitRefusal(hookId: string, plan: PlanInput, now: number): Omit<Refusal, "pause"> | null {
     const day = utcDay(now);
-    if (plan.eventsPerDay !== null && this.dailyCount("a", day) >= plan.eventsPerDay) {
+    if (plan.eventsPerDay !== null && this.takenToday(day) >= plan.eventsPerDay) {
       // A plan that takes nothing at all is a lapsed entitlement's fallback (or a suspension).
       if (plan.eventsPerDay === 0 && plan.expired) return { error: "quota", scope: "plan_expired", retryAfter: PLAN_EXPIRED_RETRY_S };
       return { error: "quota", scope: "daily", retryAfter: secondsUntilDay(day + 1, now) };
     }
-    const check = (key: string, perMin: number | null, burst: number | null, scope: LimitScope) => {
-      if (perMin === null || perMin <= 0) return null;
-      const size = Math.max(1, burst ?? perMin);
-      const tokens = this.bucket(key, perMin, size, now);
+    const check = (stored: { tokens: number | null; tokens_at: number | null }, rate: Rate | null, inFlight: number, scope: LimitScope) => {
+      if (!rate) return null;
+      const tokens = refill(stored, rate, now) - inFlight;
       if (tokens >= 1) return null;
-      return { error: "rate_limited" as const, scope, retryAfter: Math.max(1, Math.ceil(((1 - tokens) * 60_000) / perMin / 1000)) };
+      return { error: "rate_limited" as const, scope, retryAfter: Math.max(1, Math.ceil(((1 - tokens) * 60_000) / rate.perMin / 1000)) };
     };
+    const count = planCount(plan, now);
     return (
-      check(`h:${hookId}`, plan.hookRatePerMin, plan.hookBurst, "hook_rate") ??
-      check("a", plan.accountRatePerMin, plan.accountBurst, "account_rate")
+      check(this.hookCounters(hookId), count.hook, this.pending((r) => r.hookId === hookId && r.count!.hook !== null), "hook_rate") ??
+      check(this.accountCounters(), count.account, this.pending((r) => r.count!.account !== null), "account_rate")
     );
   }
 
-  /** Counts a taken delivery: a token from each bucket, one more today for the account and the hook. */
-  private countAccepted(hookId: string, plan: PlanInput, now: number): void {
-    const take = (key: string, perMin: number | null, burst: number | null) => {
-      if (perMin === null || perMin <= 0) return;
-      const tokens = this.bucket(key, perMin, Math.max(1, burst ?? perMin), now);
+  /** Whether D1's `last_event_at` is due a write for a delivery to `hookId` now (once a minute). */
+  private touchDue(hookId: string, now: number): boolean {
+    for (const r of this.reservations) if (r.hookId === hookId && r.touch) return false;
+    return now - this.hookCounters(hookId).written_at >= LAST_EVENT_WRITE_MS;
+  }
+
+  /**
+   * Writes what a committed append, hold or release changes, in one row for the hook and one for
+   * the account: the hook's share of the log (`add`), the head (`head`), today's counts and a token
+   * from each bucket (a counted delivery), and the hook's "last seen" (an append to the log). Runs
+   * inside the commit's transaction, so the counts are exactly the commits.
+   */
+  private commitCounts(r: Reservation, add: Quota | null, head: number | null): void {
+    const c = r.count;
+    const at = r.at ?? Date.now();
+    if (add || c || r.seen) {
+      const h = this.hookCounters(r.hookId);
+      if (add) {
+        h.events = Math.max(0, h.events + add.events);
+        h.bytes = Math.max(0, h.bytes + add.bytes);
+      }
+      if (c) {
+        [h.day, h.taken] = countDay(h.day, h.taken, c.day);
+        if (c.hook) [h.tokens, h.tokens_at] = take(h, c.hook, at);
+      }
+      if (r.seen) {
+        h.last_at = at;
+        if (r.touch) h.written_at = at;
+      }
       this.sql.exec(
-        "INSERT INTO buckets (key, tokens, at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET tokens = excluded.tokens, at = excluded.at",
-        key,
-        tokens - 1,
-        now,
+        `INSERT INTO hook_usage (hook_id, events, bytes, day, taken, last_at, written_at, tokens, tokens_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(hook_id) DO UPDATE SET events = ?2, bytes = ?3, day = ?4, taken = ?5, last_at = ?6, written_at = ?7,
+           tokens = ?8, tokens_at = ?9`,
+        r.hookId,
+        h.events,
+        h.bytes,
+        h.day,
+        h.taken,
+        h.last_at,
+        h.written_at,
+        h.tokens,
+        h.tokens_at,
       );
-    };
-    take(`h:${hookId}`, plan.hookRatePerMin, plan.hookBurst);
-    take("a", plan.accountRatePerMin, plan.accountBurst);
-    const day = utcDay(now);
-    this.addDaily("a", day);
-    this.addDaily(`h:${hookId}`, day);
-  }
-
-  /** Notes that the hook was just delivered to; true when D1's `last_event_at` is due a write. */
-  private seen(hookId: string, now: number): boolean {
-    const r = this.sql.exec<{ written_at: number }>("SELECT written_at FROM hook_seen WHERE hook_id = ?", hookId).toArray()[0];
-    const touch = !r || now - r.written_at >= LAST_EVENT_WRITE_MS;
-    this.sql.exec(
-      `INSERT INTO hook_seen (hook_id, last_at, written_at) VALUES (?1, ?2, ?3)
-       ON CONFLICT(hook_id) DO UPDATE SET last_at = ?2, written_at = CASE WHEN ?4 THEN ?3 ELSE written_at END`,
-      hookId,
-      now,
-      touch ? now : 0,
-      touch ? 1 : 0,
-    );
-    return touch;
+    }
+    if (head !== null || c) {
+      const a = this.accountCounters();
+      if (head !== null) a.head = head;
+      if (c) {
+        [a.day, a.taken] = countDay(a.day, a.taken, c.day);
+        if (c.account) [a.tokens, a.tokens_at] = take(a, c.account, at);
+      }
+      this.sql.exec(
+        `INSERT INTO counters (id, head, day, taken, tokens, tokens_at) VALUES (1, ?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET head = ?1, day = ?2, taken = ?3, tokens = ?4, tokens_at = ?5`,
+        a.head,
+        a.day,
+        a.taken,
+        a.tokens,
+        a.tokens_at,
+      );
+    }
   }
 
   /**
@@ -1241,7 +1383,7 @@ export class AccountObject extends DurableObject<Env> {
             } else {
               this.sql.exec("INSERT INTO pruned (from_seq, to_seq, reason) VALUES (?, ?, 'over_limit')", seq, seq);
             }
-            this.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", seq);
+            this.sql.exec("UPDATE counters SET head = ? WHERE id = 1", seq);
           });
         },
       );
@@ -1330,19 +1472,20 @@ export class AccountObject extends DurableObject<Env> {
     );
     const perHook: AccountUsage["perHook"] = {};
     const hook = (id: string) => (perHook[id] ??= { today: 0, refused: 0, backlog: { events: 0, bytes: 0 }, lastEventAt: null });
-    for (const [k, n] of counts) {
-      if (k.startsWith("h:")) hook(k.slice(2)).today = n;
-      else if (k.startsWith("r:")) hook(k.slice(2)).refused = n;
+    for (const [k, n] of counts) if (k.startsWith("r:")) hook(k.slice(2)).refused = n;
+    for (const r of this.sql
+      .exec<HookCounters & { hook_id: string }>("SELECT hook_id, events, bytes, day, taken, last_at FROM hook_usage")
+      .toArray()) {
+      // A hook is listed for what it holds, took today, or was last delivered (a deleted hook keeps
+      // what it took today, and what it still holds, but no longer its last delivery).
+      if (r.day === day && r.taken > 0) hook(r.hook_id).today = r.taken;
+      if (r.events > 0 || r.bytes > 0) hook(r.hook_id).backlog = { events: r.events, bytes: r.bytes };
+      if (r.last_at !== null) hook(r.hook_id).lastEventAt = r.last_at;
     }
-    for (const r of this.sql.exec<{ hook_id: string; events: number; bytes: number }>("SELECT hook_id, events, bytes FROM hook_usage").toArray()) {
-      hook(r.hook_id).backlog = { events: r.events, bytes: r.bytes };
-    }
-    for (const r of this.sql.exec<{ hook_id: string; last_at: number }>("SELECT hook_id, last_at FROM hook_seen").toArray()) {
-      hook(r.hook_id).lastEventAt = r.last_at;
-    }
+    const a = this.accountCounters();
     return {
       day,
-      today: { events: counts.get("a") ?? 0, refused: counts.get("ar") ?? 0, dropped: counts.get("ad") ?? 0 },
+      today: { events: a.day === day ? a.taken : 0, refused: counts.get("ar") ?? 0, dropped: counts.get("ad") ?? 0 },
       perHook,
       backlog: this.usage(),
     };
@@ -1515,7 +1658,6 @@ export class AccountObject extends DurableObject<Env> {
           if (this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM held_events WHERE id = ?", id).one().n === 0) return;
           const revoked = this.revokedAmong(signed.map((e) => e.device_id));
           this.ctx.storage.transactionSync(() => {
-            this.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", seq);
             // Retention counts from now, when it enters the log, not from when it was received:
             // an old event released today must never take newer ones with it (PROTOCOL §7).
             this.sql.exec(
@@ -1545,9 +1687,7 @@ export class AccountObject extends DurableObject<Env> {
             this.sql.exec("DELETE FROM held_events WHERE id = ?", id);
             // The bytes move from the hold to the log.
             this.addHookUsage("held_usage", h.hook_id, -1, -((heldBytes ?? 0) + 2));
-            const u = this.usage();
-            this.setUsage({ events: u.events + 1, bytes: u.bytes + moved });
-            this.addHookUsage("hook_usage", h.hook_id, 1, moved);
+            this.commitCounts(reservation, { events: 1, bytes: moved }, seq);
           });
           released = true;
           this.deliverLive(seq);
@@ -1613,13 +1753,18 @@ export class AccountObject extends DurableObject<Env> {
     const current = this.ensureDevice(deviceId).acked;
     const next = Math.max(current, Math.min(through, head));
     if (next !== current) {
-      this.sql.exec("UPDATE devices SET acked = ? WHERE id = ?", next, deviceId);
-      // This device's envelopes are of no use to anyone once it has them. Those up to `current`
-      // went with its earlier acks, so the range is the newly acknowledged seqs alone (read by
-      // `envelopes_seq_device`, without scanning other devices' backlog).
-      this.deleteEnvelopes("e.seq > ? AND e.seq <= ? AND e.device_id = ?", current, next, deviceId);
-      this.pruneRecipients(deviceId, current, next);
-      this.pruneAcknowledged();
+      // One transaction, and one write per hook for what every delete in it took from the log.
+      this.ctx.storage.transactionSync(() => {
+        const delta: UsageDelta = new Map();
+        this.sql.exec("UPDATE devices SET acked = ? WHERE id = ?", next, deviceId);
+        // This device's envelopes are of no use to anyone once it has them. Those up to `current`
+        // went with its earlier acks, so the range is the newly acknowledged seqs alone (read by
+        // `envelopes_seq_device`, without scanning other devices' backlog).
+        this.deleteEnvelopes(delta, "e.seq > ? AND e.seq <= ? AND e.device_id = ?", current, next, deviceId);
+        this.pruneRecipients(delta, deviceId, current, next);
+        this.pruneAcknowledged(delta);
+        this.applyUsage(delta);
+      });
       await this.ensureAlarm();
     }
     return next;
@@ -1636,8 +1781,9 @@ export class AccountObject extends DurableObject<Env> {
         // Already closing.
       }
     }
-    this.deleteEnvelopes("e.device_id = ?", deviceId);
-    this.pruneRecipients(deviceId, 0, Number.MAX_SAFE_INTEGER);
+    const delta: UsageDelta = new Map();
+    this.deleteEnvelopes(delta, "e.device_id = ?", deviceId);
+    this.pruneRecipients(delta, deviceId, 0, Number.MAX_SAFE_INTEGER);
     // Its held envelopes too, each hook's hold counter with them.
     for (const g of this.sql
       .exec<{ h: string; b: number | null }>(
@@ -1649,7 +1795,8 @@ export class AccountObject extends DurableObject<Env> {
       this.addHookUsage("held_usage", g.h, 0, -(g.b ?? 0));
     }
     this.sql.exec("DELETE FROM held_envelopes WHERE device_id = ?", deviceId);
-    this.pruneAcknowledged();
+    this.pruneAcknowledged(delta);
+    this.applyUsage(delta);
     await this.ensureAlarm();
   }
 
@@ -1706,10 +1853,9 @@ export class AccountObject extends DurableObject<Env> {
     const now = Date.now();
     this.pruneAudit(now);
     if (change.kind === "hook.deleted") {
-      // Its counters go with it (today's account counts keep what it took).
-      this.sql.exec("DELETE FROM buckets WHERE key = ?", `h:${change.hookId}`);
+      // Its counters go with it (today's counts keep what it took, the log what it still holds).
+      this.sql.exec("UPDATE hook_usage SET last_at = NULL, written_at = 0, tokens = NULL, tokens_at = NULL WHERE hook_id = ?", change.hookId);
       this.sql.exec("DELETE FROM refusals WHERE hook_id = ?", change.hookId);
-      this.sql.exec("DELETE FROM hook_seen WHERE hook_id = ?", change.hookId);
       this.sql.exec("DELETE FROM limit_notices WHERE hook_id = ?", change.hookId);
     }
     this.sql.exec(
@@ -2053,7 +2199,7 @@ export class AccountObject extends DurableObject<Env> {
    * (or retention) and hold the account's quota. One recipient acknowledging never takes an event
    * from another that hasn't.
    */
-  private pruneRecipients(deviceId: string, after: number, through: number): void {
+  private pruneRecipients(delta: UsageDelta, deviceId: string, after: number, through: number): void {
     const rows = this.sql
       .exec<{ seq: number; recipients: string }>(
         `SELECT seq, recipients FROM events e WHERE recipients IS NOT NULL AND seq > ? AND seq <= ?
@@ -2072,17 +2218,17 @@ export class AccountObject extends DurableObject<Env> {
         const d = devices.get(id);
         return d === undefined || d.revoked === 1 || d.acked >= r.seq;
       });
-      if (done) this.deleteRange(r.seq, r.seq);
+      if (done) this.deleteRange(delta, r.seq, r.seq);
     }
   }
 
   /** Deletes events every active device has acknowledged, and gap records nobody can need. */
-  private pruneAcknowledged(): void {
+  private pruneAcknowledged(delta: UsageDelta): void {
     const row = this.sql
       .exec<{ m: number | null; n: number }>("SELECT min(acked) AS m, count(*) AS n FROM devices WHERE revoked = 0")
       .one();
     if (row.n === 0 || row.m === null) return;
-    this.deleteRange(0, row.m);
+    this.deleteRange(delta, 0, row.m);
     this.sql.exec("DELETE FROM pruned WHERE to_seq <= ?", row.m);
   }
 
@@ -2092,7 +2238,7 @@ export class AccountObject extends DurableObject<Env> {
    * and only events that old go: a released event received long ago never takes newer ones with it.
    * Old events are a prefix of the log in practice; any newer event among them splits the ranges.
    */
-  private pruneRetention(now: number): void {
+  private pruneRetention(delta: UsageDelta, now: number): void {
     const cutoff = now - this.retentionMs();
     const hi = this.sql.exec<{ hi: number | null }>("SELECT max(seq) AS hi FROM events WHERE stored_at < ?", cutoff).one().hi;
     if (hi === null) return;
@@ -2108,7 +2254,7 @@ export class AccountObject extends DurableObject<Env> {
       if (last && i > 0 && rows[i - 1]!.old && last[1] === rows[i - 1]!.seq) last[1] = r.seq;
       else ranges.push([r.seq, r.seq]);
     }
-    this.ctx.storage.transactionSync(() => {
+    {
       for (const [lo, hi] of ranges) {
         const last = this.sql
           .exec<{ rowid: number; from_seq: number; to_seq: number; reason: string }>(
@@ -2126,15 +2272,25 @@ export class AccountObject extends DurableObject<Env> {
         } else {
           this.sql.exec("INSERT INTO pruned (from_seq, to_seq, reason) VALUES (?, ?, 'retention')", lo, hi);
         }
-        this.deleteRange(lo, hi);
+        this.deleteRange(delta, lo, hi);
       }
-    });
+    }
   }
 
   override async alarm(): Promise<void> {
     const now = Date.now();
-    this.pruneAcknowledged();
-    this.pruneRetention(now);
+    this.ctx.storage.transactionSync(() => {
+      const delta: UsageDelta = new Map();
+      this.pruneAcknowledged(delta);
+      this.pruneRetention(delta, now);
+      this.applyUsage(delta);
+      // Rows of hooks that hold nothing, took nothing today, and have no bucket or last delivery
+      // (deleted hooks, or hooks only ever held) have nothing left to say.
+      this.sql.exec(
+        "DELETE FROM hook_usage WHERE events = 0 AND bytes = 0 AND last_at IS NULL AND tokens IS NULL AND day < ?",
+        utcDay(now),
+      );
+    });
     this.sql.exec("DELETE FROM nonces WHERE at < ?", now - NONCE_TTL_MS);
     this.sql.exec("DELETE FROM seen WHERE long = 0 AND at <= ?", now - DEDUPE_TTL_MS);
     this.sql.exec("DELETE FROM seen WHERE long = 1 AND at <= ?", now - this.replayMarkMs());
@@ -2197,7 +2353,9 @@ export class AccountObject extends DurableObject<Env> {
       head: this.head(),
       events: this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM events").one().n,
       hooks: Object.fromEntries(
-        this.sql.exec<{ hook_id: string; events: number; bytes: number }>("SELECT hook_id, events, bytes FROM hook_usage").toArray().map((r) => [r.hook_id, { events: r.events, bytes: r.bytes }]),
+        this.sql
+          .exec<{ hook_id: string; events: number; bytes: number }>("SELECT hook_id, events, bytes FROM hook_usage WHERE events > 0 OR bytes > 0")
+          .toArray().map((r) => [r.hook_id, { events: r.events, bytes: r.bytes }]),
       ),
       heldUsage: this.heldTotal(),
       envelopes: this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM envelopes").one().n,
@@ -2257,22 +2415,29 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS audit_counts (kind TEXT NOT NULL, subject TEXT NOT NULL, hour INTEGER NOT NULL,
      name TEXT, count INTEGER NOT NULL, PRIMARY KEY (kind, subject, hour)) WITHOUT ROWID`,
   // What each hook holds in the log and in the hold, kept as counters (PROTOCOL §4).
-  `CREATE TABLE IF NOT EXISTS hook_usage (hook_id TEXT PRIMARY KEY, events INTEGER NOT NULL, bytes INTEGER NOT NULL) WITHOUT ROWID`,
+  // Schema 8: each hook's row also holds today's count (`day`, `taken`), its last delivery
+  // (`last_at`, and `written_at`, when D1's `last_event_at` was last written) and its token bucket
+  // (`tokens`, `tokens_at`), so an append writes one row for the hook.
+  `CREATE TABLE IF NOT EXISTS hook_usage (hook_id TEXT PRIMARY KEY, events INTEGER NOT NULL, bytes INTEGER NOT NULL,
+     day INTEGER NOT NULL DEFAULT 0, taken INTEGER NOT NULL DEFAULT 0, last_at INTEGER, written_at INTEGER NOT NULL DEFAULT 0,
+     tokens REAL, tokens_at INTEGER) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS held_usage (hook_id TEXT PRIMARY KEY, events INTEGER NOT NULL, bytes INTEGER NOT NULL) WITHOUT ROWID`,
   // Hook changes announced on the streams (PROTOCOL §6); each device's `changes_seen` is the last sent.
   `CREATE TABLE IF NOT EXISTS hook_changes (n INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL,
      hook_id TEXT NOT NULL, name TEXT NOT NULL, previous_name TEXT, actor TEXT)`,
   "CREATE INDEX IF NOT EXISTS hook_changes_at ON hook_changes(at)",
-  // Plans (PROTOCOL §2a), schema 5: token buckets (`h:<hook>` and `a`), today's counts (`a` taken,
-  // `h:<hook>` taken by a hook, `ar` refused, `r:<hook>` refused at a hook, `ad` dropped), each
-  // hook's refusal window and pauses, the `limit` notices, and when each hook last took a delivery.
-  "CREATE TABLE IF NOT EXISTS buckets (key TEXT PRIMARY KEY, tokens REAL NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID",
+  // Plans (PROTOCOL §2a), schema 5: today's refusals and drops (`ar` refused, `r:<hook>` refused at
+  // a hook, `ad` dropped; schema 8 moved the counts taken into `counters` and `hook_usage`), each
+  // hook's refusal window and pauses, and the `limit` notices.
   "CREATE TABLE IF NOT EXISTS daily (key TEXT NOT NULL, day INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (key, day)) WITHOUT ROWID",
   `CREATE TABLE IF NOT EXISTS refusals (hook_id TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL,
      level INTEGER NOT NULL DEFAULT 0, paused_until INTEGER) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS limit_notices (scope TEXT NOT NULL, hook_id TEXT NOT NULL, refused INTEGER NOT NULL, since INTEGER NOT NULL,
      until INTEGER, plan TEXT NOT NULL, sent_at INTEGER NOT NULL, PRIMARY KEY (scope, hook_id)) WITHOUT ROWID`,
-  "CREATE TABLE IF NOT EXISTS hook_seen (hook_id TEXT PRIMARY KEY, last_at INTEGER NOT NULL, written_at INTEGER NOT NULL) WITHOUT ROWID",
+  // Schema 8: the account's counters in one row, written once per append: the head (the last seq
+  // taken), today's count taken (`day`, `taken`), and the account's token bucket.
+  `CREATE TABLE IF NOT EXISTS counters (id INTEGER PRIMARY KEY CHECK (id = 1), head INTEGER NOT NULL DEFAULT 0,
+     day INTEGER NOT NULL DEFAULT 0, taken INTEGER NOT NULL DEFAULT 0, tokens REAL, tokens_at INTEGER)`,
 ];
 
 /** Indexes on columns schema 4 added: created after the columns exist, on old objects too. */
@@ -2305,6 +2470,38 @@ function limitMessage(n: { scope: string; hookId: string; refused: number; since
     until: n.until,
     plan: n.plan,
   };
+}
+
+/** What a delivery the plan takes counts: today, and a token from each rate the plan sets. */
+function planCount(plan: PlanInput, now: number): NonNullable<Reservation["count"]> {
+  const rate = (perMin: number | null, burst: number | null): Rate | null =>
+    perMin === null || perMin <= 0 ? null : { perMin, burst: Math.max(1, burst ?? perMin) };
+  return { day: utcDay(now), hook: rate(plan.hookRatePerMin, plan.hookBurst), account: rate(plan.accountRatePerMin, plan.accountBurst) };
+}
+
+/** A token bucket's tokens at `now`, refilled at its rate up to its size; full when it has none. */
+function refill(b: { tokens: number | null; tokens_at: number | null }, rate: Rate, now: number): number {
+  if (b.tokens === null) return rate.burst;
+  return Math.min(rate.burst, b.tokens + (Math.max(0, now - (b.tokens_at ?? now)) * rate.perMin) / 60_000);
+}
+
+/** A bucket after one token is taken at `at`. Never dated back: a hold committed late takes it then. */
+function take(b: { tokens: number | null; tokens_at: number | null }, rate: Rate, at: number): [number, number] {
+  return [refill(b, rate, at) - 1, Math.max(b.tokens_at ?? at, at)];
+}
+
+/** A day's count after one more on `day`; a count for a day already past is of no more use. */
+function countDay(storedDay: number, taken: number, day: number): [number, number] {
+  if (day > storedDay) return [day, 1];
+  if (day === storedDay) return [day, taken + 1];
+  return [storedDay, taken];
+}
+
+function addDelta(delta: UsageDelta, hookId: string, events: number, bytes: number): void {
+  const d = delta.get(hookId) ?? { events: 0, bytes: 0 };
+  d.events += events;
+  d.bytes += bytes;
+  delta.set(hookId, d);
 }
 
 /** A device that can be sealed to, with the tags hooks' targets match against. */

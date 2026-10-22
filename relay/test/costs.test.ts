@@ -8,11 +8,11 @@ import { duplicateScenario, heldScenario, webhookScenario, type Rows } from "./c
 
 /** Upper bounds, per scenario and step: rows written (setAlarm included), and rows read. */
 const BOUNDS = {
-  oneDevice: { append: { written: 15, read: 60 }, acks: { written: 11, read: 80 }, alarm: { written: 4, read: 60 }, total: { written: 29, read: 180 } },
-  threeDevices: { append: { written: 19, read: 70 }, acks: { written: 23, read: 220 }, alarm: { written: 6, read: 70 }, total: { written: 47, read: 320 } },
-  rateLimited: { append: { written: 17, read: 70 }, acks: { written: 11, read: 80 }, alarm: { written: 4, read: 60 }, total: { written: 31, read: 190 } },
+  oneDevice: { append: { written: 10, read: 50 }, acks: { written: 5, read: 60 }, alarm: { written: 4, read: 55 }, total: { written: 18, read: 150 } },
+  threeDevices: { append: { written: 14, read: 55 }, acks: { written: 13, read: 170 }, alarm: { written: 6, read: 70 }, total: { written: 32, read: 280 } },
+  rateLimited: { append: { written: 10, read: 50 }, acks: { written: 5, read: 60 }, alarm: { written: 4, read: 55 }, total: { written: 18, read: 150 } },
   duplicate: { written: 0, read: 5 },
-  held: { written: 12, read: 50 },
+  held: { written: 12, read: 45 },
 };
 
 function within(name: string, got: Rows, bound: { written: number; read: number }): void {
