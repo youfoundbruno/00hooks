@@ -17,6 +17,22 @@ import {
 } from "./presets.ts";
 import { openSecret, pepperedHash, sealSecret } from "./seal.ts";
 import { parseScreen, type EdgeScreen } from "./screen.ts";
+import { resolvePlan, secondsToMidnight, type AccountPlanColumns, type ResolvedPlan } from "./plans.ts";
+import { utcDay } from "./account-object.ts";
+
+/** An account's plan right now (one D1 read): for management routes, never per delivery. */
+export async function accountPlan(env: Env, accountId: string, now: number): Promise<ResolvedPlan> {
+  const row = await env.DB.prepare("SELECT plan, plan_until, limits FROM accounts WHERE id = ?").bind(accountId).first<AccountPlanColumns>();
+  return resolvePlan(env, row, now);
+}
+
+/** `onLimit` (PROTOCOL §3): what a delivery past the account's daily cap gets. */
+function onLimitField(v: unknown): "refuse" | "accept_and_drop" {
+  if (v !== "refuse" && v !== "accept_and_drop") {
+    throw new HttpError(invalid("onLimit", "onLimit must be refuse or accept_and_drop."));
+  }
+  return v;
+}
 
 export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 /**
@@ -47,6 +63,10 @@ export interface HookRow {
   offline_notice: string | null;
   /** The screen's rules, as JSON (PROTOCOL §4b), or null. */
   screen?: string | null;
+  /** Paused after a flood of refusals until then (PROTOCOL §4), or null. */
+  paused_until: number | null;
+  /** What a delivery past the daily cap gets: `refuse` (429) or `accept_and_drop` (200, a gap). */
+  on_limit: string;
 }
 
 export function screenOf(row: HookRow): EdgeScreen | null {
@@ -88,6 +108,8 @@ export function hookJson(row: HookRow, origin: string) {
     lastEventAt: row.last_event_at,
     offlineNotice: offlineNoticeOf(row),
     screenRules: screenOf(row)?.rules.length ?? 0,
+    onLimit: row.on_limit === "accept_and_drop" ? "accept_and_drop" : "refuse",
+    pausedUntil: row.paused_until !== null && row.paused_until > Date.now() ? row.paused_until : null,
   };
 }
 
@@ -133,6 +155,7 @@ export async function createHook(env: Env, caller: Principal, origin: string, bo
   const name = hookName(input.name);
   const { config, secret: supplied, verifyToken: suppliedToken } = parseVerify(input.verify);
   const notice = input.offlineNotice === undefined ? null : parseOfflineNotice(input.offlineNotice, config.preset);
+  const onLimit = input.onLimit === undefined ? "refuse" : onLimitField(input.onLimit);
   const id = newId("hk");
   // Meta's GET handshake needs a verify token: the caller's, or one made here and shown once.
   const generatedToken = SPECS[config.preset].getHandshake && suppliedToken === null ? generateVerifyToken() : null;
@@ -153,12 +176,19 @@ export async function createHook(env: Env, caller: Principal, origin: string, bo
   // Junk a sender can pass the edge checks with costs less storage on hooks the relay can't verify.
   const unchecked = config.strict === true || SPECS[config.preset].mac === "none";
   const now = Date.now();
-  await env.DB.prepare(
-    `INSERT INTO hooks (id, account_id, name, enabled, verify, secret_sealed, max_body_bytes, created_at,
-       handshake_token_hash, offline_notice)
-     VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
+  const plan = await accountPlan(env, caller.accountId, now);
+  const day = utcDay(now);
+  // The plan's hook cap and daily creations are checked in the insert itself, as the device cap is
+  // (PROTOCOL §3): two creations racing can't both take the last place. The day's count goes up in
+  // the same transaction, only when the hook was made.
+  const [inserted] = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO hooks (id, account_id, name, enabled, verify, secret_sealed, max_body_bytes, created_at,
+         handshake_token_hash, offline_notice, on_limit)
+       SELECT ?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+       WHERE (?11 IS NULL OR (SELECT count(*) FROM hooks WHERE account_id = ?2) < ?11)
+         AND (?12 IS NULL OR coalesce((SELECT count FROM hook_creates WHERE account_id = ?2 AND day = ?13), 0) < ?12)`,
+    ).bind(
       id,
       caller.accountId,
       name,
@@ -168,9 +198,36 @@ export async function createHook(env: Env, caller: Principal, origin: string, bo
       now,
       token ? await verifyTokenHash(env, id, token) : null,
       notice ? JSON.stringify(notice) : null,
-    )
-    .run()
-    .catch(uniqueName);
+      onLimit,
+      plan.limits.hooks,
+      plan.limits.hookCreatesPerDay,
+      day,
+    ),
+    env.DB.prepare(
+      `INSERT INTO hook_creates (account_id, day, count) SELECT ?1, ?2, 1 WHERE EXISTS (SELECT 1 FROM hooks WHERE id = ?3)
+       ON CONFLICT(account_id, day) DO UPDATE SET count = count + 1`,
+    ).bind(caller.accountId, day, id),
+  ]).catch(uniqueName);
+  if (!inserted || inserted.meta.changes === 0) {
+    const n = await env.DB.prepare("SELECT count(*) AS n FROM hooks WHERE account_id = ?").bind(caller.accountId).first<{ n: number }>();
+    if (plan.limits.hooks !== null && (n?.n ?? 0) >= plan.limits.hooks) {
+      throw new HttpError(
+        error(409, "conflict", "This account has as many hooks as its plan allows; delete one before adding another.", {
+          scope: "hooks",
+          limit: plan.limits.hooks,
+        }),
+      );
+    }
+    throw new HttpError(
+      error(
+        429,
+        "rate_limited",
+        "This account has created as many hooks today as its plan allows; try again after midnight UTC.",
+        { scope: "hook_creates", limit: plan.limits.hookCreatesPerDay },
+        { "Retry-After": String(secondsToMidnight(now)) },
+      ),
+    );
+  }
   await accountStub(env, caller.accountId).hookChanged({ kind: "hook.created", hookId: id, name, actor: caller.actor });
   const row = await load(env, caller, id);
   // The secret appears here only when the relay generated it: a caller-supplied one is never echoed.
@@ -213,18 +270,37 @@ export async function patchHook(env: Env, caller: Principal, origin: string, id:
     }
     maxBodyBytes = v;
   }
+  const onLimit = input.onLimit === undefined ? row.on_limit : onLimitField(input.onLimit);
+  // `enabled: true` also lifts a pause (PROTOCOL §3): the device saw the flood and wants the hook back.
+  const unpause = input.enabled === true && row.paused_until !== null && row.paused_until > Date.now();
   let notice = row.offline_notice;
   if (input.offlineNotice !== undefined) {
     const parsed = parseOfflineNotice(input.offlineNotice, (JSON.parse(row.verify) as VerifyConfig).preset);
     notice = parsed ? JSON.stringify(parsed) : null;
   }
   if (name !== row.name) await assertNameFree(env, caller.accountId, name, id);
-  await env.DB.prepare("UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ? WHERE id = ?")
-    .bind(name, enabled, maxBodyBytes, notice, id)
+  await env.DB.prepare(
+    "UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ?, on_limit = ?, paused_until = CASE WHEN ? THEN NULL ELSE paused_until END WHERE id = ?",
+  )
+    .bind(name, enabled, maxBodyBytes, notice, onLimit, unpause ? 1 : 0, id)
     .run()
     .catch(uniqueName);
+  if (unpause) await accountStub(env, caller.accountId).hookUnpaused(id, caller.actor);
   if (name !== row.name) {
     await accountStub(env, caller.accountId).hookChanged({ kind: "hook.renamed", hookId: id, name, previousName: row.name, actor: caller.actor });
+  }
+  return json(hookJson(await load(env, caller, id), origin));
+}
+
+/**
+ * `POST /v1/hooks/<id>/unpause` (`hooks:write`): lifts a pause at once (PROTOCOL §3). Answers the
+ * hook; a hook that isn't paused is answered as it is.
+ */
+export async function unpauseHook(env: Env, caller: Principal, origin: string, id: string): Promise<Response> {
+  const row = await load(env, caller, id);
+  if (row.paused_until !== null && row.paused_until > Date.now()) {
+    await env.DB.prepare("UPDATE hooks SET paused_until = NULL WHERE id = ?").bind(id).run();
+    await accountStub(env, caller.accountId).hookUnpaused(id, caller.actor);
   }
   return json(hookJson(await load(env, caller, id), origin));
 }

@@ -13,6 +13,8 @@ export async function pruneD1(env: Env, now: number): Promise<void> {
     env.DB.prepare("DELETE FROM enrolments WHERE expires_at < ?").bind(old),
     env.DB.prepare("DELETE FROM enrolment_failures WHERE window_start < ? AND coalesce(blocked_until, 0) < ?").bind(old, now),
     env.DB.prepare("DELETE FROM phone_pairings WHERE expires_at < ?").bind(old),
+    // Hook creations are counted per UTC day; earlier days are of no more use.
+    env.DB.prepare("DELETE FROM hook_creates WHERE day < ?").bind(Math.floor(now / 86_400_000) - 1),
     env.DB.prepare(
       "DELETE FROM api_keys WHERE (revoked_at IS NOT NULL AND revoked_at < ?1) OR expires_at < ?1",
     ).bind(now - KEEP_DEAD_KEYS_MS),

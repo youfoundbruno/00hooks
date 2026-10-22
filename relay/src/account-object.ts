@@ -39,7 +39,7 @@ export const DEFAULT_REPLAY_MARK_DAYS = 180;
 /** Alarms are rounded up to this, so a busy account wakes at most hourly just to prune. */
 export const ALARM_BUCKET_MS = 3600_000;
 /** The object's storage layout; the schema statements run only when the stored one is older. */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 /** One offline notice per sender per hook in this long (PROTOCOL §4a). */
 export const NOTICE_TTL_MS = 24 * 3600_000;
 /**
@@ -114,16 +114,96 @@ export interface AppendInput {
   notice?: { mark: string; afterMs: number };
   /** The screen held it (PROTOCOL §4b): the rule's id. It is kept aside, not streamed, until released. */
   held?: string;
+  /** The account's plan (PROTOCOL §2a). Without it, only the backlog quota of the settings applies. */
+  plan?: PlanInput;
+  /** What the hook does past the daily cap: refuse (429, the default) or accept and drop. */
+  onLimit?: "refuse" | "accept_and_drop";
+}
+
+/** A `limit` notice (PROTOCOL §6) as the object keeps it: one per scope and hook. */
+export interface LimitNotice {
+  scope: LimitScope | "paused";
+  hookId?: string;
+  refused: number;
+  since: number;
+  until: number | null;
+  plan: string;
+}
+
+/** `GET /v1/account`'s usage, as the object counts it. */
+export interface AccountUsage {
+  day: number;
+  today: { events: number; refused: number; dropped: number };
+  perHook: Record<string, { today: number; refused: number; backlog: Quota; lastEventAt: number | null }>;
+  backlog: Quota;
 }
 
 /** Which quota refused an append: the account's log, the hook's share of it, or the hook's hold. */
 export type FullScope = "account" | "hook" | "held";
 
+/**
+ * The plan's limits the Worker passes with each delivery (PROTOCOL §2a), counted exactly here: the
+ * token buckets and daily counters are rows of this object's SQLite, read and written in the same
+ * synchronous step that decides the append, so no timer runs and hibernation is unaffected.
+ */
+export interface PlanInput {
+  /** The plan's name, as the `limit` stream event says it. */
+  name: string;
+  /** The account's entitled plan ran out: `name` is the fallback (PROTOCOL §2b). */
+  expired: boolean;
+  eventsPerDay: number | null;
+  hookRatePerMin: number | null;
+  hookBurst: number | null;
+  accountRatePerMin: number | null;
+  accountBurst: number | null;
+  retentionHours: number | null;
+  backlogEvents: number | null;
+  backlogBytes: number | null;
+  /** Refusals of one hook within `pauseWindowMs` that pause it; 0 never pauses. */
+  pauseAfter: number;
+  pauseWindowMs: number;
+}
+
+/** What refused a delivery under the plan (PROTOCOL §4, step 7). */
+export type LimitScope = "hook_rate" | "account_rate" | "daily" | "plan_expired";
+
+export interface Refusal {
+  error: "rate_limited" | "quota";
+  scope: LimitScope;
+  /** Whole seconds until a delivery could be taken: what `Retry-After` says. */
+  retryAfter: number;
+  /** This refusal paused the hook until then (the Worker writes it to D1 once). */
+  pause?: { until: number };
+}
+
+/** A paused hook's first pause lasts this long; each repeat doubles it, up to `PAUSE_MAX_MS`. */
+export const PAUSE_BASE_MS = 3600_000;
+export const PAUSE_MAX_MS = 24 * 3600_000;
+/** A hook unpaused (or whose pause ended) this long ago starts again from `PAUSE_BASE_MS`. */
+export const PAUSE_FORGET_MS = 24 * 3600_000;
+/** A `limit` stream event per scope and hook at most this often (PROTOCOL §6). */
+export const LIMIT_NOTICE_MS = 3600_000;
+/** `last_event_at` is written to D1 at most this often per hook (the object keeps the exact time). */
+export const LAST_EVENT_WRITE_MS = 60_000;
+
 export type AppendResult =
   | { duplicate: true }
   | { duplicate: false; full: true; scope: FullScope }
+  | { duplicate: false; full: false; limited: Refusal }
+  /** Past the daily cap on a hook whose policy is `accept_and_drop`: nothing stored, a gap `over_limit`. */
+  | { duplicate: false; full: false; dropped: true; seq: number }
   | { duplicate: false; full: false; held: true; id: string; sealedFor: number; notice: false }
-  | { duplicate: false; full: false; held?: false; seq: number; id: string; sealedFor: number; notice: boolean };
+  | {
+      duplicate: false;
+      full: false;
+      held?: false;
+      seq: number;
+      id: string;
+      sealedFor: number;
+      notice: boolean;
+      /** The hook's `last_event_at` in D1 is due a write (at most once a minute per hook). */
+      touch?: boolean;
+    };
 
 /** One event the screen holds (PROTOCOL §4b), as `GET /v1/held` lists it: metadata only. */
 export interface HeldSummary {
@@ -265,6 +345,8 @@ export class AccountObject extends DurableObject<Env> {
   private commitTail: Promise<void> = Promise.resolve();
   /** When audit rows were last pruned (they're pruned at most hourly outside the alarm). */
   private auditPrunedAt = 0;
+  /** The plan values last written to `meta`, so an append writes them only when they change. */
+  private planKey: string | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -307,7 +389,18 @@ export class AccountObject extends DurableObject<Env> {
         tryExec("ALTER TABLE events ADD COLUMN held INTEGER NOT NULL DEFAULT 0");
       }
       // Schema 4: retention by when an event entered the log; per-hook quotas; the hold counted
-      // apart from the log; long replay marks; hook changes announced to devices.
+      // apart from the log; long replay marks; hook changes announced to devices. (Schema 5 only
+      // adds tables, which SCHEMA creates.)
+      if (version < 4) this.migrateTo4(tryExec);
+      this.sql.exec(
+        "INSERT INTO meta (key, value) VALUES ('schema', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        SCHEMA_VERSION,
+      );
+    });
+  }
+
+  private migrateTo4(tryExec: (stmt: string) => void): void {
+    {
       tryExec("ALTER TABLE events ADD COLUMN stored_at INTEGER");
       this.sql.exec("UPDATE events SET stored_at = received_at WHERE stored_at IS NULL");
       tryExec("ALTER TABLE devices ADD COLUMN changes_seen INTEGER NOT NULL DEFAULT 0");
@@ -327,11 +420,7 @@ export class AccountObject extends DurableObject<Env> {
         `UPDATE held_usage SET bytes = (SELECT coalesce(sum(length(e.ct) + ${ENVELOPE_OVERHEAD}), 0)
            FROM held_envelopes e JOIN held_events h ON h.id = e.id WHERE h.hook_id = held_usage.hook_id)`,
       );
-      this.sql.exec(
-        "INSERT INTO meta (key, value) VALUES ('schema', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        SCHEMA_VERSION,
-      );
-    });
+    }
   }
 
   private signingKey(): Promise<RelayKey | null> {
@@ -348,7 +437,53 @@ export class AccountObject extends DurableObject<Env> {
 
   private quota(): Quota {
     if (this.quotaOverride) return this.quotaOverride;
-    return { events: positive(this.env.ACCOUNT_MAX_EVENTS, DEFAULT_MAX_EVENTS), bytes: positive(this.env.ACCOUNT_MAX_BYTES, DEFAULT_MAX_BYTES) };
+    // The plan's backlog (PROTOCOL §2a), as the last delivery passed it; the settings otherwise.
+    const plan = this.planMeta();
+    return {
+      events: plan.backlogEvents ?? positive(this.env.ACCOUNT_MAX_EVENTS, DEFAULT_MAX_EVENTS),
+      bytes: plan.backlogBytes ?? positive(this.env.ACCOUNT_MAX_BYTES, DEFAULT_MAX_BYTES),
+    };
+  }
+
+  /** The plan values kept in `meta` (retention and backlog), so the alarm and releases use them too. */
+  private planMeta(): { retentionMs: number | null; backlogEvents: number | null; backlogBytes: number | null } {
+    const rows = this.sql
+      .exec<{ key: string; value: number }>(
+        "SELECT key, value FROM meta WHERE key IN ('plan_retention_ms', 'plan_backlog_events', 'plan_backlog_bytes')",
+      )
+      .toArray();
+    const get = (k: string) => rows.find((r) => r.key === k)?.value ?? null;
+    return { retentionMs: get("plan_retention_ms"), backlogEvents: get("plan_backlog_events"), backlogBytes: get("plan_backlog_bytes") };
+  }
+
+  /** Keeps the plan's retention and backlog in `meta`, writing only when they changed. */
+  private notePlan(plan: PlanInput): void {
+    const want: [string, number | null][] = [
+      ["plan_retention_ms", plan.retentionHours === null ? null : Math.max(plan.retentionHours, 1) * 3600_000],
+      ["plan_backlog_events", plan.backlogEvents === null ? null : Math.max(1, plan.backlogEvents)],
+      ["plan_backlog_bytes", plan.backlogBytes === null ? null : Math.max(1, plan.backlogBytes)],
+      ["plan_expired", plan.expired ? 1 : null],
+    ];
+    const key = JSON.stringify(want);
+    if (this.planKey === key) return;
+    // After a wake the cache is empty: compare with what is stored, so a wake costs no write.
+    const stored = new Map(
+      this.sql
+        .exec<{ key: string; value: number }>(
+          "SELECT key, value FROM meta WHERE key IN ('plan_retention_ms', 'plan_backlog_events', 'plan_backlog_bytes', 'plan_expired')",
+        )
+        .toArray()
+        .map((r) => [r.key, r.value]),
+    );
+    const had = stored.get("plan_expired") ?? null;
+    for (const [k, v] of want) {
+      if ((stored.get(k) ?? null) === v) continue;
+      if (v === null) this.sql.exec("DELETE FROM meta WHERE key = ?", k);
+      else this.sql.exec("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", k, v);
+    }
+    // The plan came back: its `plan_expired` notice no longer holds.
+    if (had !== null && !plan.expired) this.sql.exec("DELETE FROM limit_notices WHERE scope = 'plan_expired'");
+    this.planKey = key;
   }
 
   /** One hook's caps: its share of the log (by whether the relay verifies it) and of the hold. */
@@ -513,6 +648,8 @@ export class AccountObject extends DurableObject<Env> {
   }
 
   private retentionMs(): number {
+    const plan = this.planMeta().retentionMs;
+    if (plan !== null) return Math.max(plan, 3600_000);
     const days = Number(this.env.RETENTION_DAYS);
     return (Number.isFinite(days) && days > 0 ? Math.max(days, 1 / 24) : 7) * 24 * 3600_000;
   }
@@ -667,10 +804,20 @@ export class AccountObject extends DurableObject<Env> {
     if (!relay) throw new Error("RELAY_SIGNING_KEY is missing or malformed");
     // ── synchronous: decide, and reserve (nothing else runs until the first await) ──
     if (this.isDuplicate(input.hookId, input.dedupeKeys)) return { duplicate: true };
+    const now = Date.now();
+    const held = input.held !== undefined;
+    if (input.plan) {
+      this.notePlan(input.plan);
+      // The plan's limits, before the backlog quota: nothing is counted unless all of them pass.
+      const refusal = this.limitRefusal(input.hookId, input.plan, now);
+      if (refusal) {
+        if (refusal.scope === "daily" && input.onLimit === "accept_and_drop" && !held) return this.dropOverLimit(input.hookId, input.plan, now);
+        return { duplicate: false, full: false, limited: this.refused(input.hookId, input.plan, refusal, now) };
+      }
+    }
     const devices = this.sealingDevices();
     let plaintext: Uint8Array | null = encodeContent({ ...input.content, body: input.body });
     const estimate = devices.length * (plaintext.byteLength + 16 + ENVELOPE_OVERHEAD) + 2;
-    const held = input.held !== undefined;
     const scope = this.refuses(input.hookId, estimate, { held, checked: input.verified && !input.strict });
     if (scope) {
       plaintext.fill(0);
@@ -692,6 +839,9 @@ export class AccountObject extends DurableObject<Env> {
     const id = newId("evt");
     const seq = held ? 0 : this.takeSeq();
     this.reservations.add(reservation);
+    // Taken: it counts against the plan's buckets and today's counters, and the hook was seen.
+    if (input.plan) this.countAccepted(input.hookId, input.plan, now);
+    const touch = held ? false : this.seen(input.hookId, now);
 
     try {
       if (held) {
@@ -808,11 +958,288 @@ export class AccountObject extends DurableObject<Env> {
         },
       );
       await this.ensureAlarm();
-      return { duplicate: false, full: false, seq, id, sealedFor, notice };
+      return { duplicate: false, full: false, seq, id, sealedFor, notice, touch };
     } finally {
       plaintext?.fill(0);
       this.release(reservation);
     }
+  }
+
+  // ── plans: rates, daily caps, pauses and notices (PROTOCOL §2a) ────────────
+
+  /** A token bucket's tokens now, refilled at `perMin` up to `burst`; full when it has no row. */
+  private bucket(key: string, perMin: number, burst: number, now: number): number {
+    const r = this.sql.exec<{ tokens: number; at: number }>("SELECT tokens, at FROM buckets WHERE key = ?", key).toArray()[0];
+    if (!r) return burst;
+    return Math.min(burst, r.tokens + (Math.max(0, now - r.at) * perMin) / 60_000);
+  }
+
+  private dailyCount(key: string, day: number): number {
+    return this.sql.exec<{ count: number }>("SELECT count FROM daily WHERE key = ? AND day = ?", key, day).toArray()[0]?.count ?? 0;
+  }
+
+  private addDaily(key: string, day: number, n = 1): void {
+    if (this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM daily WHERE day = ?", day).one().n === 0) {
+      // The first count of a new UTC day: yesterday's are of no more use.
+      this.sql.exec("DELETE FROM daily WHERE day < ?", day);
+    }
+    this.sql.exec(
+      "INSERT INTO daily (key, day, count) VALUES (?, ?, ?) ON CONFLICT(key, day) DO UPDATE SET count = count + excluded.count",
+      key,
+      day,
+      n,
+    );
+  }
+
+  /**
+   * Whether the plan refuses one more delivery to `hookId` now, without counting anything: an
+   * expired plan that takes nothing, the account's daily cap, then the hook's and the account's
+   * token buckets. Null when every limit passes.
+   */
+  private limitRefusal(hookId: string, plan: PlanInput, now: number): Omit<Refusal, "pause"> | null {
+    const day = utcDay(now);
+    if (plan.eventsPerDay !== null && this.dailyCount("a", day) >= plan.eventsPerDay) {
+      // A plan that takes nothing at all is a lapsed entitlement's fallback (or a suspension).
+      if (plan.eventsPerDay === 0 && plan.expired) return { error: "quota", scope: "plan_expired", retryAfter: PLAN_EXPIRED_RETRY_S };
+      return { error: "quota", scope: "daily", retryAfter: secondsUntilDay(day + 1, now) };
+    }
+    const check = (key: string, perMin: number | null, burst: number | null, scope: LimitScope) => {
+      if (perMin === null || perMin <= 0) return null;
+      const size = Math.max(1, burst ?? perMin);
+      const tokens = this.bucket(key, perMin, size, now);
+      if (tokens >= 1) return null;
+      return { error: "rate_limited" as const, scope, retryAfter: Math.max(1, Math.ceil(((1 - tokens) * 60_000) / perMin / 1000)) };
+    };
+    return (
+      check(`h:${hookId}`, plan.hookRatePerMin, plan.hookBurst, "hook_rate") ??
+      check("a", plan.accountRatePerMin, plan.accountBurst, "account_rate")
+    );
+  }
+
+  /** Counts a taken delivery: a token from each bucket, one more today for the account and the hook. */
+  private countAccepted(hookId: string, plan: PlanInput, now: number): void {
+    const take = (key: string, perMin: number | null, burst: number | null) => {
+      if (perMin === null || perMin <= 0) return;
+      const tokens = this.bucket(key, perMin, Math.max(1, burst ?? perMin), now);
+      this.sql.exec(
+        "INSERT INTO buckets (key, tokens, at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET tokens = excluded.tokens, at = excluded.at",
+        key,
+        tokens - 1,
+        now,
+      );
+    };
+    take(`h:${hookId}`, plan.hookRatePerMin, plan.hookBurst);
+    take("a", plan.accountRatePerMin, plan.accountBurst);
+    const day = utcDay(now);
+    this.addDaily("a", day);
+    this.addDaily(`h:${hookId}`, day);
+  }
+
+  /** Notes that the hook was just delivered to; true when D1's `last_event_at` is due a write. */
+  private seen(hookId: string, now: number): boolean {
+    const r = this.sql.exec<{ written_at: number }>("SELECT written_at FROM hook_seen WHERE hook_id = ?", hookId).toArray()[0];
+    const touch = !r || now - r.written_at >= LAST_EVENT_WRITE_MS;
+    this.sql.exec(
+      `INSERT INTO hook_seen (hook_id, last_at, written_at) VALUES (?1, ?2, ?3)
+       ON CONFLICT(hook_id) DO UPDATE SET last_at = ?2, written_at = CASE WHEN ?4 THEN ?3 ELSE written_at END`,
+      hookId,
+      now,
+      touch ? now : 0,
+      touch ? 1 : 0,
+    );
+    return touch;
+  }
+
+  /**
+   * Records a refusal: counted for the day, noted for the `limit` stream event, and counted towards
+   * pausing the hook. Past `pauseAfter` refusals in `pauseWindowMs`, the hook is paused for an hour,
+   * twice as long each time it is paused again (up to a day), and the audit says so; the Worker
+   * writes the pause to D1 and answers from there without waking this object.
+   */
+  private refused(hookId: string, plan: PlanInput, r: Omit<Refusal, "pause">, now: number): Refusal {
+    this.addDaily("ar", utcDay(now));
+    this.addDaily(`r:${hookId}`, utcDay(now));
+    const until = r.scope === "plan_expired" ? null : now + r.retryAfter * 1000;
+    this.noteLimit(r.scope, r.scope === "hook_rate" ? hookId : "", until, plan.name, now);
+    if (plan.pauseAfter <= 0) return r;
+    const row = this.sql
+      .exec<{ window_start: number; count: number; level: number; paused_until: number | null }>(
+        "SELECT window_start, count, level, paused_until FROM refusals WHERE hook_id = ?",
+        hookId,
+      )
+      .toArray()[0] ?? { window_start: now, count: 0, level: 0, paused_until: null };
+    let { window_start, count, level, paused_until } = row;
+    if (now - window_start > plan.pauseWindowMs) {
+      window_start = now;
+      count = 0;
+    }
+    count++;
+    let pause: { until: number } | undefined;
+    if (count >= plan.pauseAfter && !(paused_until !== null && paused_until > now)) {
+      if (paused_until === null || now - paused_until > PAUSE_FORGET_MS) level = 0;
+      const ms = Math.min(PAUSE_BASE_MS * 2 ** Math.min(level, 10), PAUSE_MAX_MS);
+      level++;
+      paused_until = now + ms;
+      window_start = now;
+      count = 0;
+      pause = { until: paused_until };
+      this.sql.exec("INSERT INTO audit (at, kind, actor, subject, name) VALUES (?, 'hook.paused', NULL, ?, ?)", now, hookId, r.scope);
+      this.noteLimit("paused", hookId, paused_until, plan.name, now, true);
+    }
+    this.sql.exec(
+      `INSERT INTO refusals (hook_id, window_start, count, level, paused_until) VALUES (?1, ?2, ?3, ?4, ?5)
+       ON CONFLICT(hook_id) DO UPDATE SET window_start = ?2, count = ?3, level = ?4, paused_until = ?5`,
+      hookId,
+      window_start,
+      count,
+      level,
+      paused_until,
+    );
+    return pause ? { ...r, pause } : r;
+  }
+
+  /**
+   * Past the daily cap on an `accept_and_drop` hook: the sender gets `200`, nothing is stored, and
+   * the seq the event would have had becomes a gap with the reason `over_limit` (joined to the
+   * previous one when nothing was stored between), so the devices hear what they missed.
+   */
+  private async dropOverLimit(hookId: string, plan: PlanInput, now: number): Promise<AppendResult> {
+    this.addDaily("ad", utcDay(now));
+    this.noteLimit("daily", "", now + secondsUntilDay(utcDay(now) + 1, now) * 1000, plan.name, now);
+    const seq = this.takeSeq();
+    const reservation: Reservation = { hookId, held: false, bytes: 0, marks: [] };
+    this.reservations.add(reservation);
+    try {
+      await this.inOrder(
+        async () => null,
+        () => {
+          this.ctx.storage.transactionSync(() => {
+            const last = this.sql
+              .exec<{ rowid: number; to_seq: number; reason: string }>("SELECT rowid, to_seq, reason FROM pruned ORDER BY to_seq DESC LIMIT 1")
+              .toArray()[0];
+            if (last && last.reason === "over_limit" && last.to_seq === seq - 1) {
+              this.sql.exec("UPDATE pruned SET to_seq = ? WHERE rowid = ?", seq, last.rowid);
+            } else {
+              this.sql.exec("INSERT INTO pruned (from_seq, to_seq, reason) VALUES (?, ?, 'over_limit')", seq, seq);
+            }
+            this.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", seq);
+          });
+        },
+      );
+    } finally {
+      this.release(reservation);
+    }
+    return { duplicate: false, full: false, dropped: true, seq };
+  }
+
+  /**
+   * Notes a refusal for the `limit` stream event (PROTOCOL §6): one row per scope and hook, counting
+   * the refusals since the limit began to bite. Every device's stream is sent it at most once an
+   * hour per scope and hook (`force`: now, as when a hook is paused), and again after `ready`.
+   */
+  private noteLimit(scope: LimitNotice["scope"], hookId: string, until: number | null, plan: string, now: number, force = false): void {
+    const r = this.sql
+      .exec<{ refused: number; since: number; until: number | null; sent_at: number }>(
+        "SELECT refused, since, until, sent_at FROM limit_notices WHERE scope = ? AND hook_id = ?",
+        scope,
+        hookId,
+      )
+      .toArray()[0];
+    // A limit that had lifted begins again: count from now.
+    const fresh = !r || (r.until !== null && r.until <= now);
+    const refused = (fresh ? 0 : r.refused) + (scope === "paused" ? 0 : 1);
+    const since = fresh ? now : r.since;
+    const due = force || !r || now - r.sent_at >= LIMIT_NOTICE_MS;
+    const sentAt = due ? now : r!.sent_at;
+    this.sql.exec(
+      `INSERT INTO limit_notices (scope, hook_id, refused, since, until, plan, sent_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+       ON CONFLICT(scope, hook_id) DO UPDATE SET refused = ?3, since = ?4, until = ?5, plan = ?6, sent_at = ?7`,
+      scope,
+      hookId,
+      refused,
+      since,
+      until,
+      plan,
+      sentAt,
+    );
+    if (!due) return;
+    const msg = JSON.stringify(limitMessage({ scope, hookId, refused, since, until, plan }));
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws.readyState === WebSocket.OPEN) this.trySend(ws, msg);
+    }
+  }
+
+  /** After `ready`: the newest notices still in effect, so a device that reconnects hears of them. */
+  private sendLimits(ws: WebSocket): boolean {
+    const rows = this.sql
+      .exec<{ scope: LimitNotice["scope"]; hook_id: string; refused: number; since: number; until: number | null; plan: string }>(
+        "SELECT scope, hook_id, refused, since, until, plan FROM limit_notices WHERE until IS NULL OR until > ? ORDER BY since DESC LIMIT 10",
+        Date.now(),
+      )
+      .toArray();
+    for (const r of rows) {
+      if (!this.trySend(ws, JSON.stringify(limitMessage({ ...r, hookId: r.hook_id })))) return false;
+    }
+    return true;
+  }
+
+  /**
+   * A device unpaused the hook (PROTOCOL §3): its refusal window starts again, and the next pause
+   * doubles from this one unless a day passes first.
+   */
+  async hookUnpaused(hookId: string, actor: string): Promise<void> {
+    const now = Date.now();
+    this.sql.exec("UPDATE refusals SET count = 0, window_start = ?1, paused_until = min(coalesce(paused_until, ?1), ?1) WHERE hook_id = ?2", now, hookId);
+    this.sql.exec("DELETE FROM limit_notices WHERE scope = 'paused' AND hook_id = ?", hookId);
+    this.pruneAudit(now);
+    this.sql.exec("INSERT INTO audit (at, kind, actor, subject, name) VALUES (?, 'hook.unpaused', ?, ?, NULL)", now, actor, hookId);
+  }
+
+  /** The plan was set or refreshed (PROTOCOL §2b): an expired plan's notice no longer holds. */
+  async planChanged(): Promise<void> {
+    this.sql.exec("DELETE FROM limit_notices WHERE scope = 'plan_expired'");
+    this.sql.exec("DELETE FROM meta WHERE key = 'plan_expired'");
+    this.planKey = null;
+  }
+
+  /** Today's counts and what the log holds, per hook and in all (`GET /v1/account`). */
+  async accountUsage(): Promise<AccountUsage> {
+    const now = Date.now();
+    const day = utcDay(now);
+    const counts = new Map(
+      this.sql.exec<{ key: string; count: number }>("SELECT key, count FROM daily WHERE day = ?", day).toArray().map((r) => [r.key, r.count]),
+    );
+    const perHook: AccountUsage["perHook"] = {};
+    const hook = (id: string) => (perHook[id] ??= { today: 0, refused: 0, backlog: { events: 0, bytes: 0 }, lastEventAt: null });
+    for (const [k, n] of counts) {
+      if (k.startsWith("h:")) hook(k.slice(2)).today = n;
+      else if (k.startsWith("r:")) hook(k.slice(2)).refused = n;
+    }
+    for (const r of this.sql.exec<{ hook_id: string; events: number; bytes: number }>("SELECT hook_id, events, bytes FROM hook_usage").toArray()) {
+      hook(r.hook_id).backlog = { events: r.events, bytes: r.bytes };
+    }
+    for (const r of this.sql.exec<{ hook_id: string; last_at: number }>("SELECT hook_id, last_at FROM hook_seen").toArray()) {
+      hook(r.hook_id).lastEventAt = r.last_at;
+    }
+    return {
+      day,
+      today: { events: counts.get("a") ?? 0, refused: counts.get("ar") ?? 0, dropped: counts.get("ad") ?? 0 },
+      perHook,
+      backlog: this.usage(),
+    };
+  }
+
+  /** The limit notices the object keeps (tests and `GET /v1/account`). */
+  async limitNotices(): Promise<LimitNotice[]> {
+    return this.sql
+      .exec<{ scope: LimitNotice["scope"]; hook_id: string; refused: number; since: number; until: number | null; plan: string }>(
+        "SELECT scope, hook_id, refused, since, until, plan FROM limit_notices ORDER BY since DESC",
+      )
+      .toArray()
+      .map((r) => {
+        const { t: _t, ...n } = limitMessage({ ...r, hookId: r.hook_id });
+        return n as LimitNotice;
+      });
   }
 
   // ── the screen's hold (PROTOCOL §4b) ───────────────────────────────────────
@@ -1144,6 +1571,13 @@ export class AccountObject extends DurableObject<Env> {
   async hookChanged(change: HookChange): Promise<void> {
     const now = Date.now();
     this.pruneAudit(now);
+    if (change.kind === "hook.deleted") {
+      // Its counters go with it (today's account counts keep what it took).
+      this.sql.exec("DELETE FROM buckets WHERE key = ?", `h:${change.hookId}`);
+      this.sql.exec("DELETE FROM refusals WHERE hook_id = ?", change.hookId);
+      this.sql.exec("DELETE FROM hook_seen WHERE hook_id = ?", change.hookId);
+      this.sql.exec("DELETE FROM limit_notices WHERE hook_id = ?", change.hookId);
+    }
     this.sql.exec(
       "INSERT INTO audit (at, kind, actor, subject, name) VALUES (?, ?, ?, ?, ?)",
       now,
@@ -1315,7 +1749,7 @@ export class AccountObject extends DurableObject<Env> {
     this.streamSeen();
     const att: Attachment = { deviceId, cursor: after, catchingUp: true, openedAt: Date.now() };
     const ready = { t: "ready", accountId, deviceId, after, head, protocol: STREAM_PROTOCOL, sealKid: device.sealKid };
-    if (this.trySend(server, JSON.stringify(ready)) && this.sendChanges(server, deviceId)) this.sendPage(server, att);
+    if (this.trySend(server, JSON.stringify(ready)) && this.sendChanges(server, deviceId) && this.sendLimits(server)) this.sendPage(server, att);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -1457,8 +1891,13 @@ export class AccountObject extends DurableObject<Env> {
     for (const ws of sockets) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (!att || att.catchingUp || att.cursor >= seq) continue;
+      const before = att.cursor;
       // A failed socket is closed by sendHook and resumes from its cursor on reconnect.
-      if (this.sendHook(ws, att, row) !== null) ws.serializeAttachment(att);
+      if (this.sendHook(ws, att, row) === null) continue;
+      // Seqs skipped since this stream's last one (deliveries dropped `over_limit`) are said after
+      // the event, once the stream has shown a seq past them (a client ignores a gap beyond it).
+      if (seq > before + 1 && !this.sendGaps(ws, { ...att, cursor: before }, seq - 1)) continue;
+      ws.serializeAttachment(att);
     }
   }
 
@@ -1647,6 +2086,16 @@ const SCHEMA = [
      hook_id TEXT NOT NULL, name TEXT NOT NULL, previous_name TEXT, actor TEXT)`,
   "CREATE INDEX IF NOT EXISTS hook_changes_at ON hook_changes(at)",
   "CREATE INDEX IF NOT EXISTS held_hook ON held_events(hook_id, rule)",
+  // Plans (PROTOCOL §2a), schema 5: token buckets (`h:<hook>` and `a`), today's counts (`a` taken,
+  // `h:<hook>` taken by a hook, `ar` refused, `r:<hook>` refused at a hook, `ad` dropped), each
+  // hook's refusal window and pauses, the `limit` notices, and when each hook last took a delivery.
+  "CREATE TABLE IF NOT EXISTS buckets (key TEXT PRIMARY KEY, tokens REAL NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS daily (key TEXT NOT NULL, day INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (key, day)) WITHOUT ROWID",
+  `CREATE TABLE IF NOT EXISTS refusals (hook_id TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL,
+     level INTEGER NOT NULL DEFAULT 0, paused_until INTEGER) WITHOUT ROWID`,
+  `CREATE TABLE IF NOT EXISTS limit_notices (scope TEXT NOT NULL, hook_id TEXT NOT NULL, refused INTEGER NOT NULL, since INTEGER NOT NULL,
+     until INTEGER, plan TEXT NOT NULL, sent_at INTEGER NOT NULL, PRIMARY KEY (scope, hook_id)) WITHOUT ROWID`,
+  "CREATE TABLE IF NOT EXISTS hook_seen (hook_id TEXT PRIMARY KEY, last_at INTEGER NOT NULL, written_at INTEGER NOT NULL) WITHOUT ROWID",
 ];
 
 /** Indexes on columns schema 4 added: created after the columns exist, on old objects too. */
@@ -1655,6 +2104,32 @@ const SCHEMA_4_INDEXES = [
   "CREATE INDEX IF NOT EXISTS events_hook ON events(hook_id)",
   "CREATE INDEX IF NOT EXISTS seen_long_at ON seen(long, at)",
 ];
+
+/** How long a lapsed plan's refusal asks a sender to wait: an hour (a refreshed plan takes effect at once). */
+export const PLAN_EXPIRED_RETRY_S = 3600;
+
+/** The UTC day `now` is in (days since the epoch). */
+export function utcDay(now: number): number {
+  return Math.floor(now / 86_400_000);
+}
+
+/** Whole seconds from `now` until the start of UTC day `day`, at least one. */
+function secondsUntilDay(day: number, now: number): number {
+  return Math.max(1, Math.ceil((day * 86_400_000 - now) / 1000));
+}
+
+/** The `limit` message (PROTOCOL §6): `hookId` only for a hook's own scope. */
+function limitMessage(n: { scope: string; hookId: string; refused: number; since: number; until: number | null; plan: string }) {
+  return {
+    t: "limit",
+    scope: n.scope,
+    ...(n.hookId ? { hookId: n.hookId } : {}),
+    refused: n.refused,
+    since: n.since,
+    until: n.until,
+    plan: n.plan,
+  };
+}
 
 function positive(v: string | undefined, fallback: number): number {
   const x = Number(v);

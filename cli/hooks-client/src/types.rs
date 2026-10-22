@@ -431,6 +431,303 @@ pub struct AuditEntry {
     pub count: Option<u64>,
 }
 
+/// The reasons a `gap` gives (PROTOCOL §6). A reason this client doesn't know is still a gap.
+pub mod gap_reason {
+    /// Retention dropped the events before this device read them.
+    pub const RETENTION: &str = "retention";
+    /// The event had no envelope for this device (it had no sealing key then).
+    pub const NO_KEY: &str = "no_key";
+    /// The event's message was over the relay's internal message limit.
+    pub const TOO_LARGE: &str = "too_large";
+    /// Deliveries the relay answered `200` and dropped past the account's daily cap, on a hook
+    /// whose `onLimit` is `accept_and_drop` (PROTOCOL §4 step 7).
+    pub const OVER_LIMIT: &str = "over_limit";
+}
+
+impl Gap {
+    /// The relay took these deliveries past the daily cap and dropped them (nothing was stored).
+    pub fn is_over_limit(&self) -> bool {
+        self.reason == gap_reason::OVER_LIMIT
+    }
+}
+
+/// `event: limit` (PROTOCOL §6): one of the plan's limits is refusing deliveries. Sent without an
+/// `id:`, at most once an hour per scope and hook, and again after `ready`; never recorded or
+/// acknowledged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Limit {
+    /// `hook_rate`, `account_rate`, `daily`, `paused` or `plan_expired`; see [`Limit::kind`].
+    pub scope: String,
+    /// The hook, for a hook's own scope (`hook_rate`, `paused`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_id: Option<String>,
+    /// Deliveries refused (or, for `daily`, also accepted and dropped) since `since`.
+    #[serde(default)]
+    pub refused: u64,
+    /// When the limit began to bite, in Unix milliseconds.
+    #[serde(default)]
+    pub since: i64,
+    /// When it lifts, in Unix milliseconds; `None` for `plan_expired` (it lifts when renewed).
+    #[serde(default)]
+    pub until: Option<i64>,
+    /// The plan in effect.
+    #[serde(default)]
+    pub plan: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Which limit a [`Limit`] (or a refusal's `scope`, [`crate::Error::limit_scope`]) names. A scope
+/// this client doesn't know is [`Other`], never an error.
+///
+/// [`Other`]: LimitScope::Other
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitScope {
+    /// One hook's token bucket.
+    HookRate,
+    /// The account's token bucket, across its hooks.
+    AccountRate,
+    /// The account's deliveries per UTC day.
+    Daily,
+    /// The hook is paused after a flood of refusals.
+    Paused,
+    /// The account's entitled plan ran out (PROTOCOL §2b).
+    PlanExpired,
+    /// The account's backlog is full (`quota`).
+    Account,
+    /// The hook's share of the backlog is full (`quota`).
+    Hook,
+    /// The hook's screen hold is full (`quota`).
+    Held,
+    /// The plan's hook cap (`409`).
+    Hooks,
+    /// The plan's hook creations per day.
+    HookCreates,
+    /// Hook creations per address.
+    HookCreateIp,
+    Other,
+}
+
+impl LimitScope {
+    pub fn parse(scope: &str) -> Self {
+        match scope {
+            "hook_rate" => LimitScope::HookRate,
+            "account_rate" => LimitScope::AccountRate,
+            "daily" => LimitScope::Daily,
+            "paused" => LimitScope::Paused,
+            "plan_expired" => LimitScope::PlanExpired,
+            "account" => LimitScope::Account,
+            "hook" => LimitScope::Hook,
+            "held" => LimitScope::Held,
+            "hooks" => LimitScope::Hooks,
+            "hook_creates" => LimitScope::HookCreates,
+            "hook_create_ip" => LimitScope::HookCreateIp,
+            _ => LimitScope::Other,
+        }
+    }
+}
+
+impl Limit {
+    pub fn kind(&self) -> LimitScope {
+        LimitScope::parse(&self.scope)
+    }
+}
+
+/// What a delivery past the account's daily cap gets (PROTOCOL §3, `onLimit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnLimit {
+    /// `429`, so the provider retries later (the default).
+    Refuse,
+    /// `200`, nothing stored, and the devices get a gap `over_limit`.
+    AcceptAndDrop,
+}
+
+impl Hook {
+    /// The hook's `onLimit` (PROTOCOL §3); `Refuse` from a relay that predates plans.
+    pub fn on_limit(&self) -> OnLimit {
+        match self.extra.get("onLimit").and_then(Value::as_str) {
+            Some("accept_and_drop") => OnLimit::AcceptAndDrop,
+            _ => OnLimit::Refuse,
+        }
+    }
+
+    /// When the hook's pause ends (Unix milliseconds), while it is paused.
+    pub fn paused_until(&self) -> Option<i64> {
+        self.extra.get("pausedUntil").and_then(Value::as_i64)
+    }
+}
+
+/// How to get the operator's hosted plan, as `/v1/info` and `GET /v1/account` announce it: data,
+/// shown as it is.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedPlan {
+    pub plan: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// What `/v1/info` says about plans (PROTOCOL §2a): read with [`crate::Client::plans_info`].
+/// A relay that predates plans says nothing, which reads as `plans: false`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlansInfo {
+    #[serde(default)]
+    pub plans: bool,
+    /// Whether the relay takes Overblast entitlements (PROTOCOL §2b).
+    #[serde(default)]
+    pub entitlements: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_plan: Option<HostedPlan>,
+}
+
+/// A plan's limits (PROTOCOL §2a). `None` is no limit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanLimits {
+    #[serde(default)]
+    pub hooks: Option<u64>,
+    #[serde(default)]
+    pub devices: Option<u64>,
+    #[serde(default)]
+    pub events_per_day: Option<u64>,
+    #[serde(default)]
+    pub hook_rate_per_min: Option<f64>,
+    #[serde(default)]
+    pub hook_burst: Option<u64>,
+    #[serde(default)]
+    pub account_rate_per_min: Option<f64>,
+    #[serde(default)]
+    pub account_burst: Option<u64>,
+    #[serde(default)]
+    pub retention_hours: Option<f64>,
+    #[serde(default)]
+    pub max_body_bytes: Option<u64>,
+    #[serde(default)]
+    pub backlog_events: Option<u64>,
+    #[serde(default)]
+    pub backlog_bytes: Option<u64>,
+    #[serde(default)]
+    pub hook_creates_per_day: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Events and bytes waiting for acknowledgement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Backlog {
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+/// Today's counts for the account (UTC).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UsageToday {
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub refused: u64,
+    #[serde(default)]
+    pub dropped: u64,
+}
+
+/// One hook's counts in `GET /v1/account`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookUsage {
+    #[serde(default)]
+    pub today: u64,
+    #[serde(default)]
+    pub refused: u64,
+    #[serde(default)]
+    pub backlog: Backlog,
+    /// Exact (a `Hook`'s `last_event_at` is written at most once a minute).
+    #[serde(default)]
+    pub last_event_at: Option<i64>,
+}
+
+/// `GET /v1/account`'s `usage`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsage {
+    /// The UTC day the counts are for (days since the epoch).
+    #[serde(default)]
+    pub day: u64,
+    #[serde(default)]
+    pub today: UsageToday,
+    #[serde(default)]
+    pub per_hook: BTreeMap<String, HookUsage>,
+    #[serde(default)]
+    pub backlog: Backlog,
+    #[serde(default)]
+    pub hooks: u64,
+    #[serde(default)]
+    pub devices: u64,
+    #[serde(default)]
+    pub hook_creates_today: u64,
+}
+
+/// A paused hook in `GET /v1/account`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PausedHook {
+    pub hook_id: String,
+    pub until: i64,
+}
+
+/// `GET /v1/account` (PROTOCOL §2a): the account's plan, its limits and today's usage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountInfo {
+    pub account_id: String,
+    pub plan: String,
+    /// When the plan ends (an entitlement's `exp`), in Unix milliseconds; `None`: it doesn't.
+    #[serde(default)]
+    pub plan_until: Option<i64>,
+    /// The entitled plan ran out: `plan` is the fallback.
+    #[serde(default)]
+    pub expired: bool,
+    #[serde(default)]
+    pub limits: PlanLimits,
+    #[serde(default)]
+    pub usage: AccountUsage,
+    #[serde(default)]
+    pub paused: Vec<PausedHook>,
+    /// How to get the hosted plan, when the operator offers it to this account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<HostedPlan>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `POST /v1/accounts` with an entitlement (PROTOCOL §2b): the account, on the entitled plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EntitledJoin {
+    pub account_id: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub plan_until: Option<i64>,
+}
+
+impl EntitledJoin {
+    pub fn joined(&self) -> Joined {
+        Joined {
+            account_id: self.account_id.clone(),
+            device_id: self.device_id.clone(),
+        }
+    }
+}
+
 /// An error body (PROTOCOL §8).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -443,6 +740,9 @@ pub(crate) struct ErrorBody {
     pub field: Option<String>,
     #[serde(default)]
     pub server_time: Option<i64>,
+    /// Which limit answered a `429` or a cap's `409` (PROTOCOL §8).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[cfg(test)]
@@ -516,6 +816,95 @@ mod tests {
         assert!(c.by_device("dev_1"));
         assert_eq!(c.actor_words(), "device dev_1");
         assert!(serde_json::from_str::<HookChange>(r#"{"kind":"hook.created"}"#).is_err());
+    }
+
+    #[test]
+    fn limits_read_every_scope_and_tolerate_new_ones() {
+        let raw = r#"{"scope":"hook_rate","hookId":"hk_1","refused":12,"since":1,"until":2,
+            "plan":"overblast","future":true}"#;
+        let l: Limit = serde_json::from_str(raw).unwrap();
+        assert_eq!(l.kind(), LimitScope::HookRate);
+        assert_eq!(l.hook_id.as_deref(), Some("hk_1"));
+        assert_eq!((l.refused, l.since, l.until), (12, 1, Some(2)));
+        assert_eq!(serde_json::to_value(&l).unwrap()["future"], true);
+        let l: Limit = serde_json::from_str(
+            r#"{"scope":"plan_expired","refused":1,"since":5,"until":null,"plan":"suspended"}"#,
+        )
+        .unwrap();
+        assert_eq!(l.kind(), LimitScope::PlanExpired);
+        assert_eq!(l.until, None);
+        assert_eq!(l.hook_id, None);
+        for (s, want) in [
+            ("account_rate", LimitScope::AccountRate),
+            ("daily", LimitScope::Daily),
+            ("paused", LimitScope::Paused),
+            ("hooks", LimitScope::Hooks),
+            ("hook_creates", LimitScope::HookCreates),
+            ("someday", LimitScope::Other),
+        ] {
+            assert_eq!(LimitScope::parse(s), want);
+        }
+    }
+
+    #[test]
+    fn gaps_say_over_limit() {
+        let g: Gap = serde_json::from_str(r#"{"from":2,"to":3,"reason":"over_limit"}"#).unwrap();
+        assert!(g.is_over_limit());
+        let g: Gap = serde_json::from_str(r#"{"from":2,"to":3}"#).unwrap();
+        assert!(!g.is_over_limit());
+    }
+
+    #[test]
+    fn hooks_read_on_limit_and_pauses_from_newer_relays_only() {
+        let old: Hook = serde_json::from_value(serde_json::json!({
+            "id": "hk_1", "name": "n", "url": "u", "enabled": true, "verify": {"preset": "github"},
+            "maxBodyBytes": 1, "createdAt": 0
+        }))
+        .unwrap();
+        assert_eq!(old.on_limit(), OnLimit::Refuse);
+        assert_eq!(old.paused_until(), None);
+        let new: Hook = serde_json::from_value(serde_json::json!({
+            "id": "hk_1", "name": "n", "url": "u", "enabled": true, "verify": {"preset": "github"},
+            "maxBodyBytes": 1, "createdAt": 0, "onLimit": "accept_and_drop", "pausedUntil": 99
+        }))
+        .unwrap();
+        assert_eq!(new.on_limit(), OnLimit::AcceptAndDrop);
+        assert_eq!(new.paused_until(), Some(99));
+        assert_eq!(
+            serde_json::to_value(OnLimit::AcceptAndDrop).unwrap(),
+            "accept_and_drop"
+        );
+    }
+
+    #[test]
+    fn account_info_reads_the_relay_answer() {
+        let raw = r#"{"accountId":"acc_1","plan":"overblast","planUntil":5,"expired":false,
+            "limits":{"hooks":50,"devices":10,"eventsPerDay":50000,"hookRatePerMin":120,
+              "hookBurst":300,"accountRatePerMin":600,"accountBurst":1200,"retentionHours":168,
+              "maxBodyBytes":1048576,"backlogEvents":10000,"backlogBytes":268435456,
+              "hookCreatesPerDay":100},
+            "usage":{"day":20383,"today":{"events":3,"refused":1,"dropped":0},
+              "perHook":{"hk_1":{"today":3,"refused":1,"backlog":{"events":2,"bytes":10},
+              "lastEventAt":7}},"backlog":{"events":2,"bytes":10},"hooks":1,"devices":1,
+              "hookCreatesToday":1},
+            "paused":[{"hookId":"hk_1","until":9}],
+            "upgrade":{"plan":"overblast","title":"Overblast Plan","url":"https://x.example"}}"#;
+        let a: AccountInfo = serde_json::from_str(raw).unwrap();
+        assert_eq!(a.plan, "overblast");
+        assert_eq!(a.limits.events_per_day, Some(50_000));
+        assert_eq!(a.limits.hook_rate_per_min, Some(120.0));
+        assert_eq!(a.usage.per_hook["hk_1"].last_event_at, Some(7));
+        assert_eq!(a.paused[0].until, 9);
+        assert_eq!(a.upgrade.unwrap().title, "Overblast Plan");
+        // The default plan's nulls are no limit.
+        let a: AccountInfo = serde_json::from_str(
+            r#"{"accountId":"acc_1","plan":"default","planUntil":null,"limits":{"hooks":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(a.limits.hooks, None);
+        assert_eq!(a.usage, AccountUsage::default());
+        let p: PlansInfo = serde_json::from_str(r#"{"version":"1","protocol":2}"#).unwrap();
+        assert!(!p.plans && !p.entitlements && p.hosted_plan.is_none());
     }
 
     #[test]
