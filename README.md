@@ -221,6 +221,39 @@ automations:
 
   Use `options_end` for programs that honour `--` (arguments after it may start with `-`), and
   `raw: true` only for a program those values can't mislead.
+- **Batches** (optional): instead of running once per event, an automation can hold its events in
+  a file and run once for all of them, when things go quiet or after a set time at most:
+
+  ```yaml
+  - name: Sensor readings
+    when: { hook: sensors, kinds: any }
+    batch:
+      idle: 2m          # run once no new event has come for 2 minutes
+      max_wait: 10m     # ...or 10 minutes after the batch's first event, even if events keep coming
+      max_events: 500   # ...or once 500 are held (default 1000)
+    allow_commands: [/usr/local/bin/process-readings]
+    then:
+      - run: { command: process-readings }   # gets every held event
+  ```
+
+  Give `idle`, `max_wait` or both (each from 5s to 24h; `max_wait` at least `idle`). Whichever
+  comes first runs the batch; a batch also runs early once it holds 8 MiB. Filters,
+  `verified_only` and the screen still look at each event before it joins. When the batch runs,
+  a command gets every event as JSON lines on stdin and in the file named by `HOOKS_EVENTS_FILE`
+  (`HOOKS_EVENT_FILE` is the last one), plus `HOOKS_BATCH_ID`, `HOOKS_BATCH_COUNT`,
+  `HOOKS_BATCH_FIRST`, `HOOKS_BATCH_LAST` and `HOOKS_BATCH_REASON` (`idle`, `max_wait`,
+  `max_events`, `max_bytes` or `flush`). Templates read `{{batch.count}}`, `{{batch.first}}`,
+  `{{batch.last}}`, `{{batch.reason}}` and `{{events | json}}` (`payload` is the last event's);
+  `write: { append: … }` adds a line per event; a `call` sends the events as a JSON array.
+  The held events are kept on disk in the runner's private folder, so a restart loses none: the
+  timers carry on from the first event, and a batch that came due meanwhile runs at once. The rate
+  limit and the pause after failures count batch runs. While an automation is paused or over its
+  limit, its batch waits and keeps holding events up to its limit; past that, new events aren't
+  held and are counted, each with a note in `00hooks runs` (`00hooks replay <event>` runs it).
+  `00hooks batches` lists the open batches and when each runs; `00hooks batches flush <automation>`
+  runs one now and `00hooks batches drop <automation>` throws one away; `00hooks replay <batch>`
+  runs a batch again (the newest 200 are kept). Programs that embed the runner, such as 00next,
+  get batches from the same library once they offer the setting and tick the runner (PLAN §5.2).
 - `00hooks kinds` lists the kinds of events seen and `00hooks kinds show <hook/kind>` their fields;
   `00hooks automations check` validates the file against them; `00hooks runs` and
   `00hooks replay <event>` show and repeat runs.

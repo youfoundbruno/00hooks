@@ -1989,6 +1989,23 @@ automations:
         let full = p(block(2)).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(full.automations.len(), 1);
         assert_eq!(full.automations[0].actions.len(), 4);
+        // The batch example, as written under `automations:`.
+        let batch = readme
+            .split("```yaml\n")
+            .find(|b| b.contains("batch:"))
+            .and_then(|s| s.split("```").next())
+            .expect("the README has a batch example");
+        let indented: String = batch.lines().map(|l| format!("  {l}\n")).collect();
+        let b = p(&format!("automations:\n{indented}")).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(
+            b.automations[0].batch,
+            Some(Batch {
+                idle: Some(Duration::from_secs(120)),
+                max_wait: Some(Duration::from_secs(600)),
+                max_events: 500,
+                line: 5,
+            })
+        );
     }
 
     #[test]
