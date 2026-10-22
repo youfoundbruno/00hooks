@@ -883,6 +883,9 @@ when it was received), then dropped, which shows up as a `gap`. Only events that
 each contiguous run of them as its own `gap`.
 
 Clients dedupe by `id` before acting, so at-least-once delivery never runs an automation twice.
+For the presets that sign no timestamp they also dedupe by content (§3): the reference runner writes
+its content mark before its run's start record and confirms the event only after both, so a crash
+between them hands the same `id` over again, which its own mark names and lets through.
 The reference client records an event (opened) before acknowledging it, and then hands it to its
 consumer. By default it marks the event handed-over as it does (at most once to the consumer); a
 consumer that records durably itself can ask to **confirm** instead (`SubscribeOptions::confirm`,
