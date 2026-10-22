@@ -97,6 +97,7 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
       contentType: request.headers.get("content-type"),
       strict,
       key: await screenCryptoKey(env.HASH_PEPPER, hook.account_id),
+      at: now,
     });
     if (verdict?.verdict === "drop") {
       countAtEdge(env, ctx, hook.account_id, "screen.dropped", hookId, hook.name);

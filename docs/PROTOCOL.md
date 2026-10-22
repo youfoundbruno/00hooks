@@ -499,8 +499,8 @@ a device releases it) or `drop` (§4 step 5a). No rule holding is a pass. Nothin
 a decision leaves the rule's id and an hourly count.
 
 **What it reads.** The client's address (`CF-Connecting-IP`), its network (`request.cf.asn`) and
-country (`request.cf.country`), the headers, the body's size and, unless the hook is strict, the
-body itself, read as the harness reads it: JSON, else a form's fields (a repeated name becomes a
+country (`request.cf.country`), the headers, the body's size, the time it arrived (the relay's
+clock, which is the event's `receivedAt`) and, unless the hook is strict, the body itself, read as the harness reads it: JSON, else a form's fields (a repeated name becomes a
 list), else UTF-8 text. A strict hook's body is never parsed, so conditions on its body never hold
 there (its devices still screen it).
 
@@ -527,6 +527,7 @@ Condition  =
   { "on": "field", "path", "op": "pattern", "pattern", "not"?: true }        needs consent.words
   { "on": "field", "path", "op": "similar_text", "signature", "threshold"? } needs consent.words
   { "on": "similar", "shape"?: 64 hex, "text"?: signature, "threshold"? }
+  { "on": "time", "from": "HH:MM", "to": "HH:MM", "days"?: [0..6…], "tz"?: IANA zone, "not"?: true }
 ```
 
 Lists hold 1 to 1,000 entries. `not` turns a list into an allow list: `{"on": "ip", "in": <GitHub's
@@ -588,6 +589,24 @@ missing network, country or field.
   once), its patterns and `contains` comparisons take at most 2,000,000 steps, and its field paths
   pass at most 1,000,000 payload nodes. A delivery that would need more is held, as if a rule had
   said `quarantine`, under the rule id `~over-budget` (not a valid rule id, so it names no rule).
+- **Time windows** (`time`) hold when the delivery arrived, read as a wall clock in `tz` (an IANA
+  name such as `Europe/Lisbon`; UTC when absent), on one of `days` (0 is Sunday; every day when
+  absent) at or after `from` and before `to`. `from` is `00:00` to `23:59`, `to` is `00:00` to
+  `24:00` and differs from `from`. A window whose `from` is later than its `to` runs past midnight,
+  and is on the day it started: `{"days": [5], "from": "22:00", "to": "06:00"}` holds from Friday
+  22:00 to Saturday 06:00. Daylight saving time is the zone's: a wall-clock time that is skipped
+  never occurs, and one that repeats holds both times. The time is the relay's clock when the
+  delivery arrives, the instant it signs as the event's `receivedAt`; the harness judges the same
+  event by that `receivedAt` (not the device's clock), so both halves agree, and an event read
+  late is judged by when it arrived. A zone's name is letters first, then letters, digits, `_`, `+`
+  and `-` in parts joined by `/`, at most 64 characters (no offsets like `+01:00`; case is
+  ignored and older names such as `US/Eastern` work), and must be in the zone database; an unknown
+  zone, `Etc/Unknown` and `Factory` are refused (`400` on the condition's `tz`), as is a bad `from`,
+  `to` or `days` (on that field). One screen's windows are in at most 8 different zones (no `tz`
+  counts as `UTC`; `400`, `field: "screen.rules"`). Each zone's formatter is made once per relay
+  isolate, and a delivery reads its wall clock once per zone. The two halves' zone databases
+  (the runtime's ICU at the relay, the IANA database bundled with the harness) can differ for a
+  zone whose rules changed recently, until both are updated.
 - **Fingerprints** (`similar`): `shape` is the payload's shape hash (its field paths and types:
   every path `payload.a`, `payload.l[]`… with its types sorted and joined by `|`, the lines
   `path:types` sorted and joined by `\n`, then hex SHA-256; at most 2,000 fields, 32 levels and 50
@@ -599,8 +618,9 @@ missing network, country or field.
   equal slots is at least `threshold` (0.5 to 1; 0.8 when absent).
 
 `fixtures/screen.v1.json` pins words, shapes, signatures, domains (with the caps), keyed hashes,
-which patterns are in the edge's subset with their weights, and what edge patterns match
-(pathological inputs included); the relay's tests and the harness's (`cli/hooks-screen`) both run
+which patterns are in the edge's subset with their weights, what edge patterns match
+(pathological inputs included), and when time windows hold (past midnight, days, daylight saving
+transitions, `not`) with the windows and zones refused; the relay's tests and the harness's (`cli/hooks-screen`) both run
 it.
 
 **The hold.** A quarantined event is sealed to every device as usual, but with the associated data

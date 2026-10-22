@@ -5,9 +5,9 @@
 //
 // What it reads: the sender's address, network (ASN) and country from Cloudflare (`request.cf`),
 // headers, the size, and, unless the hook is strict, the body: its shape hash, a MinHash of its
-// text, and fields and headers whose values the rules hold only as keyed hashes. `contains` (on a
-// field or a header), `pattern` and `similar text` read the words, so a device may push them only
-// with `consent.words`. Nothing read here is stored: a decision keeps the rule's id and a count.
+// text, and fields and headers whose values the rules hold only as keyed hashes; and the time it
+// arrived, for time windows. `contains` (on a field or a header), `pattern` and `similar text`
+// read the words, so a device may push them only with `consent.words`. Nothing read here is stored: a decision keeps the rule's id and a count.
 //
 // What one delivery can cost is bounded whatever the screen and the payload: a screen is compiled
 // once per isolate; patterns run on a linear-time matcher (`screen-pattern.ts`); a path reads at
@@ -52,7 +52,8 @@ export type Condition =
   | { on: "field"; path: string; op: "contains"; words: string; not?: boolean }
   | { on: "field"; path: string; op: "pattern"; pattern: string; not?: boolean }
   | { on: "field"; path: string; op: "similar_text"; signature: string; threshold?: number; not?: boolean }
-  | { on: "similar"; shape?: string; text?: string; threshold?: number };
+  | { on: "similar"; shape?: string; text?: string; threshold?: number }
+  | { on: "time"; from: string; to: string; days?: number[]; tz?: string; not?: boolean };
 
 export interface EdgeRule {
   id: string;
@@ -418,6 +419,66 @@ export function edgeSafePattern(pattern: string): boolean {
   }
 }
 
+// ── time windows (the same as cli/hooks-screen's `window`) ──────────────────────────────────────
+
+/** The most different time zones one screen's windows read in (each is an `Intl` formatter). */
+export const MAX_SCREEN_ZONES = 8;
+const WEEKDAYS: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+/** Formatters by zone name, shared by the isolate's screens; only zones that exist get one. */
+const MAX_FORMATTERS = 256;
+const formatters = new Map<string, Intl.DateTimeFormat>();
+
+/** `HH:MM`, two digits each, as minutes since midnight; `24:00` only where `end` allows it. */
+function minutesOf(v: unknown, end: boolean): number | null {
+  if (typeof v !== "string" || !/^[0-9]{2}:[0-9]{2}$/.test(v)) return null;
+  const h = Number(v.slice(0, 2));
+  const m = Number(v.slice(3));
+  const t = h * 60 + m;
+  return m < 60 && (h < 24 || (end && t === 1440)) ? t : null;
+}
+
+/**
+ * The formatter that reads a time as a wall clock in an IANA zone, or null when the name isn't
+ * one: spelled as IANA names are (letters first; letters, digits, _ + -; parts joined by /; at
+ * most 64 characters, so no `+01:00`), and known to the runtime's zone database.
+ */
+function zoneFormatter(tz: unknown): Intl.DateTimeFormat | null {
+  if (typeof tz !== "string" || tz.length > 64 || !/^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+)*$/.test(tz)) return null;
+  // The database's "no local time" (the harness's `jiff` knows it; refused on both halves).
+  if (tz.toLowerCase() === "factory") return null;
+  let f = formatters.get(tz);
+  if (!f) {
+    try {
+      f = new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", weekday: "short", hour: "2-digit", minute: "2-digit" });
+    } catch {
+      return null;
+    }
+    if (formatters.size >= MAX_FORMATTERS) formatters.clear();
+    formatters.set(tz, f);
+  }
+  return f;
+}
+
+/** The day of the week (0 is Sunday) and the minute of the day, at `at`, on a zone's wall clock. */
+function wallClock(f: Intl.DateTimeFormat, at: number): { day: number; minute: number } {
+  let day = 0;
+  let hour = 0;
+  let minute = 0;
+  for (const p of f.formatToParts(at)) {
+    if (p.type === "weekday") day = WEEKDAYS[p.value] ?? 0;
+    else if (p.type === "hour") hour = Number(p.value) % 24;
+    else if (p.type === "minute") minute = Number(p.value);
+  }
+  return { day, minute: hour * 60 + minute };
+}
+
+/** Whether a wall-clock time is within a window: past midnight, the morning is the day before's. */
+function inWindow(c: { from: number; to: number; days: number }, t: { day: number; minute: number }): boolean {
+  const on = (d: number) => (c.days & (1 << d)) !== 0;
+  if (c.from < c.to) return on(t.day) && c.from <= t.minute && t.minute < c.to;
+  return (t.minute >= c.from && on(t.day)) || (t.minute < c.to && on((t.day + 6) % 7));
+}
+
 // ── parsing what a device pushes ────────────────────────────────────────────────────────────────
 
 const bad = (field: string, message: string): never => {
@@ -560,8 +621,22 @@ function parseCondition(raw: unknown, field: string): Condition {
       const t = threshold(raw.threshold, `${field}.threshold`);
       return { on: "similar", ...(shape ? { shape } : {}), ...(text ? { text } : {}), ...(t !== undefined ? { threshold: t } : {}) };
     }
+    case "time": {
+      const from = minutesOf(raw.from, false) ?? bad(`${field}.from`, "from is a time of day, HH:MM, 00:00 to 23:59.");
+      const to = minutesOf(raw.to, true) ?? bad(`${field}.to`, "to is a time of day, HH:MM, 00:00 to 24:00.");
+      if (from === to) return bad(`${field}.to`, "to is a different time from from.");
+      let days: number[] | undefined;
+      if (raw.days !== undefined) {
+        const d = raw.days;
+        const ok = Array.isArray(d) && d.length > 0 && d.every((x, i) => Number.isInteger(x) && (x as number) >= 0 && (x as number) <= 6 && d.indexOf(x) === i);
+        days = ok ? (d as number[]) : bad(`${field}.days`, "days lists each day once, 0 (Sunday) to 6.");
+      }
+      let tz: string | undefined;
+      if (raw.tz !== undefined) tz = zoneFormatter(raw.tz) ? (raw.tz as string) : bad(`${field}.tz`, "tz is a time zone's IANA name, like Europe/Lisbon.");
+      return withNot({ on: "time", from: raw.from as string, to: raw.to as string, ...(days ? { days } : {}), ...(tz ? { tz } : {}) });
+    }
     default:
-      return bad(`${field}.on`, "A condition is on ip, asn, country, header, size, field or similar.");
+      return bad(`${field}.on`, "A condition is on ip, asn, country, header, size, field, similar or time.");
   }
 }
 
@@ -595,6 +670,9 @@ export function parseScreen(raw: unknown): EdgeScreen | null {
   if ([...weights.values()].reduce((s, w) => s + w, 0) > MAX_SCREEN_PATTERN_WEIGHT) {
     return bad("screen.rules", `The patterns of one screen weigh at most ${MAX_SCREEN_PATTERN_WEIGHT} together, once their repeats are counted (each different pattern once).`);
   }
+  const zones = new Set<string>();
+  for (const r of rules) for (const c of r.conditions) if (c.on === "time") zones.add(c.tz ?? "UTC");
+  if (zones.size > MAX_SCREEN_ZONES) return bad("screen.rules", `The time windows of one screen are in at most ${MAX_SCREEN_ZONES} different time zones.`);
   return { rules, consent: { words: consent && rules.some((r) => r.conditions.some(needsWords)) } };
 }
 
@@ -614,7 +692,9 @@ type Check =
   /** `re` is null for a pattern stored before the subset that it isn't in: it never holds. */
   | { on: "field"; path: string; not: boolean; op: "pattern"; re: CompiledPattern | null }
   | { on: "field"; path: string; not: boolean; op: "similar_text"; signature: Uint32Array | null; threshold: number }
-  | { on: "similar"; shape: string | undefined; text: Uint32Array | null | undefined; threshold: number };
+  | { on: "similar"; shape: string | undefined; text: Uint32Array | null | undefined; threshold: number }
+  /** `clock` is null for a zone this runtime doesn't know (a screen kept from elsewhere): it never holds. */
+  | { on: "time"; from: number; to: number; days: number; clock: Intl.DateTimeFormat | null; not: boolean };
 
 export interface CompiledScreen {
   rules: { id: string; verdict: Verdict; any: boolean; checks: Check[] }[];
@@ -657,6 +737,15 @@ export function compileScreen(screen: EdgeScreen): CompiledScreen {
         return fieldCheck(c, not);
       case "similar":
         return { on: "similar", shape: c.shape, text: c.text ? decodeSignature(c.text) : undefined, threshold: c.threshold ?? DEFAULT_THRESHOLD };
+      case "time":
+        return {
+          on: "time",
+          from: minutesOf(c.from, false) ?? 0,
+          to: minutesOf(c.to, true) ?? 0,
+          days: c.days ? c.days.reduce((bits, d) => bits | (1 << d), 0) : 0x7f,
+          clock: zoneFormatter(c.tz ?? "UTC"),
+          not,
+        };
     }
   };
   const fieldCheck = (c: Extract<Condition, { on: "field" }>, not: boolean): Check => {
@@ -735,6 +824,8 @@ export interface Delivery {
   strict: boolean;
   /** The account's screen key, imported once for this delivery. */
   key: CryptoKey;
+  /** When the relay received it (Unix milliseconds; the event's `receivedAt`), for time windows. */
+  at: number;
 }
 
 /** What the conditions read, worked out at most once, and the delivery's budget. */
@@ -752,6 +843,7 @@ class View implements Steps {
   private readonly sigs = new Map<string, Uint32Array | null>();
   private readonly points = new Map<string, Int32Array>();
   private readonly matched = new Map<CompiledPattern, Map<string, boolean>>();
+  private readonly clocks = new Map<Intl.DateTimeFormat, { day: number; minute: number }>();
   readonly ip: { v4: boolean; bytes: number[] } | null;
   readonly d: Delivery;
   constructor(d: Delivery) {
@@ -812,6 +904,12 @@ class View implements Steps {
     let s = this.sigs.get(value);
     if (s === undefined) this.sigs.set(value, (s = signatureOf(value)));
     return s;
+  }
+  /** The delivery's time on a zone's wall clock, once per zone. */
+  wallClock(f: Intl.DateTimeFormat): { day: number; minute: number } {
+    let t = this.clocks.get(f);
+    if (!t) this.clocks.set(f, (t = wallClock(f, this.d.at)));
+    return t;
   }
   matches(re: CompiledPattern, value: string): boolean {
     let seen = this.matched.get(re);
@@ -877,6 +975,8 @@ async function holds(c: Check, v: View): Promise<boolean> {
       const mine = v.text();
       return mine !== null && c.text !== null && similarity(mine, c.text) >= c.threshold;
     }
+    case "time":
+      return c.clock !== null && c.from !== c.to && inWindow(c, v.wallClock(c.clock)) !== c.not;
   }
 }
 
