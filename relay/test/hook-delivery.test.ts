@@ -371,6 +371,23 @@ describe("the test event", () => {
     }
   });
 
+  it("can't be claimed by a sender: a delivery typed 00hooks.test has no type", async () => {
+    const dev = await newAccount();
+    const { hook, secret } = await createHook(dev, { preset: "github" });
+    const body = JSON.stringify({ n: 1 });
+    const sig = `sha256=${toHex(await hmac("SHA-256", utf8(secret!), utf8(body)))}`;
+    const res = await fetchRelay(`/h/${hook.id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Hub-Signature-256": sig, "X-GitHub-Event": "00hooks.test", "X-GitHub-Delivery": "d1" },
+      body,
+    });
+    expect(res.status).toBe(200);
+    const s = await openStream(dev, 0);
+    expect((await s.sse.nextEvent())?.event).toBe("ready");
+    expect(data<StreamedEvent>(await nextHook(s.sse)).eventType).toBeNull();
+    await s.sse.cancel();
+  });
+
   it("refuses a strict hook and needs a device or hooks:secrets", async () => {
     const dev = await newAccount();
     const { hook: strict } = await createHook(dev, { preset: "github", strict: true });

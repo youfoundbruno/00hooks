@@ -133,7 +133,9 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
     verified: verdict.verified,
     strict,
     preset: config.preset,
-    eventType: test ? TEST_EVENT_TYPE : verdict.eventType,
+    // Only the relay's own test says `00hooks.test`: a sender's claim of it (GitHub's type is an
+    // unsigned header) is no type at all.
+    eventType: test ? TEST_EVENT_TYPE : verdict.eventType === TEST_EVENT_TYPE ? null : verdict.eventType,
     content: {
       contentType: request.headers.get("content-type")?.slice(0, 200) ?? null,
       // A strict hook seals the signature headers and the URL too: its devices verify.

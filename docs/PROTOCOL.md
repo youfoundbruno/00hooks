@@ -275,7 +275,9 @@ secret the way its preset's provider signs (the preset table drives it: signed p
 of now, fresh delivery ids so it is never a duplicate), through the hook's own path: rate limits,
 verification, the screen, dedupe, sealing and the log apply exactly as to a delivery. The sample is
 JSON (`{"type": "00hooks.test", …, "00hooks": {"test": true, "sentAt", "note"}}`; a form for `twilio`),
-and the event's routing `eventType` is `00hooks.test`, set by the relay whatever the preset reads,
+and the event's routing `eventType` is `00hooks.test`, set by the relay whatever the preset reads
+(and only by it: a delivery whose preset reads that type, from GitHub's unsigned header say, gets
+none),
 and signed with the rest of the metadata (§5). → `200` `{ "status": <what the delivery was
 answered>, "answer": <its JSON answer, or null>, "eventType": "00hooks.test" }`. A strict hook (its
 secret is on the devices) and a `standard-webhooks-ed25519` hook (the relay holds only the public
