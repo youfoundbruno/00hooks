@@ -22,6 +22,15 @@ pub enum Preset {
     Twilio,
     /// Meta: WhatsApp Cloud API, Messenger and Instagram webhooks.
     Meta,
+    Calendly,
+    Typeform,
+    /// Paddle Billing.
+    Paddle,
+    /// Twitch EventSub.
+    Twitch,
+    Zoom,
+    /// PagerDuty (v3 webhooks).
+    Pagerduty,
     Hmac,
     Token,
     Unverified,
@@ -39,6 +48,12 @@ impl Preset {
             Preset::Shopify => "shopify",
             Preset::Twilio => "twilio",
             Preset::Meta => "meta",
+            Preset::Calendly => "calendly",
+            Preset::Typeform => "typeform",
+            Preset::Paddle => "paddle",
+            Preset::Twitch => "twitch",
+            Preset::Zoom => "zoom",
+            Preset::Pagerduty => "pagerduty",
             Preset::Hmac => "hmac",
             Preset::Token => "token",
             Preset::Unverified => "unverified",
@@ -55,6 +70,9 @@ impl Preset {
                 | Preset::Shopify
                 | Preset::Twilio
                 | Preset::Meta
+                | Preset::Paddle
+                | Preset::Zoom
+                | Preset::Pagerduty
         )
     }
 }
@@ -122,6 +140,12 @@ pub fn verify_spec(preset: Preset, a: &VerifyArgs) -> CliResult<Value> {
             "A token hook can't be strict: the token reaches the relay in the clear with every \
              delivery, so the relay could mint events with it. Use a signing preset (hmac, say), \
              or drop --strict.",
+        ));
+    }
+    if preset == Preset::Zoom && a.strict {
+        return Err(Failure::new(
+            "A zoom hook can't be strict: Zoom checks the endpoint every 72 hours with a token the \
+             relay must sign with the secret. Drop --strict.",
         ));
     }
     if preset == Preset::StandardWebhooksEd25519 {
@@ -758,6 +782,52 @@ mod tests {
                 .unwrap_err()
                 .message
                 .contains("--public-key")
+        );
+    }
+
+    #[test]
+    fn the_documented_hmac_presets_take_the_right_secret() {
+        let none = VerifyArgs::default();
+        for p in [Preset::Calendly, Preset::Typeform, Preset::Twitch] {
+            // The receiver chooses these secrets: the relay generates one when none is given.
+            assert_eq!(
+                verify_spec(p, &none).unwrap(),
+                json!({ "preset": p.wire() })
+            );
+            assert_eq!(parse_preset(p.wire()), Some(p));
+        }
+        let given = VerifyArgs {
+            secret: Some("s".into()),
+            ..Default::default()
+        };
+        for p in [Preset::Paddle, Preset::Zoom, Preset::Pagerduty] {
+            assert!(
+                verify_spec(p, &none)
+                    .unwrap_err()
+                    .message
+                    .contains("--secret-stdin")
+            );
+            assert_eq!(
+                verify_spec(p, &given).unwrap(),
+                json!({ "preset": p.wire(), "secret": "s" })
+            );
+            assert_eq!(parse_preset(p.wire()), Some(p));
+        }
+        let strict = VerifyArgs {
+            secret: Some("s".into()),
+            strict: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            verify_spec(Preset::Paddle, &strict).unwrap(),
+            json!({"preset":"paddle","strict":true})
+        );
+        // Zoom's endpoint check needs the secret at the relay.
+        assert!(
+            verify_spec(Preset::Zoom, &strict)
+                .unwrap_err()
+                .message
+                .contains("can't be strict")
         );
     }
 

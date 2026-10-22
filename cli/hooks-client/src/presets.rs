@@ -31,9 +31,17 @@ enum Part {
 
 #[derive(Debug, Clone)]
 enum SigFormat {
-    Single { prefix: String },
-    Versioned { version: &'static str },
-    Params { param: &'static str },
+    Single {
+        prefix: String,
+    },
+    Versioned {
+        version: &'static str,
+    },
+    /// `k=v` pairs separated by `sep`: `,` (Stripe) or `;` (Paddle).
+    Params {
+        param: &'static str,
+        sep: char,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,10 +73,18 @@ enum TsSource {
     BodyField(&'static str),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TsUnit {
+    Seconds,
+    Millis,
+    /// An RFC 3339 date-time (Twitch's).
+    Rfc3339,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Timestamp {
     source: TsSource,
-    millis: bool,
+    unit: TsUnit,
     tolerance_s: i64,
 }
 
@@ -105,6 +121,19 @@ const SLACK: &[Part] = &[
     Part::Body,
 ];
 const TWILIO: &[Part] = &[Part::Twilio];
+const CALENDLY: &[Part] = &[Part::SigParam("t"), Part::Text("."), Part::Body];
+const PADDLE: &[Part] = &[Part::SigParam("ts"), Part::Text(":"), Part::Body];
+const TWITCH: &[Part] = &[
+    Part::Header("twitch-eventsub-message-id"),
+    Part::Header("twitch-eventsub-message-timestamp"),
+    Part::Body,
+];
+const ZOOM: &[Part] = &[
+    Part::Text("v0:"),
+    Part::Header("x-zm-request-timestamp"),
+    Part::Text(":"),
+    Part::Body,
+];
 
 fn sig(header: &str, f: SigFormat, e: Encoding) -> Option<(String, SigFormat, Encoding)> {
     Some((header.to_string(), f, e))
@@ -145,7 +174,7 @@ fn spec(verify: &Value) -> Option<Spec> {
                 signed: STANDARD,
                 timestamp: Some(Timestamp {
                     source: TsSource::Header("webhook-timestamp"),
-                    millis: false,
+                    unit: TsUnit::Seconds,
                     tolerance_s: 300,
                 }),
                 event_type: Some(TypeSource::BodyFields(&["type"])),
@@ -156,13 +185,16 @@ fn spec(verify: &Value) -> Option<Spec> {
             key: KeyForm::Utf8,
             sig: sig(
                 "stripe-signature",
-                SigFormat::Params { param: "v1" },
+                SigFormat::Params {
+                    param: "v1",
+                    sep: ',',
+                },
                 Encoding::Hex,
             ),
             signed: STRIPE,
             timestamp: Some(Timestamp {
                 source: TsSource::SigParam("t"),
-                millis: false,
+                unit: TsUnit::Seconds,
                 tolerance_s: 300,
             }),
             event_type: Some(TypeSource::BodyFields(&["type"])),
@@ -180,7 +212,7 @@ fn spec(verify: &Value) -> Option<Spec> {
             signed: SLACK,
             timestamp: Some(Timestamp {
                 source: TsSource::Header("x-slack-request-timestamp"),
-                millis: false,
+                unit: TsUnit::Seconds,
                 tolerance_s: 300,
             }),
             event_type: Some(TypeSource::BodyFields(&["event.type", "type"])),
@@ -198,7 +230,7 @@ fn spec(verify: &Value) -> Option<Spec> {
             signed: BODY,
             timestamp: Some(Timestamp {
                 source: TsSource::BodyField("webhookTimestamp"),
-                millis: true,
+                unit: TsUnit::Millis,
                 tolerance_s: 60,
             }),
             event_type: Some(TypeSource::BodyFields(&["type"])),
@@ -246,6 +278,113 @@ fn spec(verify: &Value) -> Option<Spec> {
             signed: BODY,
             timestamp: None,
             event_type: Some(TypeSource::BodyFields(&["object"])),
+        },
+        // Calendly: `t=<s>,v1=<hex>` over `t.body`, `t` within 3 minutes.
+        "calendly" => Spec {
+            mac: Mac_::HmacSha256,
+            key: KeyForm::Utf8,
+            sig: sig(
+                "calendly-webhook-signature",
+                SigFormat::Params {
+                    param: "v1",
+                    sep: ',',
+                },
+                Encoding::Hex,
+            ),
+            signed: CALENDLY,
+            timestamp: Some(Timestamp {
+                source: TsSource::SigParam("t"),
+                unit: TsUnit::Seconds,
+                tolerance_s: 180,
+            }),
+            event_type: Some(TypeSource::BodyFields(&["event"])),
+        },
+        // Typeform: `sha256=<base64 HMAC(body)>`, no timestamp.
+        "typeform" => Spec {
+            mac: Mac_::HmacSha256,
+            key: KeyForm::Utf8,
+            sig: sig(
+                "typeform-signature",
+                SigFormat::Single {
+                    prefix: "sha256=".into(),
+                },
+                Encoding::Base64,
+            ),
+            signed: BODY,
+            timestamp: None,
+            event_type: Some(TypeSource::BodyFields(&["event_type"])),
+        },
+        // Paddle Billing: `ts=<s>;h1=<hex>` over `ts:body`, `ts` within 5 s.
+        "paddle" => Spec {
+            mac: Mac_::HmacSha256,
+            key: KeyForm::Utf8,
+            sig: sig(
+                "paddle-signature",
+                SigFormat::Params {
+                    param: "h1",
+                    sep: ';',
+                },
+                Encoding::Hex,
+            ),
+            signed: PADDLE,
+            timestamp: Some(Timestamp {
+                source: TsSource::SigParam("ts"),
+                unit: TsUnit::Seconds,
+                tolerance_s: 5,
+            }),
+            event_type: Some(TypeSource::BodyFields(&["event_type"])),
+        },
+        // Twitch EventSub: `sha256=<hex>` over id, timestamp and body; the RFC 3339 timestamp at
+        // most 10 minutes off; typed by the signed body's subscription type.
+        "twitch" => Spec {
+            mac: Mac_::HmacSha256,
+            key: KeyForm::Utf8,
+            sig: sig(
+                "twitch-eventsub-message-signature",
+                SigFormat::Single {
+                    prefix: "sha256=".into(),
+                },
+                Encoding::Hex,
+            ),
+            signed: TWITCH,
+            timestamp: Some(Timestamp {
+                source: TsSource::Header("twitch-eventsub-message-timestamp"),
+                unit: TsUnit::Rfc3339,
+                tolerance_s: 600,
+            }),
+            event_type: Some(TypeSource::BodyFields(&["subscription.type"])),
+        },
+        // Zoom: `v0=<hex>` over `v0:ts:body`. The timestamp is signed but, with no documented
+        // window, not checked (as the relay).
+        "zoom" => Spec {
+            mac: Mac_::HmacSha256,
+            key: KeyForm::Utf8,
+            sig: sig(
+                "x-zm-signature",
+                SigFormat::Single {
+                    prefix: "v0=".into(),
+                },
+                Encoding::Hex,
+            ),
+            signed: ZOOM,
+            timestamp: None,
+            event_type: Some(TypeSource::BodyFields(&["event"])),
+        },
+        // PagerDuty v3: `v1=<hex HMAC(body)>[,v1=…]`, no timestamp.
+        "pagerduty" => Spec {
+            mac: Mac_::HmacSha256,
+            key: KeyForm::Utf8,
+            sig: sig(
+                "x-pagerduty-signature",
+                SigFormat::Params {
+                    param: "v1",
+                    sep: ',',
+                },
+                Encoding::Hex,
+            ),
+            signed: BODY,
+            timestamp: None,
+            event_type: Some(TypeSource::BodyFields(&["event.event_type"])),
         },
         "hmac" => Spec {
             mac: if field("algorithm") == Some("sha1") {
@@ -339,10 +478,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Stripe-style `k=v,k=v` parameters; every value of a repeated key is kept.
-fn sig_params(value: &str) -> BTreeMap<String, Vec<String>> {
+/// Stripe-style `k=v,k=v` parameters (Paddle's `k=v;k=v`); every value of a repeated key is kept.
+fn sig_params(value: &str, sep: char) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for part in value.split(',') {
+    for part in value.split(sep) {
         if let Some((k, v)) = part.split_once('=')
             && !k.trim().is_empty()
         {
@@ -374,8 +513,8 @@ fn candidates(
             .split(' ')
             .filter_map(|s| s.strip_prefix(&format!("{version},")).map(str::to_string))
             .collect(),
-        SigFormat::Params { param } => {
-            params = sig_params(value);
+        SigFormat::Params { param, sep } => {
+            params = sig_params(value, *sep);
             params.get(*param).cloned().unwrap_or_default()
         }
     };
@@ -553,11 +692,95 @@ fn timestamp_ms(
         },
         TsSource::BodyField(f) => body_path(json, f),
     }?;
+    if t.unit == TsUnit::Rfc3339 {
+        return rfc3339_ms(&raw).map(Some);
+    }
     if raw.is_empty() || raw.len() > 16 || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let n: i64 = raw.parse().ok()?;
-    Some(Some(if t.millis { n } else { n.saturating_mul(1000) }))
+    Some(Some(if t.unit == TsUnit::Millis {
+        n
+    } else {
+        n.saturating_mul(1000)
+    }))
+}
+
+/// An RFC 3339 date-time (`2019-11-16T10:11:12.634234626Z`) in Unix ms, the fraction cut to whole
+/// ms; `None` unless it is exactly that form, from 1970, with every field in range (no leap second).
+/// The relay's `rfc3339Ms` parses it the same way.
+pub fn rfc3339_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = b.get(r)?;
+        if part.is_empty() || !part.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(part).ok()?.parse().ok()
+    };
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, se) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let mut i = 19;
+    let mut ms = 0;
+    if b[i] == b'.' {
+        let start = i + 1;
+        let mut end = start;
+        while end < b.len() && b[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == start || end - start > 9 {
+            return None;
+        }
+        let mut digits = s[start..end.min(start + 3)].to_string();
+        while digits.len() < 3 {
+            digits.push('0');
+        }
+        ms = digits.parse::<i64>().ok()?;
+        i = end;
+    }
+    let offset_min = match &b[i..] {
+        [b'Z'] => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (oh, om) = (num(i + 1..i + 3)?, num(i + 4..i + 6)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            (if *sign == b'-' { -1 } else { 1 }) * (oh * 60 + om)
+        }
+        _ => return None,
+    };
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if y < 1970 || d < 1 || d > days_in || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    // Days from 1970-01-01 (Howard Hinnant's days_from_civil).
+    let (yy, m) = if mo <= 2 {
+        (y - 1, mo + 9)
+    } else {
+        (y, mo - 3)
+    };
+    let era = yy / 400;
+    let yoe = yy - era * 400;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + h) * 60 + mi - offset_min) * 60_000 + se * 1000 + ms)
 }
 
 /// Whether a preset proves anything in strict mode. `unverified` proves nothing, and a `token`
@@ -707,7 +930,7 @@ pub fn generate_secret(preset: &str) -> crate::Result<Option<String>> {
             "whsec_{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         )),
-        "github" | "hmac" | "token" => {
+        "github" | "calendly" | "typeform" | "twitch" | "hmac" | "token" => {
             Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
         }
         _ => None,
@@ -768,10 +991,49 @@ mod tests {
             "shopify",
             "twilio",
             "meta",
+            "calendly",
+            "typeform",
+            "paddle",
+            "twitch",
+            "zoom",
+            "pagerduty",
             "hmac",
             "token",
         ] {
             assert!(presets.contains(p), "no vector for {p}");
+        }
+    }
+
+    #[test]
+    fn rfc3339_is_parsed_exactly_and_nothing_else() {
+        // 2019-11-16T10:11:12Z
+        let base = 1_573_899_072_000;
+        assert_eq!(rfc3339_ms("2019-11-16T10:11:12Z"), Some(base));
+        assert_eq!(
+            rfc3339_ms("2019-11-16T10:11:12.634234626Z"),
+            Some(base + 634)
+        );
+        assert_eq!(rfc3339_ms("2019-11-16T12:11:12.5+02:00"), Some(base + 500));
+        assert_eq!(rfc3339_ms("2019-11-16T05:41:12-04:30"), Some(base));
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        for bad in [
+            "2023-02-29T00:00:00Z",
+            "2019-13-01T00:00:00Z",
+            "2019-11-16T24:00:00Z",
+            "2019-11-16T23:59:60Z",
+            "2019-11-16 10:11:12Z",
+            "2019-11-16T10:11:12",
+            "2019-11-16t10:11:12z",
+            "2019-11-16T10:11:12.Z",
+            "2019-11-16T10:11:12.1234567890Z",
+            "0050-01-01T00:00:00Z",
+            "1792233600",
+            " 2019-11-16T10:11:12Z",
+            "2019-11-16T10:11:12+0200",
+            "+019-11-16T10:11:12Z",
+        ] {
+            assert_eq!(rfc3339_ms(bad), None, "{bad}");
         }
     }
 
@@ -842,5 +1104,12 @@ mod tests {
         );
         assert_eq!(generate_secret("github").unwrap().unwrap().len(), 43);
         assert!(generate_secret("stripe").unwrap().is_none());
+        // Twitch takes 10 to 100 ASCII characters; the receiver chooses Calendly's and Typeform's.
+        for p in ["calendly", "typeform", "twitch"] {
+            assert_eq!(generate_secret(p).unwrap().unwrap().len(), 43, "{p}");
+        }
+        for p in ["paddle", "zoom", "pagerduty"] {
+            assert!(generate_secret(p).unwrap().is_none(), "{p}");
+        }
     }
 }
