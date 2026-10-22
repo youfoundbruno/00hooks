@@ -54,6 +54,12 @@ management requests are rate-limited per address (`429`, §1); an account at its
 `409` (§2); and a relay with neither a signup token nor `OPEN_SIGNUP=1` refuses signups with `403` (its
 `/v1/info` says `signupOpen: false`).
 
+Additive within version 2 (finishing the plan): renaming a device (`PATCH /v1/devices/<id>`, §2);
+a hook's `deliverTo` and `response` (§3, §6); the signed test event (`POST /v1/test/<hookId>`,
+§3), whose routing `eventType` is `00hooks.test`; and the audit kinds `device.renamed` and
+`hook.delivery` (§9). A client that ignores them keeps working: an event its hook delivers to
+another device never reaches it, and a test event is an ordinary verified event.
+
 ## 1. Signed requests
 
 Every `/v1/*` request except account creation and enrolment is signed by a **device**. A device has an
@@ -184,6 +190,11 @@ characters); both sides compute it.
   already in the log keep the key they were sealed to (each envelope names its kid). This is how a
   device created before version 2 gets one. Another device (or an API key) gets `403` `forbidden`:
   whoever sets a device's sealing key chooses who can read what is sealed to it.
+- `PATCH /v1/devices/<id>` (signed by a device, or an API key with `devices:write`) `{ "name" }` →
+  `{ "device": <as GET /v1/devices lists it> }`: renames one of the account's devices (a phone
+  too). The name is 1 to 100 characters once trimmed, without control characters (`400` `invalid`,
+  `field: "name"`). A revoked device, a phone whose pairing ran out unconfirmed, or another
+  account's device is `404`. Audit: `device.renamed`, named by the new name.
 - `DELETE /v1/devices/<id>` (signed, or an API key with `devices:write`) → `204`: revokes it; its open stream closes at once with `4401`.
   Revoking a device also revokes every phone paired with it, and revoking a phone tells its node
   (§10.5).
@@ -222,8 +233,23 @@ characters); both sides compute it.
   refer to a hook by name resolve the name to the hook's id once and keep the id: a hook renamed
   later, or a new hook given a freed name, is a different hook.
 - `GET /v1/hooks` (`hooks:read`) → `{ "hooks": [<Hook>] }`; `GET /v1/hooks/<id>` → `<Hook>`.
-- `PATCH /v1/hooks/<id>` (`hooks:write`) `{ "name"?, "enabled"?, "maxBodyBytes"?, "offlineNotice"? }`
-  → `<Hook>`. `"offlineNotice": null` clears it.
+- `PATCH /v1/hooks/<id>` (`hooks:write`) `{ "name"?, "enabled"?, "maxBodyBytes"?, "offlineNotice"?,
+  "deliverTo"?, "response"? }` → `<Hook>`. `null` clears `offlineNotice`, `deliverTo` and `response`.
+  - `deliverTo`: a device id. The hook's events are sealed to that device alone, so an automation
+    that two machines both run happens once (*the Mac in the office*); every other device's stream
+    passes them by without a word (§6). It must be an active device of kind `device` of the account
+    with a sealing key (`400` `invalid`, `field: "deliverTo"`). When that device is revoked (or
+    loses its key) the hook's deliveries go to every device again rather than to nobody, and the
+    events only it could read are deleted with it. Changing it is an audit line `hook.delivery`
+    (named by the device id, or `*` for every device).
+  - `response`: `{ "status"?: 200–299 but 204 and 205 (200 by default), "contentType"?:
+    "text/plain" (default) | "application/json" | "application/xml" | "text/xml", "body"?: at most
+    4,096 bytes of UTF-8 (valid JSON for JSON) }`: what the relay answers the provider for a delivery
+    it accepts, instead of `{"received": …}`: stored, a duplicate, or dropped by the screen (which
+    must look the same). Refusals (`401`, `404`, `413`, `429`) keep their usual answers. It carries
+    `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; sandbox`, and
+    never HTML: the relay's origin serves no page someone wrote. A `twilio` hook, answered with TwiML,
+    can't have one (`400`, `field: "response"`); a due Slack notice (§4a) takes precedence.
 - `POST /v1/hooks/<id>/rotate` (a device, or `hooks:secrets`) → `{ "secret" }`; the previous secret
   keeps working for 24 h. Only for presets whose secret the relay generates; a provider-issued secret (Stripe, Slack,
   Linear, Shopify, Twilio) is rotated at the provider, and a strict hook's secret is on the devices:
@@ -234,8 +260,24 @@ Every device's stream is told of each hook created, rotated, renamed or deleted 
 §6), so a person notices a change they didn't make (an API key rotating a secret, say).
 
 `Hook`: `{ "id", "name", "url", "enabled", "verify": { "preset", …non-secret fields }, "maxBodyBytes",
-"createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null, "screenRules" }`
+"createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null, "screenRules",
+"deliverTo": "dev_…" | null, "response": { "status", "contentType", "body" } | null }`
 (`screenRules`: how many edge rules the hook's screen has, §4b).
+
+### The test event
+
+`POST /v1/test/<hookId>` (a device, or an API key with `hooks:secrets`: signing with a hook's secret
+needs what being shown it does) sends the hook a sample delivery, signed with the hook's own
+secret the way its preset's provider signs (the preset table drives it: signed parts, a timestamp
+of now, fresh delivery ids so it is never a duplicate), through the hook's own path: rate limits,
+verification, the screen, dedupe, sealing and the log apply exactly as to a delivery. The sample is
+JSON (`{"type": "00hooks.test", …, "00hooks": {"test": true, "sentAt", "note"}}`; a form for `twilio`),
+and the event's routing `eventType` is `00hooks.test`, set by the relay whatever the preset reads,
+and signed with the rest of the metadata (§5). → `200` `{ "status": <what the delivery was
+answered>, "answer": <its JSON answer, or null>, "eventType": "00hooks.test" }`. A strict hook (its
+secret is on the devices) and a `standard-webhooks-ed25519` hook (the relay holds only the public
+key) can't be signed for: `409` `conflict`; send a test from the provider. The reference runner
+records a test event and runs only the automations whose kinds name `00hooks.test`.
 
 ### Presets
 
@@ -314,8 +356,8 @@ or unsafe challenge, a wrong token) is `401` `signature`, counted like a failed 
 is stored. Hooks of other presets answer `GET` with `404`. The verify token is not a signing secret
 (it proves nothing about later deliveries), so a strict `meta` hook keeps it at the relay too.
 
-`maxBodyBytes` is at most 1,835,008 (bodies live in 2 MB SQLite rows; larger ones move to R2 in a
-later phase). It is 1 MiB by default, and 256 KiB for a strict or `unverified` hook (anyone who
+`maxBodyBytes` is at most 1,835,008 (bodies live in 2 MB SQLite rows; PLAN §3.2 says why larger
+bodies don't go to R2). It is 1 MiB by default, and 256 KiB for a strict or `unverified` hook (anyone who
 knows its URL can send it junk the relay can't tell from deliveries); `PATCH` raises it. Secrets are stored encrypted with the relay's `SECRETS_KEY` (AES-256-GCM, the hook id
 as associated data), never returned after creation.
 
@@ -758,8 +800,11 @@ data: {…event…}
 - **Probe**: `GET /v1/stream?probe=1` (signed, `X-00h-Protocol: 2`) answers `retry`, `ready` and
   `closed {"code":1000,"reason":"probe"}`, then ends, without replacing the device's live stream and
   without sending events (for `00hooks doctor`).
-- *(later)* per-hook delivery, so a device receives only the hooks routed to it: today every active
-  device with a sealing key gets an envelope for every event, and filters locally.
+- **Per-hook delivery**: an event of a hook with `deliverTo` (§3) has an envelope for that device
+  only. Another device's stream skips it **silently**, with no `gap` (nothing was lost to it), so
+  seqs a device receives need not be consecutive. Once its device acknowledges it (or is revoked),
+  the event is deleted without waiting for the others. Every other event goes to every active
+  device with a sealing key, which filters locally.
 
 How the relay serves it (informative): the Worker holds the SSE response and connects to the
 account's Durable Object over a WebSocket that the object accepts with the hibernation API, so the
@@ -837,9 +882,9 @@ scope, or on a route only a device may use, is `403` `forbidden`.
 |---|---|
 | `hooks:read` | `GET /v1/hooks`, `GET /v1/hooks/<id>` |
 | `hooks:write` | `POST /v1/hooks` (without a relay-generated secret or verify token), `PATCH`/`DELETE /v1/hooks/<id>` |
-| `hooks:secrets` | `POST /v1/hooks/<id>/rotate`, and, with `hooks:write`, `POST /v1/hooks` for a hook whose secret or verify token the relay generates: the only scope ever shown a hook's secret |
+| `hooks:secrets` | `POST /v1/hooks/<id>/rotate`, `POST /v1/test/<hookId>`, and, with `hooks:write`, `POST /v1/hooks` for a hook whose secret or verify token the relay generates: the only scope ever shown a hook's secret |
 | `events:read` | `GET /v1/events` |
-| `devices:write` | `GET /v1/devices`, `DELETE /v1/devices/<id>` |
+| `devices:write` | `GET /v1/devices`, `PATCH /v1/devices/<id>` (rename), `DELETE /v1/devices/<id>` |
 | `audit:read` | `GET /v1/audit` |
 | `hooks:read` (screen) | `GET /v1/hooks/<id>/screen` |
 | `hooks:write` (screen) | `PUT /v1/hooks/<id>/screen`, `POST /v1/held/<id>/release`, `DELETE /v1/held/<id>`, `DELETE /v1/held` |
@@ -865,6 +910,8 @@ Names and ids only: never a secret, a token, a header value or a payload.
 | `key.used` | the key | the key | the key's name; `count` uses in the hour starting at `at` |
 | `verify.failed` | the hook | null | the hook's name, while it exists; `count` failures in the hour starting at `at` (approximate: counted at the edge, §4 step 4) |
 | `hook.screen` | the hook | the device or key | the hook's name |
+| `hook.delivery` | the hook | the device or key | the device its events now go to, or `*` for every device |
+| `device.renamed` | the device | the device or key | its new name |
 | `screen.held`, `screen.dropped` | the hook | null | the hook's name; `count` in the hour starting at `at` (`screen.dropped` is counted at the edge, like `verify.failed`) |
 | `held.released`, `held.dropped` | the event | the device or key | null |
 | `phone.pairing` | the pairing id | the node device | null |

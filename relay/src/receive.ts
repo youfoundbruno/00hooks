@@ -3,7 +3,7 @@
 
 import { accountStub } from "./auth.ts";
 import { isId, newId } from "./encoding.ts";
-import { error, json, notFound, readLimited, tooLarge, unavailable } from "./http.ts";
+import { error, notFound, readLimited, tooLarge, unavailable } from "./http.ts";
 import { constantTimeEqualStrings } from "./encoding.ts";
 import { currentSecrets, offlineNoticeOf, verifyTokenHash, type HookRow } from "./hooks.ts";
 import { decide, screenCryptoKey, screenFor } from "./screen.ts";
@@ -11,6 +11,7 @@ import type { Origin } from "./envelope.ts";
 import { clientKey } from "./ip.ts";
 import { countAtEdge } from "./edge-counts.ts";
 import { pepperedHash } from "./seal.ts";
+import { TEST_EVENT_TYPE, deliveryAnswer } from "./hook-delivery.ts";
 import {
   SPECS,
   challengeAnswer,
@@ -33,7 +34,12 @@ export const QUOTA_RETRY_AFTER_S = 60;
 const slowDown = (message: string) =>
   error(429, "rate_limited", message, {}, { "Retry-After": String(RATE_LIMIT_PERIOD_S) });
 
-export async function receive(request: Request, env: Env, ctx: ExecutionContext, hookId: string): Promise<Response> {
+/**
+ * `test` is set only by `POST /v1/test/<hookId>` (src/test-event.ts), which signs a sample with the
+ * hook's own secret and sends it through here: it is verified, screened and stored like any
+ * delivery, and its routing `eventType` says it is a test.
+ */
+export async function receive(request: Request, env: Env, ctx: ExecutionContext, hookId: string, test = false): Promise<Response> {
   // Fail closed: without its rate limits the relay would take any flood at full cost.
   // …and without its signing key it couldn't seal what it takes.
   if (!env.HOOK_LIMIT || !env.RECEIVE_IP_LIMIT || !env.RELAY_SIGNING_KEY) return unavailable();
@@ -95,7 +101,7 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
     if (verdict?.verdict === "drop") {
       countAtEdge(env, ctx, hook.account_id, "screen.dropped", hookId, hook.name);
       const nobody = newId("evt");
-      return providerAnswer(config, null, { received: nobody }) ?? json({ received: nobody });
+      return providerAnswer(config, null, { received: nobody }) ?? deliveryAnswer(hook.static_response, { received: nobody });
     }
     if (verdict?.verdict === "quarantine") held = verdict.rule;
   }
@@ -123,7 +129,7 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
     verified: verdict.verified,
     strict,
     preset: config.preset,
-    eventType: verdict.eventType,
+    eventType: test ? TEST_EVENT_TYPE : verdict.eventType,
     content: {
       contentType: request.headers.get("content-type")?.slice(0, 200) ?? null,
       // A strict hook seals the signature headers and the URL too: its devices verify.
@@ -135,8 +141,9 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
     receivedAt: now,
     ...(notice ? { notice } : {}),
     ...(held !== undefined ? { held } : {}),
+    ...(hook.deliver_to ? { deliverTo: hook.deliver_to } : {}),
   });
-  if (result.duplicate) return providerAnswer(config, null, { duplicate: true }) ?? json({ duplicate: true });
+  if (result.duplicate) return providerAnswer(config, null, { duplicate: true }) ?? deliveryAnswer(hook.static_response, { duplicate: true });
   if (result.full) {
     const message =
       result.scope === "held"
@@ -152,7 +159,7 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   // seen working end to end, and answered 200 like any delivery. A provider that takes its answer
   // in the response (Twilio's TwiML) gets one, with the notice when it was due.
   const said = result.notice && offline ? offline.text : null;
-  return providerAnswer(config, said, { received: result.id }) ?? json({ received: result.id });
+  return providerAnswer(config, said, { received: result.id }) ?? deliveryAnswer(hook.static_response, { received: result.id });
 }
 
 /**

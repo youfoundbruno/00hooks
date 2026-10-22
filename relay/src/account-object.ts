@@ -39,7 +39,7 @@ export const DEFAULT_REPLAY_MARK_DAYS = 180;
 /** Alarms are rounded up to this, so a busy account wakes at most hourly just to prune. */
 export const ALARM_BUCKET_MS = 3600_000;
 /** The object's storage layout; the schema statements run only when the stored one is older. */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 /** One offline notice per sender per hook in this long (PROTOCOL §4a). */
 export const NOTICE_TTL_MS = 24 * 3600_000;
 /**
@@ -114,6 +114,11 @@ export interface AppendInput {
   notice?: { mark: string; afterMs: number };
   /** The screen held it (PROTOCOL §4b): the rule's id. It is kept aside, not streamed, until released. */
   held?: string;
+  /**
+   * The hook delivers to this one device (PROTOCOL §3): only it gets an envelope, and the others'
+   * streams pass the event by. Ignored (every device gets it) when that device can't be sealed to.
+   */
+  deliverTo?: string;
 }
 
 /** Which quota refused an append: the account's log, the hook's share of it, or the hook's hold. */
@@ -200,6 +205,8 @@ interface EventRow extends Record<string, SqlStorageValue> {
   event_type: string | null;
   held: number;
   stored_at: number | null;
+  /** The one device the event is for (its hook's `deliverTo`), or null for every device. */
+  route: string | null;
 }
 
 interface EnvelopeRow extends Record<string, SqlStorageValue> {
@@ -306,6 +313,12 @@ export class AccountObject extends DurableObject<Env> {
         // Schema 3: events released from the screen's hold (PROTOCOL §4b).
         tryExec("ALTER TABLE events ADD COLUMN held INTEGER NOT NULL DEFAULT 0");
       }
+      // Schema 5: events for one device only (a hook's `deliverTo`).
+      if (version < 5) {
+        tryExec("ALTER TABLE events ADD COLUMN route TEXT");
+        tryExec("ALTER TABLE held_events ADD COLUMN route TEXT");
+      }
+      this.sql.exec("CREATE INDEX IF NOT EXISTS events_route ON events(route, seq)");
       // Schema 4: retention by when an event entered the log; per-hook quotas; the hold counted
       // apart from the log; long replay marks; hook changes announced to devices.
       tryExec("ALTER TABLE events ADD COLUMN stored_at INTEGER");
@@ -644,6 +657,18 @@ export class AccountObject extends DurableObject<Env> {
       .toArray();
   }
 
+  /**
+   * Who an event is sealed to: every active device with a sealing key, or, for a hook that delivers
+   * to one device, that device alone (`route`). A held event is sealed to every device all the same,
+   * so any of them can review it; its route applies when it is released. A route to a device that
+   * can't be sealed to (revoked, or without a key) is ignored rather than lose the event.
+   */
+  private routeTo(deliverTo: string | undefined, held: boolean): { devices: { id: string; seal_key: ArrayBuffer; seal_kid: string }[]; route: string | null } {
+    const all = this.sealingDevices();
+    const route = deliverTo !== undefined && all.some((d) => d.id === deliverTo) ? deliverTo : null;
+    return { devices: route === null || held ? all : all.filter((d) => d.id === route), route };
+  }
+
   /** Devices revoked since `ids` were read (their envelopes are left out at commit). */
   private revokedAmong(ids: string[]): Set<string> {
     if (ids.length === 0) return new Set();
@@ -667,7 +692,7 @@ export class AccountObject extends DurableObject<Env> {
     if (!relay) throw new Error("RELAY_SIGNING_KEY is missing or malformed");
     // ── synchronous: decide, and reserve (nothing else runs until the first await) ──
     if (this.isDuplicate(input.hookId, input.dedupeKeys)) return { duplicate: true };
-    const devices = this.sealingDevices();
+    const { devices, route } = this.routeTo(input.deliverTo, input.held !== undefined);
     let plaintext: Uint8Array | null = encodeContent({ ...input.content, body: input.body });
     const estimate = devices.length * (plaintext.byteLength + 16 + ENVELOPE_OVERHEAD) + 2;
     const held = input.held !== undefined;
@@ -707,8 +732,8 @@ export class AccountObject extends DurableObject<Env> {
         this.ctx.storage.transactionSync(() => {
           this.writeMarks(input);
           this.sql.exec(
-            `INSERT INTO held_events (id, hook_id, received_at, verified, strict, preset, event_type, rule)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO held_events (id, hook_id, received_at, verified, strict, preset, event_type, rule, route)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             id,
             input.hookId,
             input.receivedAt,
@@ -717,6 +742,7 @@ export class AccountObject extends DurableObject<Env> {
             input.preset,
             input.eventType,
             input.held!,
+            route,
           );
           for (const e of sealed) {
             if (revoked.has(e.deviceId)) continue;
@@ -774,8 +800,8 @@ export class AccountObject extends DurableObject<Env> {
             // Routing metadata only: the body and headers columns stay empty (they held plaintext in
             // phase 0, and are kept so older rows still read).
             this.sql.exec(
-              `INSERT INTO events (seq, id, hook_id, received_at, verified, strict, preset, event_type, content_type, headers, body, stored_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', x'', ?)`,
+              `INSERT INTO events (seq, id, hook_id, received_at, verified, strict, preset, event_type, content_type, headers, body, stored_at, route)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', x'', ?, ?)`,
               seq,
               id,
               input.hookId,
@@ -785,6 +811,7 @@ export class AccountObject extends DurableObject<Env> {
               input.preset,
               input.eventType,
               Date.now(),
+              route,
             );
             for (const e of envelopes) {
               if (revoked.has(e.deviceId)) continue;
@@ -912,20 +939,23 @@ export class AccountObject extends DurableObject<Env> {
     if (!relay) throw new Error("RELAY_SIGNING_KEY is missing or malformed");
     // ── synchronous: read it, check the log has room, reserve its seq ──
     const h = this.sql
-      .exec<{ hook_id: string; received_at: number; verified: number; strict: number; preset: string; event_type: string | null }>(
-        "SELECT hook_id, received_at, verified, strict, preset, event_type FROM held_events WHERE id = ?",
+      .exec<{ hook_id: string; received_at: number; verified: number; strict: number; preset: string; event_type: string | null; route: string | null }>(
+        "SELECT hook_id, received_at, verified, strict, preset, event_type, route FROM held_events WHERE id = ?",
         id,
       )
       .toArray()[0];
     if (!h) return null;
     if ([...this.reservations].some((r) => r.marks.includes(`release\n${id}`))) return null;
-    const envs = this.sql
+    const sealedFor = this.sql
       .exec<{ device_id: string; kid: string; enc: string; ct: ArrayBuffer }>(
         `SELECT e.device_id, e.kid, e.enc, e.ct FROM held_envelopes e JOIN devices d ON d.id = e.device_id
          WHERE e.id = ? AND d.revoked = 0 ORDER BY e.device_id`,
         id,
       )
       .toArray();
+    // A hook that delivers to one device: only its envelope goes into the log, when it still has one.
+    const route = h.route !== null && sealedFor.some((e) => e.device_id === h.route) ? h.route : null;
+    const envs = route === null ? sealedFor : sealedFor.filter((e) => e.device_id === route);
     const bytes = envs.reduce((n, e) => n + e.ct.byteLength + ENVELOPE_OVERHEAD, 2);
     const scope = this.refuses(h.hook_id, bytes, { held: false, checked: h.verified === 1 && h.strict === 0 });
     if (scope) return { full: scope };
@@ -963,8 +993,8 @@ export class AccountObject extends DurableObject<Env> {
             // Retention counts from now, when it enters the log, not from when it was received:
             // an old event released today must never take newer ones with it (PROTOCOL §7).
             this.sql.exec(
-              `INSERT INTO events (seq, id, hook_id, received_at, verified, strict, preset, event_type, content_type, headers, body, held, stored_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', x'', 1, ?)`,
+              `INSERT INTO events (seq, id, hook_id, received_at, verified, strict, preset, event_type, content_type, headers, body, held, stored_at, route)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', x'', 1, ?, ?)`,
               seq,
               id,
               h.hook_id,
@@ -974,6 +1004,7 @@ export class AccountObject extends DurableObject<Env> {
               h.preset,
               h.event_type,
               Date.now(),
+              route,
             );
             let moved = 2;
             for (const e of signed) {
@@ -1059,6 +1090,7 @@ export class AccountObject extends DurableObject<Env> {
       this.sql.exec("UPDATE devices SET acked = ? WHERE id = ?", next, deviceId);
       // This device's envelopes are of no use to anyone once it has them.
       this.deleteEnvelopes("e.device_id = ? AND e.seq <= ?", deviceId, next);
+      this.pruneRouted(deviceId, next);
       this.pruneAcknowledged();
       await this.ensureAlarm();
     }
@@ -1077,6 +1109,7 @@ export class AccountObject extends DurableObject<Env> {
       }
     }
     this.deleteEnvelopes("e.device_id = ?", deviceId);
+    this.pruneRouted(deviceId, Number.MAX_SAFE_INTEGER);
     // Its held envelopes too, each hook's hold counter with them.
     for (const g of this.sql
       .exec<{ h: string; b: number | null }>(
@@ -1404,7 +1437,14 @@ export class AccountObject extends DurableObject<Env> {
       att.cursor = row.seq;
       return 0;
     };
-    if (!env) return skip("no_key");
+    if (!env) {
+      // An event its hook delivers to another device: not this device's, so passed by in silence.
+      if (row.route !== null && row.route !== att.deviceId) {
+        att.cursor = row.seq;
+        return 0;
+      }
+      return skip("no_key");
+    }
     const frame = hookFrame(
       row.seq,
       eventMessage(
@@ -1463,6 +1503,16 @@ export class AccountObject extends DurableObject<Env> {
   }
 
   // ── pruning ────────────────────────────────────────────────────────────────
+
+  /**
+   * Deletes the events routed to one device (a hook's `deliverTo`) through `through`, once that
+   * device has acknowledged them or is revoked: nobody else will ever read them, so they mustn't
+   * wait for the other devices' acknowledgements (or retention) and hold the account's quota.
+   */
+  private pruneRouted(deviceId: string, through: number): void {
+    const seqs = this.sql.exec<{ seq: number }>("SELECT seq FROM events WHERE route = ? AND seq <= ? ORDER BY seq", deviceId, through).toArray();
+    for (const r of seqs) this.deleteRange(r.seq, r.seq);
+  }
 
   /** Deletes events every active device has acknowledged, and gap records nobody can need. */
   private pruneAcknowledged(): void {
@@ -1605,7 +1655,7 @@ const SCHEMA = [
      seq INTEGER PRIMARY KEY, id TEXT NOT NULL, hook_id TEXT NOT NULL, received_at INTEGER NOT NULL,
      verified INTEGER NOT NULL, preset TEXT NOT NULL, event_type TEXT, content_type TEXT,
      headers TEXT NOT NULL, body BLOB NOT NULL, strict INTEGER NOT NULL DEFAULT 0,
-     held INTEGER NOT NULL DEFAULT 0, stored_at INTEGER)`,
+     held INTEGER NOT NULL DEFAULT 0, stored_at INTEGER, route TEXT)`,
   "CREATE INDEX IF NOT EXISTS events_received ON events(received_at)",
   `CREATE TABLE IF NOT EXISTS envelopes (seq INTEGER NOT NULL, device_id TEXT NOT NULL, kid TEXT NOT NULL,
      enc TEXT NOT NULL, ct BLOB NOT NULL, sig TEXT NOT NULL)`,
@@ -1628,7 +1678,8 @@ const SCHEMA = [
   // The screen's hold (PROTOCOL §4b): events sealed (with the held associated data) and kept aside
   // until a device releases or drops them. Metadata and ciphertext only, as in the log.
   `CREATE TABLE IF NOT EXISTS held_events (id TEXT PRIMARY KEY, hook_id TEXT NOT NULL, received_at INTEGER NOT NULL,
-     verified INTEGER NOT NULL, strict INTEGER NOT NULL, preset TEXT NOT NULL, event_type TEXT, rule TEXT NOT NULL)`,
+     verified INTEGER NOT NULL, strict INTEGER NOT NULL, preset TEXT NOT NULL, event_type TEXT, rule TEXT NOT NULL,
+     route TEXT)`,
   "CREATE INDEX IF NOT EXISTS held_received ON held_events(received_at)",
   `CREATE TABLE IF NOT EXISTS held_envelopes (id TEXT NOT NULL, device_id TEXT NOT NULL, kid TEXT NOT NULL, enc TEXT NOT NULL,
      ct BLOB NOT NULL, PRIMARY KEY (id, device_id)) WITHOUT ROWID`,

@@ -17,6 +17,7 @@ import {
 } from "./presets.ts";
 import { openSecret, pepperedHash, sealSecret } from "./seal.ts";
 import { parseScreen, type EdgeScreen } from "./screen.ts";
+import { parseDeliverTo, parseStaticResponse, staticResponseOf } from "./hook-delivery.ts";
 
 export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 /**
@@ -47,6 +48,10 @@ export interface HookRow {
   offline_notice: string | null;
   /** The screen's rules, as JSON (PROTOCOL §4b), or null. */
   screen?: string | null;
+  /** The one device the hook's events go to (PROTOCOL §3), or null for every device. */
+  deliver_to?: string | null;
+  /** The static answer for the provider, as JSON (src/hook-delivery.ts), or null. */
+  static_response?: string | null;
 }
 
 export function screenOf(row: HookRow): EdgeScreen | null {
@@ -88,6 +93,8 @@ export function hookJson(row: HookRow, origin: string) {
     lastEventAt: row.last_event_at,
     offlineNotice: offlineNoticeOf(row),
     screenRules: screenOf(row)?.rules.length ?? 0,
+    deliverTo: row.deliver_to ?? null,
+    response: staticResponseOf(row.static_response),
   };
 }
 
@@ -218,11 +225,24 @@ export async function patchHook(env: Env, caller: Principal, origin: string, id:
     const parsed = parseOfflineNotice(input.offlineNotice, (JSON.parse(row.verify) as VerifyConfig).preset);
     notice = parsed ? JSON.stringify(parsed) : null;
   }
+  // Who receives the hook's events, and what the provider is answered (src/hook-delivery.ts).
+  const deliverTo = input.deliverTo === undefined ? (row.deliver_to ?? null) : await parseDeliverTo(env, caller.accountId, input.deliverTo);
+  let response = row.static_response ?? null;
+  if (input.response !== undefined) {
+    const parsed = parseStaticResponse(input.response, (JSON.parse(row.verify) as VerifyConfig).preset);
+    response = parsed ? JSON.stringify(parsed) : null;
+  }
   if (name !== row.name) await assertNameFree(env, caller.accountId, name, id);
-  await env.DB.prepare("UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ? WHERE id = ?")
-    .bind(name, enabled, maxBodyBytes, notice, id)
+  await env.DB.prepare(
+    "UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ?, deliver_to = ?, static_response = ? WHERE id = ?",
+  )
+    .bind(name, enabled, maxBodyBytes, notice, deliverTo, response, id)
     .run()
     .catch(uniqueName);
+  if (deliverTo !== (row.deliver_to ?? null)) {
+    // Who reads a hook's events is worth a line in the audit: the name is the device, or `*` for all.
+    await accountStub(env, caller.accountId).audit({ kind: "hook.delivery", actor: caller.actor, subject: id, name: deliverTo ?? "*" });
+  }
   if (name !== row.name) {
     await accountStub(env, caller.accountId).hookChanged({ kind: "hook.renamed", hookId: id, name, previousName: row.name, actor: caller.actor });
   }

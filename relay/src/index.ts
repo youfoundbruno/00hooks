@@ -12,6 +12,8 @@ import { HttpError, error, forbidden, json, notFound, readLimited, tooLarge, una
 import { clientKey } from "./ip.ts";
 import { pruneD1 } from "./prune.ts";
 import { RATE_LIMIT_PERIOD_S } from "./receive.ts";
+import { renameDevice } from "./devices.ts";
+import { sendTest } from "./test-event.ts";
 import { createHook, deleteHook, getHook, getScreen, listHooks, patchHook, putScreen, rotateHook } from "./hooks.ts";
 import { dropHeld, dropHeldBulk, listHeld, releaseHeld, screenInfo, screenKeyFor } from "./held.ts";
 import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
@@ -150,6 +152,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const caller = await scoped("devices:write");
     return isId("dev", dev[1]) ? revokeDevice(env, caller, dev[1]) : notFound();
   }
+  if (dev && !dev[2] && method === "PATCH") {
+    const caller = await scoped("devices:write");
+    return isId("dev", dev[1]) ? renameDevice(env, caller, dev[1], body) : notFound();
+  }
 
   if (path === "/v1/keys") {
     if (method === "POST") return createKey(env, await signed(), body);
@@ -199,6 +205,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (method === "GET") return getHook(env, caller, origin, id);
     if (method === "PATCH") return patchHook(env, caller, origin, id, body);
     return deleteHook(env, caller, id);
+  }
+
+  // A signed sample through the hook's own path: signing with a hook's secret needs what being
+  // shown one does (a device, or `hooks:secrets`).
+  const ts = /^\/v1\/test\/([^/]+)$/.exec(path);
+  if (ts && method === "POST") {
+    const caller = await scoped("hooks:secrets");
+    return isId("hk", ts[1]) ? sendTest(request, env, ctx, caller, ts[1]!) : notFound();
   }
 
   if (path === "/v1/stream" && method === "GET") return openStream(request, env, await signed());
