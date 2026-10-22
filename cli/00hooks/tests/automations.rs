@@ -546,3 +546,128 @@ automations:
     let stderr = stop(child);
     assert!(stderr.contains("was interrupted"), "{stderr}");
 }
+
+fn open_batch_count(dir: &Path) -> u64 {
+    std::fs::read(dir.join("runner/batches/open.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["Readings"]["count"].as_u64())
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batches_are_listed_flushed_dropped_replayed_and_run_when_idle() {
+    let relay = MockRelay::start().await;
+    let home = TempHome::new("cli-batches");
+    let dir: PathBuf = home.0.clone();
+    relay.with(|s| s.client_home = Some(dir.clone()));
+    let out = run(&dir, &["login", "--relay", &relay.url]).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let log = dir.join("out/readings.jsonl");
+    std::fs::write(
+        dir.join("automations.yaml"),
+        format!(
+            r#"version: 1
+notify: none
+automations:
+  - name: Readings
+    when: {{ hook: hk_1, kinds: [push] }}
+    batch: {{ idle: 5s, max_wait: 1h }}
+    then:
+      - write: {{ append: {}, line: {{ n: "{{{{payload.n}}}}", batch: "{{{{batch.id}}}}" }} }}
+"#,
+            log.display()
+        ),
+    )
+    .unwrap();
+    let out = run(&dir, &["automations", "check"]).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    relay.push_events(1..=3);
+    let child = spawn_runner(&dir);
+    wait_for("three held events", || open_batch_count(&dir) == 3).await;
+    let out = run(&dir, &["batches"]).await;
+    let t = text(&out.stdout);
+    assert!(
+        t.contains("Readings") && t.contains("bat_") && t.contains("(idle)"),
+        "{t}"
+    );
+    assert!(!log.exists(), "nothing ran yet");
+    // Flushed through the running runner.
+    let out = run(&dir, &["batches", "flush", "Readings"]).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let t = text(&out.stdout);
+    assert!(
+        t.contains("batch of 3 events for \"Readings\" (flush): ran"),
+        "{t}"
+    );
+    assert_eq!(ns(&log), vec![1, 2, 3]);
+    let batch_id = lines(&log)[0]["batch"].as_str().unwrap().to_string();
+    let out = run(&dir, &["batches", "flush", "Readings"]).await;
+    assert!(
+        text(&out.stderr).contains("has no open batch"),
+        "{}",
+        text(&out.stderr)
+    );
+    stop(child);
+
+    // Held again after a restart; dropping asks first.
+    relay.push_events(4..=5);
+    let child = spawn_runner(&dir);
+    wait_for("two held events", || open_batch_count(&dir) == 2).await;
+    let out = run(&dir, &["batches", "drop", "Readings"]).await;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("Pass --yes"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(open_batch_count(&dir), 2);
+    let out = run(&dir, &["batches", "drop", "Readings", "--yes"]).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("Dropped the batch of \"Readings\""),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = run(&dir, &["batches"]).await;
+    assert!(text(&out.stdout).contains("No open batches."));
+    stop(child);
+    assert_eq!(ns(&log), vec![1, 2, 3], "the dropped events never ran");
+
+    // `runs` shows the held events and the batch run; replay runs the kept batch again.
+    let out = run(&dir, &["runs"]).await;
+    let t = text(&out.stdout);
+    assert!(t.contains("evt_0001  1 held for a batch"), "{t}");
+    assert!(
+        t.contains(&format!(
+            "{batch_id}  batch of 3 events for \"Readings\" (flush): ran"
+        )),
+        "{t}"
+    );
+    let out = run(&dir, &["replay", &batch_id]).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("(replay)  batch of 3 events"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(ns(&log), vec![1, 2, 3, 1, 2, 3]);
+    let out = run(&dir, &["replay", "bat_0000000000000000"]).await;
+    assert!(
+        text(&out.stderr).contains("No kept batch"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    // Left alone, a batch runs once no new event has come for `idle`.
+    relay.push_events(6..=6);
+    let child = spawn_runner(&dir);
+    wait_for("the idle batch", || ns(&log).len() == 7).await;
+    let stderr = stop(child);
+    assert_eq!(ns(&log), vec![1, 2, 3, 1, 2, 3, 6]);
+    assert!(
+        stderr.contains("batch of 1 event for \"Readings\" (idle): ran"),
+        "{stderr}"
+    );
+}

@@ -1,5 +1,5 @@
-//! The automation commands: `run`, `automations check|resume`, `kinds`, `runs`, `replay` and
-//! `secrets`. The work is done by the `hooks-runner` crate; this file is the terminal around it.
+//! The automation commands: `run`, `automations check|resume`, `kinds`, `runs`, `replay`,
+//! `batches` and `secrets`. The work is done by the `hooks-runner` crate; this file is the terminal around it.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hooks_client::{StateDir, StreamEvent, SubscribeOptions, subscribe};
+use hooks_runner::batch::{OpenBatch, is_batch_id, read_done, read_open};
 use hooks_runner::catalogue::{Catalogue, KindRecord};
 use hooks_runner::config::{self, Automations, Problem};
 use hooks_runner::hookrefs;
@@ -62,6 +63,41 @@ fn describe_run(r: &RunRecord) -> Vec<String> {
         format!("{hook}/{}", r.kind)
     };
     let replay = if r.replay { " (replay)" } else { "" };
+    if let Some(b) = &r.batch {
+        // A batch's run: its id, how many events, why it was cut, how it went.
+        let refused = match b.refused {
+            0 => String::new(),
+            n => format!(", {n} not held"),
+        };
+        let mut head = format!(
+            "{}  {}  {}{replay}  batch of {} event{} for {:?} ({}{refused}): ",
+            clock(r.started_at),
+            sanitize(&what, false),
+            b.id,
+            b.count,
+            if b.count == 1 { "" } else { "s" },
+            b.automation,
+            b.reason.as_str()
+        );
+        let skipped = r.automations.iter().find_map(|a| a.skipped.as_deref());
+        head.push_str(&match (r.status, skipped) {
+            (_, Some(s)) => format!("skipped: {}", sanitize(s, false)),
+            (RunStatus::Failed, _) => "failed".into(),
+            _ => "ran".into(),
+        });
+        let mut lines = vec![head];
+        for a in &r.automations {
+            for x in a.actions.iter().filter(|x| !x.ok) {
+                lines.push(format!(
+                    "  {:?}: {} failed: {}",
+                    a.name,
+                    x.action,
+                    sanitize(x.error.as_deref().unwrap_or(""), false)
+                ));
+            }
+        }
+        return lines;
+    }
     let mut head = format!(
         "{}  {}  {}{replay}  ",
         clock(r.started_at),
@@ -78,17 +114,26 @@ fn describe_run(r: &RunRecord) -> Vec<String> {
         }
         _ => {
             let ran = r.ran();
-            let skipped = r.automations.len() - ran;
+            let batched = r.batched();
+            let skipped = r.automations.len() - ran - batched;
             if r.automations.is_empty() {
                 head.push_str("no automation matched");
             } else {
-                head.push_str(&format!("{ran} ran"));
-                if r.failed() > 0 {
-                    head.push_str(&format!(" ({} failed)", r.failed()));
+                let mut parts = Vec::new();
+                if ran > 0 || batched == 0 {
+                    let failed = match r.failed() {
+                        0 => String::new(),
+                        n => format!(" ({n} failed)"),
+                    };
+                    parts.push(format!("{ran} ran{failed}"));
+                }
+                if batched > 0 {
+                    parts.push(format!("{batched} held for a batch"));
                 }
                 if skipped > 0 {
-                    head.push_str(&format!(", {skipped} skipped"));
+                    parts.push(format!("{skipped} skipped"));
                 }
+                head.push_str(&parts.join(", "));
             }
         }
     }
@@ -128,6 +173,15 @@ fn status_word(s: RunStatus) -> &'static str {
 fn flush(runner: &mut Runner) {
     for line in runner.take_log() {
         err(line);
+    }
+}
+
+/// Print the batch runs that happened (cut while an event was handled, or due at a tick).
+fn show_batch_runs(runs: &[RunRecord]) {
+    for r in runs {
+        for l in describe_run(r) {
+            err(l);
+        }
     }
 }
 
@@ -190,8 +244,8 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
     }
     flush(&mut runner);
 
-    // Replay requests from `00hooks replay`, checked every second.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(PathBuf, String)>(16);
+    // Replay requests from `00hooks replay` (and `batches flush|drop`), checked every second.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(PathBuf, mailbox::Ask)>(16);
     let watch_dir = rdir.clone();
     let watcher = tokio::spawn(async move {
         loop {
@@ -236,25 +290,49 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
             std::future::pending::<Option<()>>()
         };
     }
+    // Batches (`batch:`) are checked every second: a due one runs (an overdue one at once, after a
+    // restart).
+    let mut batch_clock = tokio::time::interval(Duration::from_secs(1));
+    batch_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut connected_before = false;
     let result = loop {
         let next = tokio::select! {
             _ = &mut ctrl_c => break Ok(()),
             _ = terminated!() => break Ok(()),
-            Some((answer_at, event)) = rx.recv() => {
-                // A signal stops a replay half-way too: its command is killed with the run, and
-                // the run is reported as interrupted on the next start.
-                let replayed = tokio::select! {
-                    r = runner.replay(&event) => r,
+            _ = batch_clock.tick() => {
+                let runs = tokio::select! {
+                    r = runner.tick() => r,
                     _ = &mut ctrl_c => break Ok(()),
                     _ = terminated!() => break Ok(()),
                 };
-                let answer = match replayed {
-                    Ok(record) => {
-                        for l in describe_run(&record) { err(l); }
-                        mailbox::Answer { record: Some(record), error: None }
+                flush(&mut runner);
+                show_batch_runs(&runs);
+                continue;
+            }
+            Some((answer_at, ask)) = rx.recv() => {
+                // A signal stops a replay half-way too: its command is killed with the run, and
+                // the run is reported as interrupted on the next start.
+                let done = tokio::select! {
+                    r = async {
+                        match &ask {
+                            mailbox::Ask::Replay(event) => runner.replay(event).await.map(|r| (Some(r), None)),
+                            mailbox::Ask::Flush(name) => runner.flush_batch(name).await.map(|r| (Some(r), None)),
+                            mailbox::Ask::Drop(name) => runner.drop_batch(name).map(|b| {
+                                (None, Some(dropped_note(name, &b)))
+                            }),
+                        }
+                    } => r,
+                    _ = &mut ctrl_c => break Ok(()),
+                    _ = terminated!() => break Ok(()),
+                };
+                let answer = match done {
+                    Ok((record, note)) => {
+                        if let Some(r) = &record {
+                            for l in describe_run(r) { err(l); }
+                        }
+                        mailbox::Answer { record, error: None, note }
                     }
-                    Err(e) => mailbox::Answer { record: None, error: Some(e.to_string()) },
+                    Err(e) => mailbox::Answer { record: None, error: Some(e.to_string()), note: None },
                 };
                 if let Err(e) = mailbox::answer(&answer_at, &answer) {
                     err(format!("Couldn't answer a replay request: {e}"));
@@ -314,6 +392,7 @@ pub async fn run(file: Option<PathBuf>) -> CliResult {
                 for l in describe_run(&record) {
                     err(l);
                 }
+                show_batch_runs(&runner.take_batch_runs());
             }
             StreamEvent::Gap(g) => err(format!(
                 "Missed events {} to {}: the relay dropped them ({}) before this device read them.",
@@ -690,7 +769,19 @@ pub fn runs(limit: usize, event: Option<String>, as_json: bool) -> CliResult {
 pub async fn replay(event: String, file: Option<PathBuf>) -> CliResult {
     let state = open_state()?;
     let rdir = runner_dir(state.path());
-    if hooks_runner::runs::read_event(&rdir, &event)
+    if is_batch_id(&event) {
+        // A batch's run: replayed from the kept batch file.
+        if read_done(&rdir, &event)
+            .map_err(|e| Failure::new(sentence(&e.to_string())))?
+            .is_none()
+        {
+            return Err(Failure::new(format!(
+                "No kept batch {event}. `00hooks runs` lists batch runs; the newest {} batches \
+                 that ran are kept, and `00hooks batches` lists the open ones.",
+                hooks_runner::batch::KEEP_DONE
+            )));
+        }
+    } else if hooks_runner::runs::read_event(&rdir, &event)
         .map_err(|e| Failure::new(sentence(&e.to_string())))?
         .is_none()
     {
@@ -743,6 +834,191 @@ pub async fn replay(event: String, file: Option<PathBuf>) -> CliResult {
             message: String::new(),
             code: 1,
         });
+    }
+    Ok(())
+}
+
+fn dropped_note(name: &str, b: &OpenBatch) -> String {
+    format!(
+        "Dropped the batch of {name:?} ({}): {} event{} not run. Each is still in the event \
+         archive while it's kept (`00hooks replay <event>`).",
+        b.id,
+        b.count,
+        if b.count == 1 { " was" } else { "s were" }
+    )
+}
+
+/// `00hooks batches`: the open batches, with when each will run.
+pub fn batches(file: Option<PathBuf>, as_json: bool) -> CliResult {
+    let state = open_state()?;
+    let rdir = runner_dir(state.path());
+    let open = read_open(&rdir).map_err(|e| Failure::new(sentence(&e.to_string())))?;
+    let path = automations_path(file)?;
+    let config = Automations::load(&path).ok();
+    let states = hooks_runner::state::States::open(&rdir).ok();
+    let now = hooks_runner::now_ms();
+    if as_json {
+        for b in &open {
+            println!("{}", json_line(b));
+        }
+        return Ok(());
+    }
+    if open.is_empty() {
+        println!("No open batches.");
+        return Ok(());
+    }
+    let mut rows = vec![vec![
+        "AUTOMATION".into(),
+        "BATCH".into(),
+        "EVENTS".into(),
+        "SIZE".into(),
+        "FIRST EVENT".into(),
+        "RUNS".into(),
+    ]];
+    for b in &open {
+        let a = config
+            .as_ref()
+            .and_then(|c| c.automations.iter().find(|a| a.name == b.automation));
+        let paused = states
+            .as_ref()
+            .and_then(|s| s.map.get(&b.automation))
+            .and_then(|s| s.paused_until)
+            .filter(|u| *u > now);
+        let runs = match (a, paused) {
+            (None, _) if config.is_none() => "? (the automations file has problems)".to_string(),
+            (None, _) => "never: no automation by that name (`batches drop`)".to_string(),
+            (Some(a), _) if !a.enabled => "not while the automation is disabled".to_string(),
+            (Some(_), Some(u)) => format!("after the pause ends ({} UTC)", date_time(u)),
+            (Some(a), None) => match &a.batch {
+                Some(cfg) => {
+                    let (due, reason) = hooks_runner::runner::batch_due(b, cfg);
+                    if due <= now {
+                        format!("now ({})", reason.as_str())
+                    } else {
+                        format!(
+                            "in {} ({})",
+                            duration(Duration::from_millis((due - now) as u64)),
+                            reason.as_str()
+                        )
+                    }
+                }
+                None => "now (the automation no longer batches)".to_string(),
+            },
+        };
+        let refused = if b.refused > 0 {
+            format!(" (+{} not held)", b.refused)
+        } else {
+            String::new()
+        };
+        rows.push(vec![
+            sanitize(&b.automation, false),
+            b.id.clone(),
+            format!("{}{refused}", b.count),
+            format!("{} KiB", b.bytes.div_ceil(1024)),
+            date_time(b.first_at),
+            runs,
+        ]);
+    }
+    print!("{}", table(&rows));
+    println!(
+        "Times are UTC; a batch runs at the running `00hooks run`. `00hooks batches flush <automation>` runs one now."
+    );
+    Ok(())
+}
+
+/// Ask the running runner (or, when none runs, a runner opened here) to flush or drop a batch.
+async fn batch_op(ask: mailbox::Ask, file: Option<PathBuf>) -> CliResult<mailbox::Answer> {
+    let state = open_state()?;
+    let rdir = runner_dir(state.path());
+    let e = |e: hooks_runner::Error| Failure::new(sentence(&e.to_string()));
+    match mailbox::lock(&rdir).map_err(e)? {
+        Some(_lock) => {
+            let path = automations_path(file)?;
+            let origin = origin(&state)?;
+            let mut runner = Runner::open(RunnerOptions::new(&rdir, &path, &origin))
+                .map_err(|x| fail(x, &path))?;
+            let answer = match &ask {
+                mailbox::Ask::Flush(name) => mailbox::Answer {
+                    record: Some(runner.flush_batch(name).await.map_err(e)?),
+                    error: None,
+                    note: None,
+                },
+                mailbox::Ask::Drop(name) => {
+                    let b = runner.drop_batch(name).map_err(e)?;
+                    mailbox::Answer {
+                        record: None,
+                        error: None,
+                        note: Some(dropped_note(name, &b)),
+                    }
+                }
+                mailbox::Ask::Replay(_) => unreachable!("not a batch request"),
+            };
+            runner.take_log();
+            Ok(answer)
+        }
+        None => {
+            let at = mailbox::submit_ask(&rdir, &ask).map_err(e)?;
+            eprintln!("Asked the running runner…");
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                if let Some(a) = mailbox::take_answer(&at) {
+                    if let Some(m) = a.error {
+                        return Err(Failure::new(sentence(&m)));
+                    }
+                    return Ok(a);
+                }
+                if Instant::now() > deadline {
+                    return Err(Failure::new(
+                        "The running runner didn't answer within 2 minutes; it may be busy. Check `00hooks batches` later.",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+/// `00hooks batches flush <automation>`: run its open batch now.
+pub async fn batches_flush(name: String, file: Option<PathBuf>) -> CliResult {
+    let a = batch_op(mailbox::Ask::Flush(name), file).await?;
+    let Some(record) = a.record else {
+        return Ok(());
+    };
+    for l in describe_run(&record) {
+        println!("{l}");
+    }
+    if record.status == RunStatus::Failed {
+        return Err(Failure {
+            message: String::new(),
+            code: 1,
+        });
+    }
+    Ok(())
+}
+
+/// `00hooks batches drop <automation>`: throw its open batch away, after a confirmation.
+pub async fn batches_drop(name: String, yes: bool, file: Option<PathBuf>) -> CliResult {
+    let state = open_state()?;
+    let rdir = runner_dir(state.path());
+    let open = read_open(&rdir).map_err(|e| Failure::new(sentence(&e.to_string())))?;
+    let Some(b) = open.iter().find(|b| b.automation == name) else {
+        return Err(Failure::new(format!(
+            "{name:?} has no open batch. `00hooks batches` lists them."
+        )));
+    };
+    if !yes
+        && !crate::account::confirm(&format!(
+            "Drop the batch of {name:?} ({}): its {} held event{} won't run.",
+            b.id,
+            b.count,
+            if b.count == 1 { "" } else { "s" }
+        ))?
+    {
+        return Err(Failure::new("Kept it."));
+    }
+    let a = batch_op(mailbox::Ask::Drop(name), file).await?;
+    if let Some(n) = a.note {
+        println!("{}", sanitize(&n, false));
     }
     Ok(())
 }
