@@ -2,7 +2,8 @@
 // webhook log (AccountObject) and the phone links' mailbox and sockets (PhoneObject, PROTOCOL §10).
 // Self-hosting: copy this file to the gitignored `wrangler.deploy.jsonc`, put your D1 database's id
 // and your own rate-limit namespace ids there, set the secrets listed in `.dev.vars.example` with
-// `wrangler secret put`, and deploy with `-c wrangler.deploy.jsonc`. See README.md.
+// `wrangler secret put`, and deploy with `-c wrangler.deploy.jsonc`; `pnpm --filter ./relay setup` does
+// all of that. See README.md.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "00hooks-relay",

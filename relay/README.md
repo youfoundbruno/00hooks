@@ -28,6 +28,54 @@ CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hiber
 - `scripts/seal-interop.ts` seals events with `src/envelope.ts` under Node, for the CLI's interop
   tests (`fixtures/seal-interop.v1.json`).
 
+## Install on your Cloudflare account
+
+You need a Cloudflare account on the Workers Paid plan, Node 22 or later, and this repository with
+its dependencies (`pnpm install` at the root). Then, from the repository root:
+
+```sh
+pnpm --filter ./relay exec wrangler login    # once: your own Cloudflare login
+node relay/scripts/setup.mjs --dry-run       # optional: every step it would take, nothing run
+pnpm --filter ./relay setup                  # or: node relay/scripts/setup.mjs
+```
+
+Setup uses your `wrangler login` and, step by step:
+
+1. writes `relay/wrangler.deploy.jsonc` (gitignored) from `wrangler.jsonc`, with Rate Limiting
+   `namespace_id`s derived from a random base it keeps there. Those ids must not be used by any
+   other Worker's rate limiter in your Cloudflare account (they would share counters): choose the
+   base yourself with `--ratelimit-base <n>` if you need to;
+2. creates the D1 database `00hooks` (or reuses yours) and puts its id in that file;
+3. applies the D1 migrations;
+4. generates `SECRETS_KEY`, `HASH_PEPPER`, `RELAY_SIGNING_KEY` and `SIGNUP_TOKEN` on your computer
+   (node:crypto) and pipes each to `wrangler secret put` on stdin: none is written to a file,
+   passed as an argument or printed, except the signup token, shown once at the end because you
+   need it to pair. It sets them before the first deploy (wrangler holds them in an empty draft
+   Worker), so the relay never runs without them;
+5. asks, each optional, for the push keys: the APNs `.p8` file (a path; it is read and checked, never
+   shown), its key id, your team id (both typed hidden), the app's bundle id and the environment,
+   and the Firebase service account JSON file for Android. "skip" leaves that push off. Without a
+   terminal it won't ask: pass `--skip-push`, `--from-env` or `--from-file <json>` (`--help` lists
+   the names);
+6. deploys, then checks `GET /v1/info`: protocol 2, a relay key, signups needing the token, push.
+
+It ends with the relay's address and how to pair: `00hooks login --relay <url>` with the signup
+token in `HOOKS_SIGNUP_TOKEN` (it prints the exact lines), or, in 00next, Settings › Automations
+with the same address and token.
+
+Run it again any time: each step checks whether it is done (database, migrations, config, secrets),
+so a run that stopped continues, and an upgrade carries what's new in `wrangler.jsonc` (bindings,
+migrations, rate limits, the cron) into your deploy config, keeping your ids and edits. Secrets
+already set are kept; `--rotate <NAME>` replaces one after you type its name back, with what it
+breaks: `RELAY_SIGNING_KEY` makes every device log in again, `SECRETS_KEY` makes every stored hook
+secret unreadable, `HASH_PEPPER` invalidates API keys, Meta verify tokens and replay marks.
+`--rotate SIGNUP_TOKEN` is harmless to existing accounts. `--check-only` checks a deployed relay
+("relay status"). Settings that aren't secrets go in `wrangler.deploy.jsonc`'s `vars` (edit it, or
+`--var RETENTION_DAYS=3`; see "Settings"). The manual steps it automates are under "Self-hosting".
+
+There is no "Deploy to Cloudflare" button: it would build from a copy of `wrangler.jsonc` with
+shared Rate Limiting ids, and would take the secrets in a web form instead of generating them here.
+
 ## Develop
 
 From the repository root (a pnpm workspace; `pnpm install` once):
@@ -53,6 +101,8 @@ types with `pnpm --filter ./relay types`.
 You need a Cloudflare account on the Workers Paid plan (Durable Objects with SQLite storage and the
 Rate Limiting binding) and `wrangler` (a dev dependency of `relay/`: run it with
 `pnpm --filter ./relay exec wrangler …`, or from `relay/` with `pnpm exec wrangler …`).
+
+`pnpm --filter ./relay setup` (above) does all of this; these are the steps by hand, for reference.
 
 The tracked `wrangler.jsonc` holds placeholder ids for development and tests. Don't edit it for a
 deployment. Keep your account's ids in a copy that git ignores:
