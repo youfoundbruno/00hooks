@@ -27,3 +27,8 @@ SIGNUP_TOKEN=REPLACE_WITH_A_LONG_RANDOM_STRING
 # APNS_TEAM_ID=XXXXXXXXXX
 # APNS_TOPIC=com.example.phone
 # APNS_ENVIRONMENT=sandbox
+
+# Android push (optional, PROTOCOL §10.7): a Firebase service-account key (Firebase console, Project
+# settings, Service accounts, "Generate new private key"), the whole JSON file on one line. Without
+# it, /v1/info says `push.platforms.android.available: false`.
+# FCM_SERVICE_ACCOUNT='{"type":"service_account","project_id":"your-project","private_key_id":"…","private_key":"-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----\n","client_email":"…@your-project.iam.gserviceaccount.com",…}'

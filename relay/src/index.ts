@@ -4,7 +4,6 @@
 import { createAccount, createEnrolment, listDevices, putSealKey, redeemEnrolment, revokeDevice, signupOpen } from "./accounts.ts";
 import { listEvents, readAudit } from "./audit.ts";
 import { authenticate, deviceAsPrincipal, type Caller, type Principal } from "./auth.ts";
-import { pushInfo } from "./apns.ts";
 import { importRelayKey } from "./envelope.ts";
 import { describeError } from "./describe-error.ts";
 import { isId } from "./encoding.ts";
@@ -19,7 +18,7 @@ import { dropHeld, dropHeldBulk, listHeld, releaseHeld, screenInfo, screenKeyFor
 import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
 import { confirmPhone, createPairing, listPhones, openPhoneSocket, redeemPairing, unpairSelf } from "./phone.ts";
 import { PHONE_PROTOCOL } from "./phone-object.ts";
-import { pushToPhone } from "./phone-push.ts";
+import { pushInfo, pushToPhone } from "./phone-push.ts";
 import { receive, receiveGet } from "./receive.ts";
 import { ack, openStream } from "./stream.ts";
 import { PROTOCOLS, STREAM_PROTOCOL, VERSION } from "./version.ts";

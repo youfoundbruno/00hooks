@@ -56,4 +56,10 @@ interface __BaseEnv_Env {
   APNS_TOPIC?: string;
   /** `sandbox` or `production` (the default when unset): which APNs host pushes go to. */
   APNS_ENVIRONMENT?: string;
+  /**
+   * Android push (PROTOCOL §10.7): the Firebase project's service-account key, the whole JSON file
+   * Google gives (`type` `service_account`, `project_id`, `client_email`, and `private_key`, a PKCS#8
+   * PEM of an RSA key). Android push is available only when it parses and the key imports.
+   */
+  FCM_SERVICE_ACCOUNT?: string;
 }
