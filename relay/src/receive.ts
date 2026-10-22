@@ -12,6 +12,7 @@ import { clientKey } from "./ip.ts";
 import { countAtEdge } from "./edge-counts.ts";
 import { pepperedHash } from "./seal.ts";
 import { TEST_EVENT_TYPE, deliveryAnswer } from "./hook-delivery.ts";
+import { noRecipientAnswer, recipientsOf } from "./recipients.ts";
 import { effectiveMaxBody, resolvePlan, type ResolvedPlan } from "./plans.ts";
 import type { PlanInput, Refusal } from "./account-object.ts";
 import {
@@ -122,6 +123,8 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   const now = Date.now();
   // A paused hook is answered from its row, without waking the account's object.
   if (hook.paused_until !== null && hook.paused_until > now) return pausedAnswer(hook.paused_until, now);
+  // …and so is one whose target matches no device: nothing could be sealed to anyone it names.
+  if (hook.paused_reason === "no_recipient") return noRecipientAnswer();
   const plan = planOf(env, hook, now);
   const maxBody = effectiveMaxBody(hook.max_body_bytes, plan.limits);
 
@@ -198,6 +201,7 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
   // kept for REPLAY_MARK_DAYS, not a week (PROTOCOL §4).
   const long = !signsTimestamp(config);
   const longKeys = long ? dedupeKeys.filter((_, i) => verdict.dedupeKeys[i]!.startsWith("body:")) : [];
+  const target = recipientsOf(hook);
   const result = await stub.append({
     hookId,
     dedupeKeys,
@@ -219,11 +223,17 @@ export async function receive(request: Request, env: Env, ctx: ExecutionContext,
     receivedAt: now,
     ...(notice ? { notice } : {}),
     ...(held !== undefined ? { held } : {}),
-    ...(hook.deliver_to ? { deliverTo: hook.deliver_to } : {}),
+    ...(target ? { recipients: target } : {}),
     plan: planInput(env, plan),
     onLimit: hook.on_limit === "accept_and_drop" ? "accept_and_drop" : "refuse",
   });
   if (result.duplicate) return providerAnswer(config, null, { duplicate: true }) ?? deliveryAnswer(hook.static_response, { duplicate: true });
+  if ("noRecipient" in result) {
+    // Written once, by the delivery that found nobody; later ones are answered from the row until
+    // a recipient is back (src/recipients.ts, `syncRecipients`).
+    await env.DB.prepare("UPDATE hooks SET paused_reason = 'no_recipient' WHERE id = ? AND paused_reason IS NULL").bind(hookId).run();
+    return noRecipientAnswer();
+  }
   if ("limited" in result) {
     const r = result.limited;
     if (r.pause) {
@@ -292,6 +302,7 @@ export async function receiveGet(request: Request, env: Env, ctx: ExecutionConte
   const hook = await env.DB.prepare("SELECT * FROM hooks WHERE id = ?").bind(hookId).first<HookRow>();
   if (!hook || hook.enabled !== 1) return notFound();
   if (hook.paused_until !== null && hook.paused_until > Date.now()) return pausedAnswer(hook.paused_until, Date.now());
+  if (hook.paused_reason === "no_recipient") return noRecipientAnswer();
   const config = JSON.parse(hook.verify) as VerifyConfig;
   if (!SPECS[config.preset].getHandshake || !hook.handshake_token_hash) return notFound();
   if (!(await env.HOOK_LIMIT.limit({ key: hookId })).success) {

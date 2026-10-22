@@ -115,6 +115,12 @@ pub struct State {
     pub other_devices: Vec<Value>,
     /// Every `PATCH /v1/hooks/<id>` body, in order.
     pub hook_patches: Vec<Value>,
+    /// Tags given to the signing device with `PATCH /v1/devices/<id>` (others keep theirs in
+    /// `other_devices`).
+    pub device_tags: HashMap<String, Vec<String>>,
+    /// A relay from before lists and tags: hooks carry no `recipients`, and a PATCH's
+    /// `recipients` is ignored.
+    pub old_relay: bool,
     /// What `POST /v1/test/<id>` answers: `(status, body)`; by default `200` with a delivery that
     /// was accepted, and `409` for a strict or `standard-webhooks-ed25519` hook, as the relay does.
     pub test_answer: Option<(u16, Value)>,
@@ -449,34 +455,72 @@ fn signed_route(
                 .get(device)
                 .cloned()
                 .unwrap_or_else(|| "test".into());
+            let tags = s.device_tags.get(device).cloned().unwrap_or_default();
             let mut devices = vec![json!({ "id": device, "name": name, "createdAt": 1,
-                                           "lastSeenAt": null, "current": true, "sealKid": kid })];
+                                           "lastSeenAt": null, "current": true, "sealKid": kid,
+                                           "tags": tags })];
             devices.extend(s.other_devices.iter().cloned());
             json_resp(StatusCode::OK, json!({ "devices": devices }))
         }
         ("PATCH", path) if path.starts_with("/v1/devices/") => {
             let id = path["/v1/devices/".len()..].to_string();
             let v: Value = serde_json::from_slice(body).unwrap_or_default();
-            let name = v["name"].as_str().unwrap_or("").trim().to_string();
-            if name.is_empty() || name.chars().count() > 100 {
+            let tags = v.get("tags").cloned();
+            let name = v["name"].as_str().map(|n| n.trim().to_string());
+            let bad_name = |n: &String| n.is_empty() || n.chars().count() > 100;
+            if name.as_ref().is_some_and(bad_name) || (name.is_none() && tags.is_none()) {
                 return json_resp(
                     StatusCode::BAD_REQUEST,
                     json!({"error":"invalid","message":"A name is 1 to 100 characters.","field":"name"}),
                 );
             }
+            if let Some(t) = &tags {
+                let ok = t.as_array().is_some_and(|a| {
+                    a.len() <= 10
+                        && a.iter()
+                            .all(|x| x.as_str().is_some_and(hooks_client::valid_tag))
+                });
+                if !ok {
+                    return json_resp(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error":"invalid","message":"Tags are short labels.","field":"tags"}),
+                    );
+                }
+            }
             let mut s = st.lock().unwrap();
             if id == device {
-                s.device_names.insert(id.clone(), name.clone());
+                if let Some(n) = &name {
+                    s.device_names.insert(id.clone(), n.clone());
+                }
+                if let Some(t) = &tags {
+                    let t: Vec<String> = serde_json::from_value(t.clone()).unwrap();
+                    s.device_tags.insert(id.clone(), t);
+                }
                 let kid = s.seal_keys.get(device).map(|k| seal_kid(k));
+                let name = s
+                    .device_names
+                    .get(device)
+                    .cloned()
+                    .unwrap_or_else(|| "test".into());
+                let tags = s.device_tags.get(device).cloned().unwrap_or_default();
                 return json_resp(
                     StatusCode::OK,
                     json!({ "device": { "id": id, "name": name, "createdAt": 1, "lastSeenAt": null,
-                                        "current": true, "sealKid": kid } }),
+                                        "current": true, "sealKid": kid, "tags": tags } }),
                 );
             }
             match s.other_devices.iter_mut().find(|d| d["id"] == id.as_str()) {
+                Some(d) if tags.is_some() && d["kind"] == "phone" => json_resp(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"invalid","message":"Only a device can be tagged.","field":"tags"}),
+                ),
                 Some(d) => {
-                    d["name"] = json!(name);
+                    if let Some(n) = name {
+                        d["name"] = json!(n);
+                    }
+                    if let Some(t) = tags {
+                        d["tags"] = t;
+                    }
                     let d = d.clone();
                     json_resp(StatusCode::OK, json!({ "device": d }))
                 }
@@ -491,6 +535,22 @@ fn signed_route(
             let v: Value = serde_json::from_slice(body).unwrap_or_default();
             let mut s = st.lock().unwrap();
             s.hook_patches.push(v.clone());
+            let old_relay = s.old_relay;
+            // Every tag a device of the account carries.
+            let all_tags: Vec<String> = s
+                .device_tags
+                .values()
+                .flatten()
+                .cloned()
+                .chain(s.other_devices.iter().flat_map(|d| {
+                    d["tags"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|t| t.as_str().map(String::from))
+                }))
+                .collect();
             if let Some(to) = v.get("deliverTo").and_then(Value::as_str) {
                 let sealed = s.seal_keys.contains_key(to)
                     || s.other_devices
@@ -522,7 +582,57 @@ fn signed_route(
             };
             if let (Some(o), Some(p)) = (h.as_object_mut(), v.as_object()) {
                 for (k, x) in p {
+                    if k == "recipients" && old_relay {
+                        continue;
+                    }
                     o.insert(k.clone(), x.clone());
+                }
+                if old_relay {
+                    o.remove("recipients");
+                    o.remove("pausedReason");
+                }
+                if !old_relay {
+                    // As the relay does: `deliverTo` and `recipients` say the same target, and a
+                    // target no device matches pauses the hook.
+                    if let Some(to) = p.get("deliverTo") {
+                        let r = if to.is_null() {
+                            Value::Null
+                        } else {
+                            json!({"devices": [to], "tags": []})
+                        };
+                        o.insert("recipients".into(), r);
+                    }
+                    if let Some(r) = p.get("recipients") {
+                        let devices = r["devices"].as_array().cloned().unwrap_or_default();
+                        let tags = r["tags"].as_array().cloned().unwrap_or_default();
+                        let one = devices.len() == 1 && tags.is_empty();
+                        o.insert(
+                            "deliverTo".into(),
+                            if one { devices[0].clone() } else { Value::Null },
+                        );
+                        if !r.is_null() {
+                            o.insert(
+                                "recipients".into(),
+                                json!({"devices": devices, "tags": tags}),
+                            );
+                        }
+                    }
+                    let matched = match o.get("recipients") {
+                        None | Some(Value::Null) => true,
+                        Some(r) => {
+                            let listed = r["devices"].as_array().is_some_and(|d| !d.is_empty());
+                            let tags = r["tags"].as_array().cloned().unwrap_or_default();
+                            listed || all_tags.iter().any(|t| tags.contains(&json!(t)))
+                        }
+                    };
+                    o.insert(
+                        "pausedReason".into(),
+                        if matched {
+                            Value::Null
+                        } else {
+                            json!("no_recipient")
+                        },
+                    );
                 }
             }
             let h = h.clone();

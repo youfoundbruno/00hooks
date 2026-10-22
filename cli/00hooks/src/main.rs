@@ -324,6 +324,21 @@ enum DevicesCmd {
         /// The new name (1 to 100 characters).
         name: String,
     },
+    /// Add tags to a device, so hooks delivered to a tag (`hooks deliver-to --tag`) reach it.
+    Tag {
+        device: String,
+        /// Short labels: lowercase letters, digits, '.', '_' and '-'.
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove tags from a device (or --all of them).
+    Untag {
+        device: String,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        tags: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -433,12 +448,17 @@ enum HooksCmd {
     Pause { hook: String },
     /// Accept events again.
     Resume { hook: String },
-    /// Deliver a hook's events to one device only (by id or name), so its automations run on
-    /// one computer; --all delivers them to every device again.
+    /// Deliver a hook's events only to some devices (by id or name) and/or the devices carrying a
+    /// tag, so its automations run on those computers alone; --all delivers them to every device
+    /// again.
     DeliverTo {
         hook: String,
-        #[arg(required_unless_present = "all", conflicts_with = "all")]
-        device: Option<String>,
+        /// Devices, by id or name (up to 10).
+        #[arg(conflicts_with = "all")]
+        devices: Vec<String>,
+        /// Devices carrying this tag (`00hooks devices tag`); repeat for several.
+        #[arg(long = "tag", value_name = "TAG", conflicts_with = "all")]
+        tags: Vec<String>,
         #[arg(long)]
         all: bool,
     },
@@ -510,6 +530,10 @@ async fn dispatch(cmd: Cmd) -> CliResult {
             DevicesCmd::Revoke { id, yes } => account::devices_revoke(id, yes).await,
             DevicesCmd::SealKey => account::devices_seal_key().await,
             DevicesCmd::Rename { device, name } => account::devices_rename(device, name).await,
+            DevicesCmd::Tag { device, tags } => account::devices_tag(device, tags).await,
+            DevicesCmd::Untag { device, tags, all } => {
+                account::devices_untag(device, tags, all).await
+            }
         },
         Cmd::Keys { cmd } => match cmd {
             KeysCmd::Create {
@@ -583,9 +607,12 @@ async fn dispatch(cmd: Cmd) -> CliResult {
             HooksCmd::Pause { hook } => hooks::set_enabled(hook, false).await,
             HooksCmd::Resume { hook } => hooks::set_enabled(hook, true).await,
             HooksCmd::Delete { hook, yes } => hooks::delete(hook, yes).await,
-            HooksCmd::DeliverTo { hook, device, all } => {
-                hooks::deliver_to(hook, if all { None } else { device }).await
-            }
+            HooksCmd::DeliverTo {
+                hook,
+                devices,
+                tags,
+                all,
+            } => hooks::deliver_to(hook, devices, tags, all).await,
             HooksCmd::Response {
                 hook,
                 status,

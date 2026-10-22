@@ -10,6 +10,8 @@ import { pepperedHash } from "./seal.ts";
 import { verifyEntitlement, workspaceConflict, workspaceTaken, type Entitlement } from "./entitlements.ts";
 import { resolvePlan } from "./plans.ts";
 import { accountPlan } from "./hooks.ts";
+import { deviceJson } from "./devices.ts";
+import { syncRecipients } from "./recipients.ts";
 
 export const ENROLMENT_TTL_MS = 10 * 60_000;
 export const ENROLMENT_MAX_FAILURES = 5;
@@ -282,7 +284,7 @@ export async function redeemEnrolment(request: Request, env: Env, body: Uint8Arr
 export async function listDevices(env: Env, caller: Principal): Promise<Response> {
   // A pending phone whose pairing ran out is as good as revoked (PROTOCOL §10), so it isn't listed.
   const { results } = await env.DB.prepare(
-    `SELECT id, name, created_at, last_seen_at, seal_kid, kind, peer FROM devices
+    `SELECT id, name, created_at, last_seen_at, seal_kid, kind, peer, tags FROM devices
      WHERE account_id = ? AND revoked_at IS NULL AND (pending_until IS NULL OR pending_until > ?) ORDER BY created_at, id`,
   )
     .bind(caller.accountId, Date.now())
@@ -294,19 +296,9 @@ export async function listDevices(env: Env, caller: Principal): Promise<Response
       seal_kid: string | null;
       kind: string;
       peer: string | null;
+      tags: string | null;
     }>();
-  return json({
-    devices: results.map((d) => ({
-      id: d.id,
-      name: d.name,
-      createdAt: d.created_at,
-      lastSeenAt: d.last_seen_at,
-      current: d.id === caller.deviceId,
-      sealKid: d.seal_kid,
-      kind: d.kind,
-      peer: d.peer,
-    })),
-  });
+  return json({ devices: results.map((d) => deviceJson(d, caller)) });
 }
 
 /**
@@ -324,6 +316,8 @@ export async function putSealKey(env: Env, caller: Caller, deviceId: string, bod
   const stub = accountStub(env, caller.accountId);
   await stub.setSealKey(deviceId, seal.raw, seal.kid);
   await stub.audit({ kind: "device.seal_key", actor: deviceId, subject: deviceId, name: seal.kid });
+  // A device with a key may now match a hook's tags.
+  await syncRecipients(env, caller.accountId, deviceId);
   return json({ kid: seal.kid });
 }
 
@@ -368,6 +362,8 @@ export async function revokeDevice(env: Env, caller: Principal, deviceId: string
     if (r.meta.changes > 0) await stub.audit({ kind: "device.revoked", actor: caller.actor, subject: p.id, name: p.name });
   }
   await env.DB.prepare("DELETE FROM phone_pairings WHERE device_id = ? AND used_at IS NULL").bind(deviceId).run();
+  // It leaves every hook's list of recipients; a hook it was the last recipient of pauses.
+  await syncRecipients(env, caller.accountId, caller.actor);
   return new Response(null, { status: 204 });
 }
 

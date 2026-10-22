@@ -18,8 +18,9 @@ CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hiber
 
 - `src/index.ts`: routes. `src/auth.ts`: signed requests. `src/keys.ts`: API keys.
   `src/accounts.ts`: accounts, devices, enrolments, sealing keys. `src/hooks.ts`: the hook API;
-  `src/hook-delivery.ts`: a hook's static response and one-device delivery; `src/test-event.ts`: the
-  signed test event (`POST /v1/test/<hook>`); `src/devices.ts`: renaming a device.
+  `src/hook-delivery.ts`: a hook's static response; `src/recipients.ts`: who receives a hook's
+  events (devices, tags, the `no_recipient` pause); `src/test-event.ts`: the signed test event
+  (`POST /v1/test/<hook>`); `src/devices.ts`: renaming and tagging a device.
   `src/presets.ts`: the preset table and its interpreter. `src/envelope.ts`: sealing and the relay's
   envelope signature. `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE
   bridge. `src/audit.ts`: the audit log and events list. `src/account-object.ts`: the Durable
@@ -156,6 +157,7 @@ wrangler.deploy.jsonc`), and only then deploy: new code may need the new tables.
 | `0007_…` (when present) | phone hardening |
 | `0008_plans.sql` | plans and entitlements: the account's plan, its end, its workspace and override; hook pauses and `onLimit`; hook creations per day. Existing rows stay on the `default` plan |
 | `0009_hook_delivery.sql` | a hook's one-device delivery (`deliverTo`) and static response |
+| `0010_recipients.sql` | a hook's recipients (devices and tags), device tags, and the `no_recipient` pause; a one-device `deliverTo` becomes a one-device list |
 
 Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
 

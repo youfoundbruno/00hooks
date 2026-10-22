@@ -116,6 +116,9 @@ A few more things a hook can do:
 
 ```
 00hooks hooks deliver-to ci "office mac"        only that computer gets the hook's events (runs once)
+00hooks devices tag "office mac" office-macs    label a computer
+00hooks hooks deliver-to ci --tag office-macs   every computer with that tag (add devices, repeat --tag)
+00hooks hooks deliver-to ci --all               every computer again
 00hooks hooks response ci --status 200 --content-type application/json --body '{"ok":true}'
 00hooks devices rename <device> "office mac"    a clearer name
 00hooks hooks create --name pay --preset stripe --strict --secret-stdin
@@ -261,7 +264,10 @@ signature, and the code is open. Strict hooks also keep the provider's secret of
 in order when it's back.
 
 **Two machines both run my automations. Will they run twice?** Not if you pick one: `00hooks hooks
-deliver-to <hook> <device>` sends that hook's events to one computer only.
+deliver-to <hook> <device>` sends that hook's events to one computer only. You can also name
+several (`deliver-to <hook> dev_1 dev_2`) or a tag (`--tag office-macs`, after `00hooks devices tag`);
+the others never get an envelope they could open. If none of them is left, the hook pauses and the
+provider is asked to retry, rather than the events going to everyone or to no one.
 
 **How do I test a hook without the provider?** `00hooks test <hook>`: the relay signs a sample
 with the hook's own secret and sends it through the real path. It is marked as a test, and only

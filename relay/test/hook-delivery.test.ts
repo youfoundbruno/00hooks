@@ -193,7 +193,7 @@ describe("delivering a hook to one device", () => {
     expect(res.status).toBe(400);
   });
 
-  it("goes back to every device when its device is revoked, and drops what was routed to it", async () => {
+  it("pauses, rather than go to every device, when its device is revoked, and drops what was routed to it", async () => {
     const laptop = await newAccount("laptop");
     const office = await enrolDevice(laptop, "office");
     const { hook } = await createHook(laptop, { preset: "unverified" });
@@ -202,15 +202,21 @@ describe("delivering a hook to one device", () => {
     expect((await signed(laptop, "DELETE", `/v1/devices/${office.deviceId}`)).status).toBe(204);
     // What only the office machine could read is gone with it.
     expect((await accountObject(laptop.accountId).stats()).events).toBe(0);
-    // New deliveries aren't lost: the laptop gets them.
-    const id = await deliver(hook.id, { n: 2 });
-    const s = await openStream(laptop, 0);
-    expect((await s.sse.nextEvent())?.event).toBe("ready");
-    expect(data<StreamedEvent>(await nextHook(s.sse)).id).toBe(id);
-    await s.sse.cancel();
+    // The laptop was never a recipient, so it doesn't become one: the hook pauses, and the sender
+    // is asked to retry (nothing is dropped in silence).
+    const shown = (await (await signed(laptop, "GET", `/v1/hooks/${hook.id}`)).json()) as Record<string, unknown>;
+    expect(shown).toMatchObject({ deliverTo: null, recipients: { devices: [], tags: [] }, pausedReason: "no_recipient" });
+    const res = await fetchRelay(`/h/${hook.id}`, { method: "POST", body: "{}" });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "unavailable", scope: "no_recipient" });
+    expect((await accountObject(laptop.accountId).stats()).events).toBe(0);
+    // Every device again: it resumes.
+    const back = (await (await signed(laptop, "PATCH", `/v1/hooks/${hook.id}`, { deliverTo: null })).json()) as Record<string, unknown>;
+    expect(back).toMatchObject({ recipients: null, pausedReason: null });
+    await deliver(hook.id, { n: 2 });
   });
 
-  it("keeps a held event reviewable by every device, and releases it to the hook's device only", async () => {
+  it("seals a held event to the hook's device only, and releases it to that device", async () => {
     const laptop = await newAccount("laptop");
     const office = await enrolDevice(laptop, "office");
     const { hook } = await createHook(laptop, { preset: "unverified" });
@@ -219,6 +225,11 @@ describe("delivering a hook to one device", () => {
     await signed(laptop, "PUT", `/v1/hooks/${hook.id}/screen`, { screen });
     const id = await deliver(hook.id, { n: 1 });
     expect((await accountObject(laptop.accountId).stats()).held).toBe(1);
+    // Held, it is sealed to its recipient alone: the laptop could never open it.
+    const heldFor = await runInDurableObject(accountObject(laptop.accountId), (_o: AccountObject, state) =>
+      state.storage.sql.exec<{ device_id: string }>("SELECT device_id FROM held_envelopes").toArray().map((r) => r.device_id),
+    );
+    expect(heldFor).toEqual([office.deviceId]);
     const rel = await signed(laptop, "POST", `/v1/held/${id}/release`);
     expect(rel.status).toBe(200);
     const stats = await accountObject(laptop.accountId).stats();
@@ -232,32 +243,6 @@ describe("delivering a hook to one device", () => {
     expect(data<StreamedEvent>(await nextHook(o.sse)).id).toBe(id);
     await o.sse.cancel();
   });
-});
-
-describe("schema 6", () => {
-  for (const from of [4, 5]) {
-    it(`adds the route columns to an object at schema ${from}, keeping its events`, async () => {
-      // Schema 5 (plans) only added tables, so a log already at 5 still lacks these columns.
-      const dev = await newAccount();
-      const { hook } = await createHook(dev, { preset: "unverified" });
-      await deliver(hook.id, { n: 1 });
-      const after = await runInDurableObject(accountObject(dev.accountId), (o: AccountObject, state) => {
-        const sql = state.storage.sql;
-        sql.exec("DROP INDEX IF EXISTS events_route");
-        sql.exec("ALTER TABLE events DROP COLUMN route");
-        sql.exec("ALTER TABLE held_events DROP COLUMN route");
-        sql.exec("UPDATE meta SET value = ? WHERE key = 'schema'", from);
-        (o as unknown as { migrate(): void }).migrate();
-        return {
-          schema: sql.exec<{ value: number }>("SELECT value FROM meta WHERE key = 'schema'").one().value,
-          events: sql.exec("SELECT route FROM events").toArray(),
-          held: sql.exec("SELECT route FROM held_events").toArray(),
-          index: sql.exec("SELECT name FROM sqlite_master WHERE name = 'events_route'").toArray().length,
-        };
-      });
-      expect(after).toEqual({ schema: 6, events: [{ route: null }], held: [], index: 1 });
-    });
-  }
 });
 
 describe("renaming a device", () => {

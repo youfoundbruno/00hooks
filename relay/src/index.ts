@@ -11,7 +11,7 @@ import { HttpError, error, forbidden, json, notFound, readLimited, tooLarge, una
 import { clientKey } from "./ip.ts";
 import { pruneD1 } from "./prune.ts";
 import { RATE_LIMIT_PERIOD_S } from "./receive.ts";
-import { renameDevice } from "./devices.ts";
+import { patchDevice } from "./devices.ts";
 import { sendTest } from "./test-event.ts";
 import { createHook, deleteHook, getHook, getScreen, listHooks, patchHook, putScreen, rotateHook, unpauseHook } from "./hooks.ts";
 import { entitlementsOn } from "./entitlements.ts";
@@ -162,7 +162,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
   if (dev && !dev[2] && method === "PATCH") {
     const caller = await scoped("devices:write");
-    return isId("dev", dev[1]) ? renameDevice(env, caller, dev[1], body) : notFound();
+    return isId("dev", dev[1]) ? patchDevice(env, caller, dev[1], body) : notFound();
   }
 
   if (path === "/v1/keys") {

@@ -190,6 +190,51 @@ pub struct DeviceInfo {
     /// The kid of the sealing key the relay holds for it; `None` when it has none.
     #[serde(default)]
     pub seal_kid: Option<String>,
+    /// Its labels, which a hook's `recipients` can name (PROTOCOL §2); empty from a relay that
+    /// predates tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// The longest device tag, in characters.
+pub const MAX_TAG_LEN: usize = 32;
+/// The most tags one device may carry.
+pub const MAX_DEVICE_TAGS: usize = 10;
+/// The most devices a hook's `recipients` may list (the device cap).
+pub const MAX_TARGET_DEVICES: usize = 10;
+/// The most tags a hook's `recipients` may name.
+pub const MAX_TARGET_TAGS: usize = 10;
+
+/// Whether `tag` is a valid device tag: 1 to 32 characters of lowercase letters, digits, `.`,
+/// `_` and `-`, beginning and ending with a letter or digit (as the relay checks it).
+pub fn valid_tag(tag: &str) -> bool {
+    let b = tag.as_bytes();
+    let edge = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    !b.is_empty()
+        && b.len() <= MAX_TAG_LEN
+        && edge(b[0])
+        && edge(b[b.len() - 1])
+        && b.iter()
+            .all(|&c| edge(c) || matches!(c, b'.' | b'_' | b'-'))
+}
+
+/// A hook's recipients (PROTOCOL §3): the listed devices and every device carrying any of the
+/// tags, together.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Recipients {
+    #[serde(default)]
+    pub devices: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Who gets a hook's events, as [`Hook::target`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryTarget {
+    /// Every device with a sealing key.
+    All,
+    /// Only these devices and tags.
+    Only(Recipients),
 }
 
 /// A hook's verification settings: the preset and its non-secret fields.
@@ -296,6 +341,10 @@ pub struct HookPatch {
     /// `Some(None)`: deliver to every device; `Some(Some(id))`: only to that one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deliver_to: Option<Option<String>>,
+    /// `Some(None)`: deliver to every device; `Some(Some(_))`: only to those devices and tags.
+    /// Never sent together with `deliver_to` (the relay refuses both).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipients: Option<Option<Recipients>>,
     /// `Some(None)` clears the static answer; `Some(Some(_))` sets it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<Option<HookResponse>>,
@@ -597,6 +646,8 @@ pub enum LimitScope {
     Daily,
     /// The hook is paused after a flood of refusals.
     Paused,
+    /// The hook is paused because its recipients match no device with a sealing key.
+    NoRecipient,
     /// The account's entitled plan ran out (PROTOCOL §2b).
     PlanExpired,
     /// The account's backlog is full (`quota`).
@@ -621,6 +672,7 @@ impl LimitScope {
             "account_rate" => LimitScope::AccountRate,
             "daily" => LimitScope::Daily,
             "paused" => LimitScope::Paused,
+            "no_recipient" => LimitScope::NoRecipient,
             "plan_expired" => LimitScope::PlanExpired,
             "account" => LimitScope::Account,
             "hook" => LimitScope::Hook,
@@ -661,6 +713,44 @@ impl Hook {
     /// When the hook's pause ends (Unix milliseconds), while it is paused.
     pub fn paused_until(&self) -> Option<i64> {
         self.extra.get("pausedUntil").and_then(Value::as_i64)
+    }
+
+    /// Why the relay pauses the hook (`refusals`, `no_recipient`, or a reason this client doesn't
+    /// know), while it does.
+    pub fn paused_reason(&self) -> Option<&str> {
+        self.extra.get("pausedReason").and_then(Value::as_str)
+    }
+
+    /// Whether the hook is paused because its recipients match no device (PROTOCOL §3).
+    pub fn paused_for_no_recipient(&self) -> bool {
+        self.paused_reason() == Some("no_recipient")
+    }
+
+    /// The hook's `recipients` (PROTOCOL §3): `None` when the relay doesn't send the field (it
+    /// predates lists and tags) or sends a shape this client can't read; `Some(None)`: every
+    /// device. Read from `extra`, so no future shape can make a hook unreadable.
+    pub fn recipients(&self) -> Option<Option<Recipients>> {
+        match self.extra.get("recipients")? {
+            Value::Null => Some(None),
+            v => serde_json::from_value(v.clone()).ok().map(Some),
+        }
+    }
+
+    /// Who gets the hook's events: its `recipients`, else its one `deliverTo` device, else all.
+    /// A list the relay emptied (its devices were all revoked) is nobody, never every device.
+    pub fn target(&self) -> DeliveryTarget {
+        match self.recipients() {
+            Some(Some(r)) => return DeliveryTarget::Only(r),
+            Some(None) => return DeliveryTarget::All,
+            None => {}
+        }
+        match &self.deliver_to {
+            Some(id) => DeliveryTarget::Only(Recipients {
+                devices: vec![id.clone()],
+                tags: vec![],
+            }),
+            None => DeliveryTarget::All,
+        }
     }
 }
 
@@ -1060,6 +1150,113 @@ mod tests {
         assert_eq!(h.deliver_to.as_deref(), Some("dev_9"));
         assert_eq!(h.response.unwrap().status, 202);
         assert!(h.extra.is_empty());
+    }
+
+    #[test]
+    fn hooks_read_recipients_and_pause_reasons_and_tolerate_any_shape() {
+        let base = serde_json::json!({
+            "id": "hk_1", "name": "n", "url": "https://r.example/h/hk_1", "enabled": true,
+            "verify": {"preset": "github"}, "maxBodyBytes": 1, "createdAt": 0
+        });
+        let read = |extra: Value| {
+            let mut v = base.clone();
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            serde_json::from_value::<Hook>(v).unwrap()
+        };
+        // An old relay: no field, every device; or its one device.
+        let old = read(serde_json::json!({}));
+        assert_eq!(old.recipients(), None);
+        assert_eq!(old.paused_reason(), None);
+        assert_eq!(old.target(), DeliveryTarget::All);
+        let one = read(serde_json::json!({"deliverTo": "dev_1"}));
+        assert_eq!(
+            one.target(),
+            DeliveryTarget::Only(Recipients {
+                devices: vec!["dev_1".into()],
+                tags: vec![]
+            })
+        );
+        // A new relay: null is every device.
+        let all = read(serde_json::json!({"deliverTo": null, "recipients": null}));
+        assert_eq!(all.recipients(), Some(None));
+        assert_eq!(all.target(), DeliveryTarget::All);
+        // A list and tags; a missing array is empty; unknown keys are ignored.
+        let many = read(serde_json::json!({
+            "deliverTo": null,
+            "recipients": {"devices": ["dev_1", "dev_2"], "tags": ["office-macs"], "later": 1},
+            "pausedReason": "no_recipient"
+        }));
+        let want = Recipients {
+            devices: vec!["dev_1".into(), "dev_2".into()],
+            tags: vec!["office-macs".into()],
+        };
+        assert_eq!(many.recipients(), Some(Some(want.clone())));
+        assert_eq!(many.target(), DeliveryTarget::Only(want));
+        assert!(many.paused_for_no_recipient());
+        let tags = read(serde_json::json!({"recipients": {"tags": ["a"]}}));
+        assert_eq!(
+            tags.target(),
+            DeliveryTarget::Only(Recipients {
+                devices: vec![],
+                tags: vec!["a".into()]
+            })
+        );
+        // A list the relay emptied (every listed device revoked) is nobody, not every device.
+        let nobody = read(serde_json::json!({
+            "deliverTo": null, "recipients": {"devices": [], "tags": []}, "pausedReason": "no_recipient"
+        }));
+        assert_eq!(nobody.target(), DeliveryTarget::Only(Recipients::default()));
+        // A shape this client can't read never makes the hook unreadable.
+        let odd = read(serde_json::json!({
+            "deliverTo": "dev_3", "recipients": ["dev_3"], "pausedReason": "something_new"
+        }));
+        assert_eq!(odd.recipients(), None);
+        assert_eq!(odd.paused_reason(), Some("something_new"));
+        assert!(!odd.paused_for_no_recipient());
+        assert!(matches!(odd.target(), DeliveryTarget::Only(r) if r.devices == ["dev_3"]));
+        // And it serialises back with the fields it was given.
+        let back = serde_json::to_value(&many).unwrap();
+        assert_eq!(back["recipients"]["tags"][0], "office-macs");
+    }
+
+    #[test]
+    fn patches_send_recipients_and_devices_read_tags() {
+        let p = HookPatch {
+            recipients: Some(Some(Recipients {
+                devices: vec!["dev_1".into()],
+                tags: vec!["office".into()],
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&p).unwrap(),
+            r#"{"recipients":{"devices":["dev_1"],"tags":["office"]}}"#
+        );
+        let p = HookPatch {
+            recipients: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_string(&p).unwrap(), r#"{"recipients":null}"#);
+        let d: DeviceInfo =
+            serde_json::from_str(r#"{"id":"dev_1","name":"a","createdAt":0}"#).unwrap();
+        assert!(d.tags.is_empty());
+        let d: DeviceInfo =
+            serde_json::from_str(r#"{"id":"dev_1","name":"a","createdAt":0,"tags":["x"]}"#)
+                .unwrap();
+        assert_eq!(d.tags, ["x"]);
+        assert_eq!(LimitScope::parse("no_recipient"), LimitScope::NoRecipient);
+    }
+
+    #[test]
+    fn tags_are_short_lowercase_labels() {
+        for ok in ["a", "office-macs", "mac.2", "x_y", &"a".repeat(32)] {
+            assert!(valid_tag(ok), "{ok}");
+        }
+        for bad in ["", "Office", "-a", "a-", "a b", "a/b", &"a".repeat(33), "é"] {
+            assert!(!valid_tag(bad), "{bad}");
+        }
     }
 
     #[test]

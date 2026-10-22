@@ -70,6 +70,14 @@ on a relay with entitlement keys); `onLimit` and `pausedUntil` in `Hook`, and
 working; a client that predates the `limit` event ignores it (it has no `id`), and one that
 predates `over_limit` shows it as any other gap.
 
+Additive within version 2 (recipients, §2, §3): `tags` on devices (`GET /v1/devices`, and
+`PATCH /v1/devices/<id>` `{ "tags" }`); `recipients` and `pausedReason` in `Hook`, and `recipients`
+in `PATCH /v1/hooks/<id>`; the `no_recipient` pause (`503` `unavailable` `{"scope":"no_recipient"}`,
+§4) and its `limit` event (§6); `recipients` in the events list and the audit kind `device.tagged`
+(§9). `deliverTo` keeps its type and meaning (a device id or null), so a client that predates
+recipients keeps working: it reads a list or tag target as `deliverTo: null` and ignores
+`recipients`, and an event its hook delivers to other devices never reaches it.
+
 ## 1. Signed requests
 
 Every `/v1/*` request except account creation and enrolment is signed by a **device**. A device has an
@@ -205,6 +213,13 @@ characters); both sides compute it.
   too). The name is 1 to 100 characters once trimmed, without control characters (`400` `invalid`,
   `field: "name"`). A revoked device, a phone whose pairing ran out unconfirmed, or another
   account's device is `404`. Audit: `device.renamed`, named by the new name.
+- **Tags**: the same `PATCH` takes `"tags": ["office-macs", …]` (alone or with `name`), which
+  replaces the device's tags (`[]` clears them). A tag is 1 to 32 characters: lowercase letters,
+  digits, `.`, `_` and `-`, starting and ending with a letter or digit; a device carries at most 10;
+  repeats are folded (`400` `invalid`, `field: "tags"`). Only a device of kind `device` takes tags
+  (a phone receives no hook events, `400`). Hooks' recipients (§3) match them from the next event
+  on. `GET /v1/devices` lists each device's `tags` (`[]` for none). Audit: `device.tagged`, named
+  by the tags joined with `,` (or `-` for none).
 - `DELETE /v1/devices/<id>` (signed, or an API key with `devices:write`) → `204`: revokes it; its open stream closes at once with `4401`.
   Revoking a device also revokes every phone paired with it, and revoking a phone tells its node
   (§10.5).
@@ -346,14 +361,34 @@ characters, and `exp` is later than now and than `iat` (times in Unix **seconds*
   later, or a new hook given a freed name, is a different hook.
 - `GET /v1/hooks` (`hooks:read`) → `{ "hooks": [<Hook>] }`; `GET /v1/hooks/<id>` → `<Hook>`.
 - `PATCH /v1/hooks/<id>` (`hooks:write`) `{ "name"?, "enabled"?, "maxBodyBytes"?, "offlineNotice"?,
-  "deliverTo"?, "response"? }` → `<Hook>`. `null` clears `offlineNotice`, `deliverTo` and `response`.
-  - `deliverTo`: a device id. The hook's events are sealed to that device alone, so an automation
-    that two machines both run happens once (*the Mac in the office*); every other device's stream
-    passes them by without a word (§6). It must be an active device of kind `device` of the account
-    with a sealing key (`400` `invalid`, `field: "deliverTo"`). When that device is revoked (or
-    loses its key) the hook's deliveries go to every device again rather than to nobody, and the
-    events only it could read are deleted with it. Changing it is an audit line `hook.delivery`
-    (named by the device id, or `*` for every device).
+  "deliverTo"?, "recipients"?, "response"? }` → `<Hook>`. `null` clears `offlineNotice`, `deliverTo`,
+  `recipients` and `response`.
+  - `recipients`: who receives the hook's events: `null` for every device (the default), or
+    `{ "devices"?: ["dev_…"], "tags"?: ["office-macs"] }`: the listed devices **and** every device
+    carrying any of the tags (§2), together. 1 to 10 devices (repeats folded), at most 10 tags, at
+    least one of either (`400` `invalid`, `field: "recipients"`, `"recipients.devices"` or
+    `"recipients.tags"`). Each listed device must be an active device of kind `device` of the
+    account with a sealing key; a tag need not match any device yet. The hook's events are sealed to
+    its recipients alone (a held event too), so an automation that two machines both run happens
+    once (*the Mac in the office*), and a device that isn't a recipient never holds an envelope it
+    could open; its stream passes the event by without a word (§6). Who the recipients are is
+    decided **when each event arrives**: a device tagged later gets the events from then on, never
+    the ones before (they were sealed to the recipients of their time, and the relay keeps no
+    plaintext to seal again); a new target applies to new events only.
+  - `deliverTo`: a device id: the same as `recipients: { "devices": ["dev_…"] }`, kept for clients
+    that predate recipients (`400` with `field: "deliverTo"` for a device that can't be one). Send
+    `deliverTo` or `recipients`, not both (`400`, `field: "recipients"`).
+  - **A removed device** leaves every hook's list. **No recipient**: when a hook's target matches no
+    active device with a sealing key (its last listed device was revoked, its tags were taken off
+    every device, or it named a tag nobody carries yet), the hook is paused rather than sealed to
+    nobody or sent to every device: deliveries are answered `503` `unavailable`
+    `{"scope":"no_recipient"}` with `Retry-After: 300` (§4, so the provider keeps the event and
+    retries), `pausedReason` says `no_recipient`, the audit says `hook.paused` (named
+    `no_recipient`), and the stream sends a `limit` event of scope `no_recipient` (§6). It resumes
+    by itself (audit `hook.unpaused`) as soon as a device matches again (tagged, given a sealing
+    key) or the target changes; `POST /v1/hooks/<id>/unpause` checks again but can't resume it while
+    nobody matches. Changing the target is an audit line `hook.delivery`, named by its devices and
+    `#tags` joined with `,` (or `*` for every device).
   - `response`: `{ "status"?: 200–299 but 204 and 205 (200 by default), "contentType"?:
     "text/plain" (default) | "application/json" | "application/xml" | "text/xml", "body"?: at most
     4,096 bytes of UTF-8 (valid JSON for JSON) }`: what the relay answers the provider for a delivery
@@ -390,9 +425,14 @@ Every device's stream is told of each hook created, rotated, renamed or deleted 
 
 `Hook`: `{ "id", "name", "url", "enabled", "verify": { "preset", …non-secret fields }, "maxBodyBytes",
 "createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null, "screenRules",
-"deliverTo": "dev_…" | null, "response": { "status", "contentType", "body" } | null, "onLimit": "refuse" |
-"accept_and_drop", "pausedUntil": <ms> | null }` (`screenRules`: how many edge rules the hook's screen
-has, §4b). `lastEventAt` is written at most once a minute per hook (the account's object keeps the
+"deliverTo": "dev_…" | null, "recipients": { "devices": [dev…], "tags": [tag…] } | null, "response": {
+"status", "contentType", "body" } | null, "onLimit": "refuse" | "accept_and_drop", "pausedUntil": <ms> |
+null, "pausedReason": "refusals" | "no_recipient" | null }` (`screenRules`: how many edge rules the
+hook's screen has, §4b). `recipients` always carries both lists; `deliverTo` is its one device when
+the target is exactly one device and no tag, and null otherwise (every device, or a target an older
+client couldn't read as one device). A list emptied by revocations reads `{ "devices": [], "tags":
+[] }` with `pausedReason: "no_recipient"`, never as every device. `pausedReason` is `refusals` while
+`pausedUntil` is set and `no_recipient` for the pause above. `lastEventAt` is written at most once a minute per hook (the account's object keeps the
 exact time, `GET /v1/account`).
 
 ### The test event
@@ -598,7 +638,11 @@ mode removes the secret, and the parsing, not the transit.
    ids costs the guesser this budget, not the relay a database read each.
 2. Unknown or disabled hook → `404`. A paused hook (§3) → `429` `rate_limited`
    `{"scope":"paused","until"}` with `Retry-After`, from the hook's row (the account's plan comes in
-   the same read, so a delivery costs no extra database read). Body declared larger than the hook's
+   the same read, so a delivery costs no extra database read). A hook paused for want of a
+   recipient (§3) → `503` `unavailable` `{"scope":"no_recipient"}` with `Retry-After: 300`, from the
+   same row; when the account's object, which resolves the recipients as it seals, finds that the
+   target matches nobody, it answers the same way, stores nothing, takes nothing from the plan's
+   limits, and the hook is paused from then on. Body declared larger than the hook's
    `maxBodyBytes` (default 1 MiB), or the plan's `maxBodyBytes` when lower, in `Content-Length` →
    `413`.
 3. Rate limit per hook (60 requests per 10 s by default) → `429` with `Retry-After`. Only then is the
@@ -990,11 +1034,12 @@ data: {…event…}
   the audit log (§9) is the record. A client should tell the person about a change it didn't make,
   above all `hook.rotated` (a secret now exists that the person didn't see).
 - **Limits**: `event: limit` `data: {"scope": "hook_rate" | "account_rate" | "daily" | "paused" |
-  "plan_expired", "hookId"?: "hk_…", "refused": 12, "since": <ms>, "until": <ms> | null, "plan":
+  "plan_expired" | "no_recipient", "hookId"?: "hk_…", "refused": 12, "since": <ms>, "until": <ms> | null, "plan":
   "overblast"}` says one of the plan's limits (§2a) is refusing deliveries: `hookId` for a hook's own
-  scope (`hook_rate`, `paused`); `refused` how many since `since`, when the limit began to bite
-  (accepted and dropped deliveries count for `daily`); `until` when it lifts (null for
-  `plan_expired`, which lifts when the plan is renewed). Like `hook-change` it has **no `id:` line**
+  scope (`hook_rate`, `paused`, `no_recipient`); `refused` how many since `since`, when the limit
+  began to bite (accepted and dropped deliveries count for `daily`); `until` when it lifts (null for
+  `plan_expired`, which lifts when the plan is renewed, and for `no_recipient`, which lifts when a
+  device matches the hook's recipients again, §3). Like `hook-change` it has **no `id:` line**
   and is never acknowledged. It is sent at most once an hour per scope and hook (a pause at once),
   and after `ready` a stream is sent the newest notices still in effect (at most 10), so a device
   that reconnects hears of them. A client treats an unknown scope as a generic limit.
@@ -1022,10 +1067,12 @@ data: {…event…}
 - **Probe**: `GET /v1/stream?probe=1` (signed, `X-00h-Protocol: 2`) answers `retry`, `ready` and
   `closed {"code":1000,"reason":"probe"}`, then ends, without replacing the device's live stream and
   without sending events (for `00hooks doctor`).
-- **Per-hook delivery**: an event of a hook with `deliverTo` (§3) has an envelope for that device
-  only. Another device's stream skips it **silently**, with no `gap` (nothing was lost to it), so
-  seqs a device receives need not be consecutive. Once its device acknowledges it (or is revoked),
-  the event is deleted without waiting for the others. Every other event goes to every active
+- **Per-hook delivery**: an event of a hook with `recipients` (§3) has envelopes for the devices
+  that were its recipients when it arrived, only. Another device's stream skips it **silently**,
+  with no `gap` (nothing was lost to it), so seqs a device receives need not be consecutive. A
+  recipient whose envelope is missing (its key couldn't be sealed to) gets a `no_key` gap as usual.
+  Once **every** recipient has acknowledged it (or been revoked) the event is deleted, without
+  waiting for the other devices; one recipient acknowledging never takes it from another. Every other event goes to every active
   device with a sealing key, which filters locally.
 
 How the relay serves it (informative): the Worker holds the SSE response and connects to the
@@ -1141,12 +1188,13 @@ Names and ids only: never a secret, a token, a header value or a payload.
 | `key.used` | the key | the key | the key's name; `count` uses in the hour starting at `at` |
 | `verify.failed` | the hook | null | the hook's name, while it exists; `count` failures in the hour starting at `at` (approximate: counted at the edge, §4 step 4) |
 | `hook.screen` | the hook | the device or key | the hook's name |
-| `hook.delivery` | the hook | the device or key | the device its events now go to, or `*` for every device |
+| `hook.delivery` | the hook | the device or key | its recipients: devices and `#tags` joined with `,`, or `*` for every device |
 | `device.renamed` | the device | the device or key | its new name |
+| `device.tagged` | the device | the device or key | its tags joined with `,`, or `-` for none |
 | `screen.held`, `screen.dropped` | the hook | null | the hook's name; `count` in the hour starting at `at` (`screen.dropped` is counted at the edge, like `verify.failed`) |
 | `held.released`, `held.dropped` | the event | the device or key | null |
-| `hook.paused` | the hook | null | the scope whose refusals paused it |
-| `hook.unpaused` | the hook | the device or key | null |
+| `hook.paused` | the hook | null, or the device or key whose change left it without a recipient | the scope whose refusals paused it, or `no_recipient` |
+| `hook.unpaused` | the hook | the device or key | null, or `no_recipient` when a recipient matched again |
 | `account.plan` | the account | the device | the plan's name (an entitlement set or changed it, §2b) |
 | `phone.pairing` | the pairing id | the node device | null |
 | `phone.confirmed` | the phone | its node | the phone's name |
@@ -1156,8 +1204,9 @@ a `device.revoked` whose actor is the phone.
 
 **The events list**: `GET /v1/events?limit=<1–500, default 50>` (device, or `events:read`) →
 `{ "events": [{ "seq", "id", "hookId", "receivedAt", "verified", "strict", "preset", "eventType",
-"size", "deliveredTo": [dev…], "pendingFor": [dev…] }] }`: the events still in the log, newest first,
-metadata only. `size` is the bytes held for it (its envelopes).
+"size", "deliveredTo": [dev…], "pendingFor": [dev…], "recipients": [dev…] | null }] }`: the events
+still in the log, newest first, metadata only. `size` is the bytes held for it (its envelopes);
+`recipients` the devices it was for (null: every device), and `deliveredTo` then counts only them.
 
 ## 10. Phone links
 
