@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// `pnpm check`: what a change must pass before it lands. The relay's type check and tests, then the
-// CLI's formatting, lint and tests.
+// `pnpm check`: what a change must pass before it lands. The relay's type check and tests (and its
+// installer's), then the CLI's formatting, lint and tests.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -11,6 +11,8 @@ const steps = [];
 if (existsSync(join(root, "relay/package.json"))) {
   steps.push(["Relay types", "pnpm", ["--filter", "./relay", "typecheck"]]);
   steps.push(["Relay tests", "pnpm", ["--filter", "./relay", "test"]]);
+  // The installer runs under Node, not workerd: its own runner.
+  steps.push(["Relay installer tests", "node", ["--test", "relay/scripts/setup.nodetest.mjs"]]);
 }
 if (existsSync(join(root, "cli/00hooks/Cargo.toml"))) {
   steps.push(["CLI formatting", "cargo", ["fmt", "--all", "--check"]]);
