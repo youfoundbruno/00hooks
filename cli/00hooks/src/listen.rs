@@ -13,12 +13,18 @@ use crate::output::{Line, Output, clock, duration, json_line, sanitize, size};
 /// Bodies longer than this are cut in human mode (`--json` always has the whole event).
 const SHOW_BODY: usize = 64 * 1024;
 
-/// One human line about an event: time, type, hook, verified, size, id.
+/// One human line about an event: time, type, hook, verified, size, id, and whether it is a test
+/// event the relay sent (`00hooks test`).
 pub fn summary(e: &Event, hook_name: Option<&str>) -> String {
     let kind = e.event_type.as_deref().unwrap_or("event");
     let hook = hook_name.unwrap_or(&e.hook_id);
+    let test = if hooks_runner::is_test_event(e) {
+        "  (a test event: 00hooks test)"
+    } else {
+        ""
+    };
     format!(
-        "{}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}{test}",
         clock(e.received_at),
         sanitize(kind, false),
         sanitize(hook, false),
@@ -326,6 +332,11 @@ mod tests {
         assert_eq!(
             summary(&e, Some("ci")),
             "10:40:00  push  ci  verified  7 B  evt_1"
+        );
+        let e = event(b"{}", Some("00hooks.test"), true);
+        assert_eq!(
+            summary(&e, Some("ci")),
+            "10:40:00  00hooks.test  ci  verified  2 B  evt_1  (a test event: 00hooks test)"
         );
         let e = event(b"x", Some("evil\u{1b}]0;title\u{7}"), false);
         let s = summary(&e, None);

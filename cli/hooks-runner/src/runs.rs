@@ -33,12 +33,14 @@ pub enum RunStatus {
     Ok,
     /// At least one action failed.
     Failed,
-    /// Not acted on: our own echo, a loop, an event seen before.
+    /// Not acted on: our own echo, a loop, an event seen before, content already taken (a replay).
     Dropped,
     /// A crash stopped it part-way.
     Interrupted,
     /// The screen held it in the quarantine list (PLAN §6a): nothing ran; releasing it runs it.
     Held,
+    /// Taken but not run on purpose: a test event no automation lists (`00hooks test`).
+    Skipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -12,9 +12,12 @@
 //!    retries for what's safe to repeat, per-automation rate limits and a circuit breaker;
 //! 6. records the result ([`runs`]), so any event can be replayed.
 //!
-//! Duplicates are dropped by event id (at least once from the relay, at most once here). The
-//! runner should also drop a delivery whose content it has already run under another id (a dedupe
-//! by content hash); that is not built here yet.
+//! Duplicates are dropped by event id (at least once from the relay, at most once here). For the
+//! presets whose provider signs no timestamp, a delivery whose content (hook and body) the runner
+//! already took under another id is dropped as a replay too ([`contentmarks`]).
+//!
+//! An event of kind `00hooks.test` (`00hooks test`, PROTOCOL §3) is recorded but runs only the
+//! automations that list that kind by name; it isn't added to the catalogue.
 //!
 //! The stream's hook changes ([`Runner::on_hook_change`]) keep the hook names current and warn the
 //! person when a hook's secret is rotated by someone else, or a hook takes a name the automations
@@ -32,6 +35,7 @@ pub mod ask;
 pub mod catalogue;
 pub mod check;
 pub mod config;
+pub mod contentmarks;
 pub mod context;
 pub mod expr;
 pub mod hookrefs;
@@ -63,6 +67,15 @@ pub use runs::{RunLog, RunRecord};
 /// The header that marks a call as ours, and the one that counts hops.
 pub const ORIGIN_HEADER: &str = "00hooks-origin";
 pub const HOP_HEADER: &str = "00hooks-hop";
+
+/// The event type of a relay's test event (`POST /v1/test/<hookId>`, PROTOCOL §3): it runs only the
+/// automations that list this kind by name.
+pub const TEST_KIND: &str = "00hooks.test";
+
+/// Whether an event is a relay's test event: its event type is exactly [`TEST_KIND`].
+pub fn is_test_event(e: &hooks_client::Event) -> bool {
+    e.event_type.as_deref() == Some(TEST_KIND)
+}
 
 #[derive(Debug)]
 pub enum Error {

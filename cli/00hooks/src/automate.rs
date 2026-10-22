@@ -69,11 +69,13 @@ fn describe_run(r: &RunRecord) -> Vec<String> {
         r.event_id
     );
     match r.status {
-        RunStatus::Dropped | RunStatus::Interrupted => head.push_str(&format!(
-            "{}: {}",
-            status_word(r.status),
-            r.note.as_deref().unwrap_or("")
-        )),
+        RunStatus::Dropped | RunStatus::Interrupted | RunStatus::Skipped => {
+            head.push_str(&format!(
+                "{}: {}",
+                status_word(r.status),
+                r.note.as_deref().unwrap_or("")
+            ))
+        }
         _ => {
             let ran = r.ran();
             let skipped = r.automations.len() - ran;
@@ -119,6 +121,7 @@ fn status_word(s: RunStatus) -> &'static str {
         RunStatus::Dropped => "dropped",
         RunStatus::Interrupted => "interrupted",
         RunStatus::Held => "held",
+        RunStatus::Skipped => "skipped",
     }
 }
 

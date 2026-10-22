@@ -355,7 +355,14 @@ defence: a captured genuine delivery (GitHub shows recent ones, body
 and signature, to a repository's admins) verifies forever. That is why their body-hash mark is kept
 for `REPLAY_MARK_DAYS` rather than a week. Past it, a replay is accepted as a new event with a new
 `evt_` id, so a client that acts on events should also dedupe by the content's hash, kept at least
-as long as it keeps anything; the reference runner is meant to. Marks are stored as keyed hashes (HMAC-SHA256 under `HASH_PEPPER` of the hook
+as long as it keeps anything. The reference runner does: for a verified (or strict-verified) event
+of these presets it keeps SHA-256 of the hook id and the body bytes (not the headers: a replay's
+delivery id differs), fsynced before the run's start record, at most 100,000 marks for 400 days
+(oldest first out), as hashes only in a 0600 file of its state folder. A delivery whose content it
+has already taken under another id is recorded as a dropped run ("same content as event evt_…
+received …: a replay") and never run; `00hooks replay` still runs a recorded event on purpose. It
+never dedupes `token`, `unverified` or timestamped presets this way (identical bodies are legitimate
+there, or the timestamp already refuses old replays). Marks are stored as keyed hashes (HMAC-SHA256 under `HASH_PEPPER` of the hook
 id and the mark), never the ids themselves: an event id read from a body is content too.
 
 **Slack's endpoint check.** A `slack` delivery whose body is `{"type":"url_verification",
