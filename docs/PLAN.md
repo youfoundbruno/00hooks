@@ -9,8 +9,10 @@ program that embeds the runner and runs AI agents can also hand an event to an a
 instructions and a tightly limited set of permissions (§5.2, §6); the CLI itself runs plain actions
 only.
 
-It's a standalone open-source project (Apache-2.0). You run your own relay; there is no hosted one.
-The CLI works on its own, and its libraries can be embedded by other programs.
+It's a standalone open-source project (Apache-2.0). You can run your own relay, with exactly the
+behaviour described here and no limits beyond the ones you set; there is also a hosted relay, whose
+accounts come with the Overblast Plan (§4.6). The CLI works on its own, and its libraries can be
+embedded by other programs.
 
 Status: phases 0 to 3, 5 and 6 are built (§7): the relay (hooks, presets, replay protection,
 sealing, device pairing, API keys, the audit, the edge screen, one-device delivery, static
@@ -74,11 +76,12 @@ Three rules hold it together:
 
 `POST /h/<hook_id>` (also `PUT` and `PATCH`; `GET` only for a preset's endpoint check):
 
-1. **Cheap checks first**: a per-address rate limit, checked before the hook lookup; the hook exists
-   and is enabled; a per-hook rate limit (Cloudflare Rate Limiting bindings); the body is at most
-   1 MiB by default (configurable per hook up to 1.75 MiB, since bodies are kept in the Durable
-   Object's SQLite rows). There is no per-account rate limit: the account's log has a quota, and
-   each hook a share of it, counted exactly in the Durable Object.
+1. **Cheap checks first**: a per-address rate limit, checked before the hook lookup; the hook exists,
+   is enabled and isn't paused; a per-hook rate limit (Cloudflare Rate Limiting bindings); the body is
+   at most 1 MiB by default (configurable per hook up to 1.75 MiB, since bodies are kept in the Durable
+   Object's SQLite rows). The account's log has a quota, and each hook a share of it, counted exactly
+   in the Durable Object; an account's plan (§4.6) can add a daily cap and per-hook and per-account
+   rates, counted there too. Without a plan configured there are none.
 2. **Verify** with the hook's preset (§4.2). Failures answer `401` with no detail and are counted, not
    stored.
 3. **Replay protection**: a timestamp window where the provider signs one (5 minutes; 60 s for
@@ -183,7 +186,8 @@ needs a device or the `hooks:secrets` scope, and can't sign for a strict or Ed25
 - A malicious payload tries to make an agent misbehave → **access profiles enforced by the program
   that runs the agent** (egress allowlist, secret handles, approvals; §6), payloads framed as data,
   no shell interpolation (§5).
-- Floods and loops → rate limits at the relay and per automation, a circuit breaker, loop detection.
+- Floods and loops → rate limits at the relay (and a plan's exact limits, with pauses for a hook that
+  floods, §4.6) and per automation, a circuit breaker, loop detection.
 
 ### 4.2 Verifying what arrives (provider presets)
 
@@ -298,6 +302,28 @@ without a typed confirmation; `--dry-run` shows every step and runs nothing; `--
 a deployed relay. There is no "Deploy to Cloudflare" button: it couldn't give each account its own
 rate-limit ids, would build `relay/` without the workspace's lockfile, and would take the secrets
 through a web form seeded with `.dev.vars.example`'s placeholders, which the relay would accept.
+
+### 4.6 Plans and the hosted relay
+
+Every account works under a **plan**: limits from the operator's configuration (`PLANS`; PROTOCOL
+§2a): hooks and devices at once, deliveries a day, a token bucket per hook and per account,
+retention, body size, the backlog, hook creations a day. A relay without `PLANS` has one plan,
+`default`, equal to the behaviour before plans, so **self-hosting is unchanged**. The limits are
+counted exactly in the account's Durable Object (rows in its SQLite, no timers, so it still
+hibernates); the hook and device caps in the D1 insert itself. A refusal says which limit
+(`scope`) and exactly when to retry; a hook may take deliveries past the daily cap and drop them
+(`accept_and_drop`, reported to the devices as a gap) instead of refusing; a hook refused hundreds
+of times in minutes is paused, answered from D1 without waking the Durable Object, until the pause
+ends or a device lifts it. Devices hear of limits on the stream (`limit`) and read their plan and
+usage with `GET /v1/account`.
+
+**The hosted relay** is this code with a `PLANS` configuration whose accounts come with the
+**Overblast Plan**: Overblast signs an **entitlement** (PROTOCOL §2b) for a workspace, which creates
+the workspace's account (instead of a signup token) or refreshes its plan. The relay pins
+Overblast's public keys, links one account to one workspace, and, when an entitlement isn't renewed,
+falls back after a grace period to a suspended plan that takes nothing new but keeps the backlog
+readable. A relay without the keys takes no entitlements. The suggested hosted limits are in
+`docs/plans.example.json`, marked as suggestions.
 
 ## 5. Running automations on your machine
 

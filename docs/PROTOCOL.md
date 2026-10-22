@@ -60,6 +60,16 @@ a hook's `deliverTo` and `response` (§3, §6); the signed test event (`POST /v1
 `hook.delivery` (§9). A client that ignores them keeps working: an event its hook delivers to
 another device never reaches it, and a test event is an ordinary verified event.
 
+Additive within version 2 (plans, §2a, §2b): `plans`, `entitlements` and `hostedPlan` in
+`/v1/info`; `GET /v1/account`; `PUT /v1/account/plan` and `entitlement` in `POST /v1/accounts` (only
+on a relay with entitlement keys); `onLimit` and `pausedUntil` in `Hook`, and
+`POST /v1/hooks/<id>/unpause` (§3); `scope` (and `until`, `limit`) in more `429` and `409` answers
+(§3, §4, §8); the stream's `limit` event, and the gap reason `over_limit` (§6); the audit kinds
+`hook.paused`, `hook.unpaused` and `account.plan` (§9). A relay without `PLANS` has one plan,
+`default`, that behaves as the relay did before plans, so a client that ignores all of this keeps
+working; a client that predates the `limit` event ignores it (it has no `id`), and one that
+predates `over_limit` shows it as any other gap.
+
 ## 1. Signed requests
 
 Every `/v1/*` request except account creation and enrolment is signed by a **device**. A device has an
@@ -165,8 +175,8 @@ characters); both sides compute it.
   (5 a minute by default, `429` `rate_limited`), checked first. A public key that already belongs to a
   device is `409` `conflict`, also when two signups race for it; the account and its first device
   are created together or not at all.
-- An account holds at most `ACCOUNT_MAX_DEVICES` node devices (10 by default; phones, §10, aren't
-  counted, and revoked devices free their place). At the cap, `POST /v1/enrolments` and the
+- An account holds at most `ACCOUNT_MAX_DEVICES` node devices (10 by default, or its plan's
+  `devices`, §2a; phones, §10, aren't counted, and revoked devices free their place). At the cap, `POST /v1/enrolments` and the
   redemption answer `409` `conflict`.
 - `POST /v1/enrolments` (signed) → `{ "code": "ABCD-EFGH-JKMN", "expiresAt" }`: a one-time code,
   valid 10 minutes, for adding another device to the same account. A code is 12 Crockford base32
@@ -207,7 +217,7 @@ characters); both sides compute it.
 - `GET /v1/info` (unsigned) → `{ "version", "protocol": 2, "protocols": [2], "signupOpen": bool,
   "relayKey", "serverTime", "screen": { "edge": true, "maxRules": 200, "heldDays" }, "extras": [],
   "phone": { "protocol": 1, "push": { "available": bool, "environment": "sandbox" | "production" |
-  null, "platforms": { "ios": { "available": bool, "environment": … }, "android": { "available": bool } } } } }`.
+  null, "platforms": { "ios": { "available": bool, "environment": … }, "android": { "available": bool } } } }, "plans": true, "entitlements": bool, "hostedPlan"?: {…} }` (the last three: §2a).
   `signupOpen` is true only when a signup needs no token
   (`OPEN_SIGNUP=1` and no `SIGNUP_TOKEN`). `phone` says the relay carries phone links (§10) and the
   version of their socket protocol; `phone.push.platforms` says, per platform, whether it can wake a
@@ -222,6 +232,105 @@ characters); both sides compute it.
   characters) that signs every envelope (§5); a client **pins it at login** and refuses envelopes it
   doesn't verify. It is null only on a relay with no `RELAY_SIGNING_KEY`, which takes no deliveries
   (§4) and which the reference client refuses to log in to.
+
+## 2a. Plans
+
+An account works under a **plan**: a set of limits from the operator's configuration (`PLANS`, a
+JSON object mapping a plan's name to its limits; `docs/plans.example.json`). A relay without it has
+one plan, `default`, equal to how it behaved before plans: no daily cap, no account rate, the
+backlog quota and retention of `ACCOUNT_MAX_EVENTS`, `ACCOUNT_MAX_BYTES` and `RETENTION_DAYS`, the
+device cap of `ACCOUNT_MAX_DEVICES`. A limit a plan leaves out takes the `default` plan's value;
+`null` is no limit. A malformed `PLANS` makes the relay refuse deliveries with `503` `unavailable`
+rather than guess.
+
+| limit | what it caps | where it is counted |
+|---|---|---|
+| `hooks` | hooks the account has at once | the hook insert itself (§3) |
+| `devices` | node devices at once (phones aren't counted) | the device insert (§2) |
+| `eventsPerDay` | deliveries taken per UTC day, across the account's hooks | the account's object |
+| `hookRatePerMin`, `hookBurst` | one hook's sustained rate and its burst (a token bucket; `hookBurst` defaults to the rate) | the account's object |
+| `accountRatePerMin`, `accountBurst` | the same across the account's hooks | the account's object |
+| `retentionHours` | how long unacknowledged events are kept (at least 1) | the account's object |
+| `maxBodyBytes` | the largest body any hook takes (a hook's own `maxBodyBytes` may be lower) | the Worker |
+| `backlogEvents`, `backlogBytes` | what the log may hold waiting for acknowledgement (§4 step 7; each hook's share follows from it) | the account's object |
+| `hookCreatesPerDay` | hooks created per UTC day (deleting one gives none back) | the hook insert (§3) |
+
+The account's own plan is `accounts.plan` (none: `default`), with an optional per-account override
+of its limits; a plan that came with an entitlement (§2b) also has an end. The token buckets and
+daily counters are rows of the account's object, read and written in the same step that decides a
+delivery: exact, with no timer (the object still hibernates). A delivery is counted only once it is
+taken: a duplicate, a refusal or a full backlog spends nothing.
+
+`GET /v1/account` (signed by a device; never an API key) →
+
+```json
+{ "accountId": "acc_…", "plan": "overblast", "planUntil": 1795000000000, "expired": false,
+  "limits": { "hooks": 50, "devices": 10, "eventsPerDay": 50000, … },
+  "usage": { "day": 20383,
+             "today": { "events": 1200, "refused": 3, "dropped": 0 },
+             "perHook": { "hk_…": { "today": 1100, "refused": 3, "backlog": { "events": 4, "bytes": 9000 }, "lastEventAt": 1792233600000 } },
+             "backlog": { "events": 4, "bytes": 9000 },
+             "hooks": 3, "devices": 2, "hookCreatesToday": 1 },
+  "paused": [{ "hookId": "hk_…", "until": 1792237200000 }],
+  "upgrade": { "plan": "overblast", "title": "…", "description": "…", "url": "https://…" } }
+```
+
+`limits` are the ones in effect (with the account's override); `planUntil` is null for a plan without
+an end; `expired` says the account's entitled plan ran out and `plan` is the fallback (§2b);
+`usage.day` is the UTC day number (days since the epoch) the counts are for; `usage.perHook` lists
+the hooks the object has counts for (`lastEventAt` there is exact; the `Hook`'s is written at most
+once a minute, §3). `upgrade` appears when the operator announces how to get its hosted plan
+(`HOSTED_PLAN`) and the account isn't on an entitled plan, or its entitlement ran out: data, shown as
+it is, never prices or code.
+
+`/v1/info` says `plans: true` (the relay has plans and `GET /v1/account`), `entitlements: bool`
+(whether it takes §2b's entitlements), and, when the operator sets it, `hostedPlan: { "plan",
+"title", "description"?, "url"? }`.
+
+## 2b. Entitlements
+
+A hosted relay can give accounts a plan through an **entitlement**: a statement signed by its
+issuer (Overblast) that a workspace's 00hooks account comes with a plan until a time. Only a relay
+that pins the issuer's keys (`ENTITLEMENT_PUBLIC_KEYS`, a JSON array of base64url raw 32-byte Ed25519
+public keys; several for rotation) takes them; anywhere else `PUT /v1/account/plan` is `404` and an
+`entitlement` at signup is `400` `invalid` (`field: "entitlement"`).
+
+**The token**: `ent1.` + base64url (unpadded) of the UTF-8 JSON payload + `.` + base64url (unpadded)
+of an Ed25519 signature over the ASCII bytes of `ent1.<payload-b64url>`, at most 4,096 characters.
+The payload:
+
+```json
+{ "v": 1, "iss": "overblast", "aud": "00hooks", "ws": "<workspace id>",
+  "sub": { "acc": "acc_…" } | { "dev": "<base64url Ed25519 public key>" },
+  "plan": "overblast", "limits": { …optional, the keys of §2a… },
+  "iat": 1792233600, "exp": 1795257600, "jti": "<random id>" }
+```
+
+The relay accepts a token only when a pinned key verifies its signature (each key is tried), `v` is
+1, `iss` is `overblast`, `aud` is `00hooks`, `ws` is 1 to 128 characters of `[A-Za-z0-9_.:-]`, `sub`
+has exactly one of `acc` (an account id) or `dev` (a signing key), `plan` is a plan the relay knows,
+`limits` (when present) parses as §2a's, `iat` is at most 300 s in the future, `jti` is 1 to 128
+characters, and `exp` is later than now and than `iat` (times in Unix **seconds**). Anything else is
+`403` `forbidden` with one fixed message (an expired token gets its own: get a fresh one).
+
+- **At signup**: `POST /v1/accounts` with `"entitlement": "<token>"` in the body, instead of the
+  signup token. `sub.dev` must equal the request's `publicKey` (`403` otherwise). The account is
+  created on the token's plan, until `exp`, with its `limits` as the account's override, linked to
+  `ws`; the answer adds `plan` and `planUntil`. The signup limit per address applies as always.
+- **To set or refresh**: `PUT /v1/account/plan` `{ "entitlement" }` (signed by a device) →
+  `GET /v1/account`'s answer. `sub.acc` must be the caller's account (`403` otherwise). A token that
+  ends no later than the one the account holds, for the same workspace and plan, changes nothing (an
+  old token replayed can't shorten the plan). Clients refresh well before `exp` (tokens last about 35
+  days).
+- **One account per workspace**: a `ws` already linked to another account is `409` `conflict`
+  (`field: "entitlement"`), at signup and on refresh; the account it is linked to may refresh it.
+- **When it runs out**: past `exp` plus the grace period (`ENTITLEMENT_GRACE_DAYS`, 7 by default)
+  the account falls back to `ENTITLEMENT_FALLBACK_PLAN`, by default `suspended`: no new deliveries
+  (`429` `quota` `scope: "plan_expired"`, `Retry-After: 3600`), no new hooks, while the backlog stays
+  readable and acknowledgeable; the stream says so with a `limit` event of scope `plan_expired` (§6).
+  A refresh brings the plan back at once. The account's override applies to its own plan, never to
+  the fallback.
+- The audit records `account.plan` when the plan or workspace changes (§9).
 
 ## 3. Hooks
 
@@ -258,14 +367,33 @@ characters); both sides compute it.
   Linear, Shopify, Twilio, Meta, Paddle, Zoom, PagerDuty) is rotated at the provider, and a strict hook's secret is on the devices:
   both answer `409` `conflict`.
 - `DELETE /v1/hooks/<id>` (`hooks:write`) → `204`. Events already in the log stay until acknowledged.
+- **The plan's caps** (§2a), checked in the hook's insert itself, so creations racing can't pass
+  them: at `hooks` → `409` `conflict` `{"scope":"hooks","limit":n}`; past `hookCreatesPerDay` →
+  `429` `rate_limited` `{"scope":"hook_creates","limit":n}` with `Retry-After` until midnight UTC.
+  A relay with the `HOOK_CREATE_IP_LIMIT` binding also limits creations per address (`429`
+  `rate_limited` `{"scope":"hook_create_ip"}`, `Retry-After: 60`).
+- `onLimit` (in `POST` and `PATCH`): what a delivery past the account's daily cap gets: `refuse`
+  (the default: `429`, so the provider retries later) or `accept_and_drop` (`200`, nothing stored,
+  and the devices get a gap `over_limit`, §6), for providers that would otherwise give up on the
+  hook or flood it with retries. Anything else is `400` `invalid`.
+- **Pauses**: a hook refused too often (by its plan's rate or daily cap: 500 refusals in 10 minutes
+  by default, `PAUSE_AFTER_REFUSALS` and `PAUSE_WINDOW_MINUTES`) is paused for an hour, twice as long
+  each time it is paused again within a day of the last pause (up to 24 hours). While paused, every
+  delivery is `429` `rate_limited` `{"scope":"paused","until":<ms>}` with `Retry-After`, answered
+  from the hook's row without waking the account's object. The audit says `hook.paused`, the stream
+  sends a `limit` event of scope `paused` at once, and `GET /v1/account` lists it. A pause ends by
+  itself, or at once with `POST /v1/hooks/<id>/unpause` (`hooks:write`) → `<Hook>`, or
+  `PATCH /v1/hooks/<id>` `{"enabled": true}` (audit `hook.unpaused`).
 
 Every device's stream is told of each hook created, rotated, renamed or deleted (`hook-change`,
 §6), so a person notices a change they didn't make (an API key rotating a secret, say).
 
 `Hook`: `{ "id", "name", "url", "enabled", "verify": { "preset", …non-secret fields }, "maxBodyBytes",
 "createdAt", "lastEventAt", "offlineNotice": { "text", "afterMinutes" } | null, "screenRules",
-"deliverTo": "dev_…" | null, "response": { "status", "contentType", "body" } | null }`
-(`screenRules`: how many edge rules the hook's screen has, §4b).
+"deliverTo": "dev_…" | null, "response": { "status", "contentType", "body" } | null, "onLimit": "refuse" |
+"accept_and_drop", "pausedUntil": <ms> | null }` (`screenRules`: how many edge rules the hook's screen
+has, §4b). `lastEventAt` is written at most once a minute per hook (the account's object keeps the
+exact time, `GET /v1/account`).
 
 ### The test event
 
@@ -468,8 +596,11 @@ mode removes the secret, and the parsing, not the transit.
 1. Rate limit per client address (an IPv4 address, or an IPv6 /64; 600 requests per 10 s by
    default), **before** the hook is looked up → `429` `rate_limited` with `Retry-After`. Guessing hook
    ids costs the guesser this budget, not the relay a database read each.
-2. Unknown or disabled hook → `404`. Body declared larger than the hook's `maxBodyBytes` (default
-   1 MiB) in `Content-Length` → `413`.
+2. Unknown or disabled hook → `404`. A paused hook (§3) → `429` `rate_limited`
+   `{"scope":"paused","until"}` with `Retry-After`, from the hook's row (the account's plan comes in
+   the same read, so a delivery costs no extra database read). Body declared larger than the hook's
+   `maxBodyBytes` (default 1 MiB), or the plan's `maxBodyBytes` when lower, in `Content-Length` →
+   `413`.
 3. Rate limit per hook (60 requests per 10 s by default) → `429` with `Retry-After`. Only then is the
    body read, and a body that turns out larger than the limit while streaming → `413`.
 4. Verify with the preset (for a strict hook, the edge checks of §3) → `401` `{"error":"signature"}`
@@ -491,6 +622,21 @@ mode removes the secret, and the parsing, not the transit.
    hook (`UNCHECKED_HOOK_MAX_EVENTS`, `UNCHECKED_HOOK_MAX_BYTES`), so a flood on one hook can't refuse
    the others. Past any → `429` `{"error":"quota","scope":"account"|"hook"|"held"}` with
    `Retry-After: 60` (`held`: the hook's hold is full, §4b). Acknowledging (or retention) frees it.
+   The plan (§2a) can set these quotas (`backlogEvents`, `backlogBytes`) and adds its own limits,
+   checked first, in the same step, all counted exactly in the account's object, each answered with
+   an exact `Retry-After` in whole seconds:
+   - an account whose entitled plan ran out onto a plan that takes nothing (§2b) → `429`
+     `{"error":"quota","scope":"plan_expired"}`, `Retry-After: 3600`;
+   - the account's `eventsPerDay` → `429` `{"error":"quota","scope":"daily"}` until midnight UTC, or,
+     for a hook whose `onLimit` is `accept_and_drop`, `200` `{"received":"<evt_…>"}` with an id that
+     names nothing: nothing is stored, and the seq the event would have had becomes a gap
+     `over_limit` (§6);
+   - the hook's token bucket (`hookRatePerMin`, `hookBurst`) → `429`
+     `{"error":"rate_limited","scope":"hook_rate"}`;
+   - the account's (`accountRatePerMin`, `accountBurst`) → `429`
+     `{"error":"rate_limited","scope":"account_rate"}`.
+
+   Refusals count towards pausing the hook (§3); the refusal that pauses it is answered as a pause.
 8. Seal the content to every active device that has a sealing key, sign each envelope (§5), and
    append the event, its envelopes and its dedupe marks in one Durable Object transaction → `200`
    `{"received": "<evt_…>"}`. The seq (part of what is sealed) and the quota are reserved first, the
@@ -825,7 +971,12 @@ data: {…event…}
   event whose message would pass the WebSocket message limit between the relay's Worker and its
   Durable Object (32 MiB). That can't happen within this version's limits (the largest event, a
   1,835,008-byte body sealed and base64-encoded with its headers, is under 2.5 MB); the rule exists
-  so one undeliverable event can never wedge a stream.
+  so one undeliverable event can never wedge a stream. `over_limit` covers seqs of deliveries the
+  relay answered `200` and dropped past the daily cap (§4 step 7, a hook whose `onLimit` is
+  `accept_and_drop`); consecutive ones are one gap. A stream that is live when they happen is told
+  after the next event (a client ignores a gap past the newest seq it has seen), with `id:` the gap's
+  `to`, lower than that event's; a client keeps its own cursor at the highest seq. A stream that
+  connects later is told in order, like any gap.
 - **Hook changes**: `event: hook-change` `data: {"n": 7, "kind": "hook.rotated", "hookId": "hk_…",
   "name": "…", "previousName"?: "…", "actor": "key_…" | "dev_…" | null, "at": <ms>}` says one of the
   account's hooks was created, rotated, renamed (with `previousName`) or deleted (`kind` is
@@ -838,6 +989,15 @@ data: {…event…}
   once: `n` only grows within an account, and a client dedupes by it. It is a notice, not a record:
   the audit log (§9) is the record. A client should tell the person about a change it didn't make,
   above all `hook.rotated` (a secret now exists that the person didn't see).
+- **Limits**: `event: limit` `data: {"scope": "hook_rate" | "account_rate" | "daily" | "paused" |
+  "plan_expired", "hookId"?: "hk_…", "refused": 12, "since": <ms>, "until": <ms> | null, "plan":
+  "overblast"}` says one of the plan's limits (§2a) is refusing deliveries: `hookId` for a hook's own
+  scope (`hook_rate`, `paused`); `refused` how many since `since`, when the limit began to bite
+  (accepted and dropped deliveries count for `daily`); `until` when it lifts (null for
+  `plan_expired`, which lifts when the plan is renewed). Like `hook-change` it has **no `id:` line**
+  and is never acknowledged. It is sent at most once an hour per scope and hook (a pause at once),
+  and after `ready` a stream is sent the newest notices still in effect (at most 10), so a device
+  that reconnects hears of them. A client treats an unknown scope as a generic limit.
 - `Last-Event-ID` beyond the head is clamped to the head; one that isn't a number answers `400`
   `invalid`.
 - **Heartbeat**: a comment line `: hb` every 15 s.
@@ -916,7 +1076,12 @@ seq and noted.
 
 ## 8. Errors
 
-Every error body is `{ "error": "<code>", "message": "<one plain sentence>" }`. Codes: `unauthorized`,
+Every error body is `{ "error": "<code>", "message": "<one plain sentence>" }`, with extra fields
+where a section says so (`field`, `serverTime`, `scope`, `until`, `limit`). `scope` says which
+limit answered a `429` or a cap's `409`: `account`, `hook`, `held`, `daily`, `plan_expired` (with
+`quota`); `hook_rate`, `account_rate`, `paused`, `hook_creates`, `hook_create_ip` (with
+`rate_limited`); `hooks` (with `conflict`). A client treats a scope it doesn't know as the code
+alone. Codes: `unauthorized`,
 `clock_skew`, `not_found`, `too_large`, `rate_limited`, `quota` (a `429`: the account's log is full),
 `signature`, `invalid` (with `field`), `conflict`, `forbidden` (a `403`: an API key without the
 scope, or a route only a device may use), `unavailable` (a `503`: the relay is missing a safety
@@ -952,9 +1117,10 @@ scope, or on a route only a device may use, is `403` `forbidden`.
 | `devices:write` | `GET /v1/devices`, `PATCH /v1/devices/<id>` (rename), `DELETE /v1/devices/<id>` |
 | `audit:read` | `GET /v1/audit` |
 | `hooks:read` (screen) | `GET /v1/hooks/<id>/screen` |
+| `hooks:write` (pauses) | `POST /v1/hooks/<id>/unpause` |
 | `hooks:write` (screen) | `PUT /v1/hooks/<id>/screen`, `POST /v1/held/<id>/release`, `DELETE /v1/held/<id>`, `DELETE /v1/held` |
 | `events:read` (screen) | `GET /v1/held` |
-| *(device only)* | `/v1/stream`, `/v1/ack`, `/v1/enrolments`, `PUT /v1/devices/<id>/seal-key`, `/v1/keys`, `/v1/screen/key`, `/v1/phone/*` (§10) |
+| *(device only)* | `/v1/stream`, `/v1/ack`, `/v1/enrolments`, `PUT /v1/devices/<id>/seal-key`, `/v1/keys`, `/v1/screen/key`, `/v1/account`, `PUT /v1/account/plan`, `/v1/phone/*` (§10) |
 
 The device-only routes are what would turn a stolen key into a reader of the account's events (a
 stream, a new device, a sealing key) or into more keys. `hooks:secrets` is kept apart from
@@ -979,6 +1145,9 @@ Names and ids only: never a secret, a token, a header value or a payload.
 | `device.renamed` | the device | the device or key | its new name |
 | `screen.held`, `screen.dropped` | the hook | null | the hook's name; `count` in the hour starting at `at` (`screen.dropped` is counted at the edge, like `verify.failed`) |
 | `held.released`, `held.dropped` | the event | the device or key | null |
+| `hook.paused` | the hook | null | the scope whose refusals paused it |
+| `hook.unpaused` | the hook | the device or key | null |
+| `account.plan` | the account | the device | the plan's name (an entitlement set or changed it, §2b) |
 | `phone.pairing` | the pairing id | the node device | null |
 | `phone.confirmed` | the phone | its node | the phone's name |
 

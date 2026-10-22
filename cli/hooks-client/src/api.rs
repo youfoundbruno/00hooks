@@ -16,7 +16,7 @@ use crate::keys::DeviceKey;
 use crate::seal::Opener;
 use crate::signing::{new_nonce, sign_with};
 use crate::types::*;
-use crate::{Error, Result};
+use crate::{Error, Result, Secret};
 
 /// How long an ordinary API call may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -460,6 +460,76 @@ impl Client {
             .await
     }
 
+    /// `POST /v1/hooks/<id>/unpause` (PROTOCOL §3): lifts a pause at once.
+    pub async fn unpause_hook(&self, id: &str) -> Result<Hook> {
+        check_id("hk_", id)?;
+        self.call(
+            Method::POST,
+            &format!("/v1/hooks/{id}/unpause"),
+            None,
+            Auth::Signed,
+        )
+        .await
+    }
+
+    /// `PATCH /v1/hooks/<id>` `{ "onLimit" }` (PROTOCOL §3): what a delivery past the daily cap
+    /// gets.
+    pub async fn set_on_limit(&self, id: &str, on_limit: OnLimit) -> Result<Hook> {
+        check_id("hk_", id)?;
+        self.call(
+            Method::PATCH,
+            &format!("/v1/hooks/{id}"),
+            Some(json!({ "onLimit": on_limit })),
+            Auth::Signed,
+        )
+        .await
+    }
+
+    /// `GET /v1/info`'s plan fields (PROTOCOL §2a): whether the relay has plans, takes
+    /// entitlements, and how to get its hosted plan.
+    pub async fn plans_info(&self) -> Result<PlansInfo> {
+        self.call(Method::GET, "/v1/info", None, Auth::None).await
+    }
+
+    /// `GET /v1/account` (PROTOCOL §2a): this account's plan, limits and today's usage.
+    pub async fn account(&self) -> Result<AccountInfo> {
+        self.call(Method::GET, "/v1/account", None, Auth::Signed)
+            .await
+    }
+
+    /// `PUT /v1/account/plan` (PROTOCOL §2b): sets or refreshes the plan with an Overblast
+    /// entitlement whose subject is this account. Answers as [`Client::account`].
+    pub async fn set_plan(&self, entitlement: &Secret) -> Result<AccountInfo> {
+        self.call(
+            Method::PUT,
+            "/v1/account/plan",
+            Some(json!({ "entitlement": entitlement.expose() })),
+            Auth::Signed,
+        )
+        .await
+    }
+
+    /// `POST /v1/accounts` with an Overblast entitlement for `public_key` (PROTOCOL §2b) instead of
+    /// a signup token: the account starts on the entitled plan.
+    pub async fn create_account_with_entitlement(
+        &self,
+        device_name: &str,
+        public_key: &str,
+        seal_key: Option<&str>,
+        entitlement: &Secret,
+    ) -> Result<EntitledJoin> {
+        let mut body = json!({
+            "deviceName": device_name,
+            "publicKey": public_key,
+            "entitlement": entitlement.expose(),
+        });
+        if let Some(k) = seal_key {
+            body["sealKey"] = json!(k);
+        }
+        self.call(Method::POST, "/v1/accounts", Some(body), Auth::None)
+            .await
+    }
+
     /// `GET /v1/hooks`.
     pub async fn hooks(&self) -> Result<Vec<Hook>> {
         #[derive(serde::Deserialize)]
@@ -685,11 +755,18 @@ async fn read_error_body(resp: reqwest::Response) -> ErrorBody {
 }
 
 fn api_error(status: u16, e: ErrorBody) -> Error {
+    // A refusal's `scope` (PROTOCOL §8) travels in `field`, which those answers don't use otherwise,
+    // so `Error::Api` keeps its shape; [`Error::limit_scope`] reads it.
+    let field = match (e.field, e.scope) {
+        (Some(f), _) => Some(f),
+        (None, Some(scope)) if status == 429 || status == 409 => Some(scope),
+        (None, _) => None,
+    };
     Error::Api {
         status,
         code: e.error,
         message: e.message,
-        field: e.field,
+        field,
     }
 }
 
@@ -725,6 +802,33 @@ mod tests {
         assert!(check_id("hk_", "dev_abc").is_err());
         assert!(check_id("hk_", "hk_../x").is_err());
         assert!(check_id("hk_", "hk_ABC").is_err());
+    }
+
+    #[test]
+    fn a_refusals_scope_is_kept_and_read_back() {
+        let body = |v: serde_json::Value| serde_json::from_value::<ErrorBody>(v).unwrap();
+        let e = api_error(
+            429,
+            body(json!({"error": "rate_limited", "message": "m", "scope": "hook_rate"})),
+        );
+        assert_eq!(e.limit_scope(), Some(LimitScope::HookRate));
+        assert!(e.is_transient());
+        let e = api_error(
+            409,
+            body(json!({"error": "conflict", "message": "m", "scope": "hooks", "limit": 50})),
+        );
+        assert_eq!(e.limit_scope(), Some(LimitScope::Hooks));
+        // A field the relay names wins; an unknown scope or another status is no limit.
+        let e = api_error(
+            409,
+            body(json!({"error": "conflict", "message": "m", "field": "entitlement"})),
+        );
+        assert_eq!(e.limit_scope(), None);
+        let e = api_error(429, body(json!({"error": "quota", "scope": "someday"})));
+        assert_eq!(e.limit_scope(), None);
+        let e = api_error(400, body(json!({"error": "invalid", "scope": "daily"})));
+        assert_eq!(e.limit_scope(), None);
+        assert!(matches!(e, Error::Api { field: None, .. }));
     }
 
     #[test]

@@ -13,7 +13,10 @@ import { pruneD1 } from "./prune.ts";
 import { RATE_LIMIT_PERIOD_S } from "./receive.ts";
 import { renameDevice } from "./devices.ts";
 import { sendTest } from "./test-event.ts";
-import { createHook, deleteHook, getHook, getScreen, listHooks, patchHook, putScreen, rotateHook } from "./hooks.ts";
+import { createHook, deleteHook, getHook, getScreen, listHooks, patchHook, putScreen, rotateHook, unpauseHook } from "./hooks.ts";
+import { entitlementsOn } from "./entitlements.ts";
+import { getAccount, putPlan } from "./plan-routes.ts";
+import { hostedPlan } from "./plans.ts";
 import { dropHeld, dropHeldBulk, listHeld, releaseHeld, screenInfo, screenKeyFor } from "./held.ts";
 import { authenticateKey, createKey, deviceOnly, listKeys, presentsKey, revokeKey, type Scope } from "./keys.ts";
 import { confirmPhone, createPairing, listPhones, openPhoneSocket, redeemPairing, unpairSelf } from "./phone.ts";
@@ -80,6 +83,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       serverTime: Date.now(),
       ...screenInfo(env),
       phone: { protocol: PHONE_PROTOCOL, push: await pushInfo(env) },
+      // Plans (PROTOCOL §2a): `GET /v1/account` says this account's; `entitlements` whether the
+      // relay takes Overblast entitlements; `hostedPlan` how to get the hosted plan, as the
+      // operator announces it (data, never code).
+      plans: true,
+      entitlements: entitlementsOn(env),
+      ...(hostedPlan(env.HOSTED_PLAN) ? { hostedPlan: hostedPlan(env.HOSTED_PLAN) } : {}),
     });
   }
 
@@ -167,8 +176,23 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (path === "/v1/audit" && method === "GET") return readAudit(env, await scoped("audit:read"), url);
   if (path === "/v1/events" && method === "GET") return listEvents(env, await scoped("events:read"), url);
 
+  if (path === "/v1/account" && method === "GET") return getAccount(env, await signed());
+  if (path === "/v1/account/plan" && method === "PUT") {
+    // A relay without entitlement keys has no such route (PROTOCOL §2b).
+    if (!entitlementsOn(env)) return notFound();
+    return putPlan(env, await signed(), body);
+  }
+
   if (path === "/v1/hooks") {
-    if (method === "POST") return createHook(env, await scoped("hooks:write"), origin, body);
+    if (method === "POST") {
+      const caller = await scoped("hooks:write");
+      // Hook creations per address (PROTOCOL §3), on top of the plan's daily count, when the
+      // binding is deployed.
+      if (env.HOOK_CREATE_IP_LIMIT && !(await env.HOOK_CREATE_IP_LIMIT.limit({ key: clientKey(request) })).success) {
+        return error(429, "rate_limited", "Too many hooks created from this address; slow down.", { scope: "hook_create_ip" }, { "Retry-After": "60" });
+      }
+      return createHook(env, caller, origin, body);
+    }
     if (method === "GET") return listHooks(env, await scoped("hooks:read"), origin);
     return notFound();
   }
@@ -189,6 +213,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const caller = await scoped("hooks:write");
     if (!isId("evt", hd[1])) return notFound();
     return release ? releaseHeld(env, caller, hd[1]!) : dropHeld(env, caller, hd[1]!);
+  }
+
+  const up = /^\/v1\/hooks\/([^/]+)\/unpause$/.exec(path);
+  if (up) {
+    if (method !== "POST") return notFound();
+    const caller = await scoped("hooks:write");
+    if (!isId("hk", up[1])) return notFound();
+    return unpauseHook(env, caller, origin, up[1]!);
   }
 
   const hk = /^\/v1\/hooks\/([^/]+)(\/rotate)?$/.exec(path);

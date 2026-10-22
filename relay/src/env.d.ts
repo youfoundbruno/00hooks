@@ -34,6 +34,33 @@ interface __BaseEnv_Env {
    * `{ "id", "title", "description"?, "url"? }`. A self-hosted relay leaves it unset.
    */
   HOSTED_EXTRAS?: string;
+  /**
+   * Plans (PROTOCOL §2a): a JSON object mapping a plan's name to its limits (`hooks`, `devices`,
+   * `eventsPerDay`, `hookRatePerMin`, `hookBurst`, `accountRatePerMin`, `accountBurst`,
+   * `retentionHours`, `maxBodyBytes`, `backlogEvents`, `backlogBytes`, `hookCreatesPerDay`; null is
+   * no limit, a key left out takes the `default` plan's value). Unset: one plan, `default`, equal to
+   * the relay's behaviour before plans. Malformed: the relay refuses deliveries (503) rather than
+   * guess.
+   */
+  PLANS?: string;
+  /**
+   * Overblast entitlements (PROTOCOL §2b): a JSON array of base64url raw Ed25519 public keys (32
+   * bytes each; several, for rotation). Unset: the relay takes no entitlements.
+   */
+  ENTITLEMENT_PUBLIC_KEYS?: string;
+  /** Days an entitlement's plan keeps working past its `exp`; 7 when unset. */
+  ENTITLEMENT_GRACE_DAYS?: string;
+  /** The plan an account falls back to once its entitlement ran out; `suspended` when unset. */
+  ENTITLEMENT_FALLBACK_PLAN?: string;
+  /**
+   * How to get the hosted plan, as JSON `{ "plan", "title", "description"?, "url"? }`, announced as
+   * data in `/v1/info` and `/v1/account`. A self-hosted relay leaves it unset.
+   */
+  HOSTED_PLAN?: string;
+  /** Refusals (rate or daily) of one hook within `PAUSE_WINDOW_MINUTES` that pause it; 500 when unset, 0 never pauses. */
+  PAUSE_AFTER_REFUSALS?: string;
+  /** The window those refusals are counted in; 10 minutes when unset. */
+  PAUSE_WINDOW_MINUTES?: string;
   /** Phone links (PROTOCOL §10): rows a node's queue may hold before a phone's send is refused; 1000 when unset. */
   PHONE_NODE_QUEUE_MAX?: string;
   /** Rows a phone's queue may hold before the oldest are dropped; 500 when unset. */

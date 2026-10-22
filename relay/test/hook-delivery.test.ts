@@ -234,27 +234,30 @@ describe("delivering a hook to one device", () => {
   });
 });
 
-describe("schema 5", () => {
-  it("adds the route columns to an object written before them, keeping its events", async () => {
-    const dev = await newAccount();
-    const { hook } = await createHook(dev, { preset: "unverified" });
-    await deliver(hook.id, { n: 1 });
-    const after = await runInDurableObject(accountObject(dev.accountId), (o: AccountObject, state) => {
-      const sql = state.storage.sql;
-      sql.exec("DROP INDEX IF EXISTS events_route");
-      sql.exec("ALTER TABLE events DROP COLUMN route");
-      sql.exec("ALTER TABLE held_events DROP COLUMN route");
-      sql.exec("UPDATE meta SET value = 4 WHERE key = 'schema'");
-      (o as unknown as { migrate(): void }).migrate();
-      return {
-        schema: sql.exec<{ value: number }>("SELECT value FROM meta WHERE key = 'schema'").one().value,
-        events: sql.exec("SELECT route FROM events").toArray(),
-        held: sql.exec("SELECT route FROM held_events").toArray(),
-        index: sql.exec("SELECT name FROM sqlite_master WHERE name = 'events_route'").toArray().length,
-      };
+describe("schema 6", () => {
+  for (const from of [4, 5]) {
+    it(`adds the route columns to an object at schema ${from}, keeping its events`, async () => {
+      // Schema 5 (plans) only added tables, so a log already at 5 still lacks these columns.
+      const dev = await newAccount();
+      const { hook } = await createHook(dev, { preset: "unverified" });
+      await deliver(hook.id, { n: 1 });
+      const after = await runInDurableObject(accountObject(dev.accountId), (o: AccountObject, state) => {
+        const sql = state.storage.sql;
+        sql.exec("DROP INDEX IF EXISTS events_route");
+        sql.exec("ALTER TABLE events DROP COLUMN route");
+        sql.exec("ALTER TABLE held_events DROP COLUMN route");
+        sql.exec("UPDATE meta SET value = ? WHERE key = 'schema'", from);
+        (o as unknown as { migrate(): void }).migrate();
+        return {
+          schema: sql.exec<{ value: number }>("SELECT value FROM meta WHERE key = 'schema'").one().value,
+          events: sql.exec("SELECT route FROM events").toArray(),
+          held: sql.exec("SELECT route FROM held_events").toArray(),
+          index: sql.exec("SELECT name FROM sqlite_master WHERE name = 'events_route'").toArray().length,
+        };
+      });
+      expect(after).toEqual({ schema: 6, events: [{ route: null }], held: [], index: 1 });
     });
-    expect(after).toEqual({ schema: 5, events: [{ route: null }], held: [], index: 1 });
-  });
+  }
 });
 
 describe("renaming a device", () => {

@@ -154,6 +154,7 @@ wrangler.deploy.jsonc`), and only then deploy: new code may need the new tables.
 | `0005_phone.sql` | phone links; needs the `PHONE` Durable Object binding, its `v2` migration and `PAIR_IP_LIMIT` |
 | `0006_…` | hook names unique within an account |
 | `0007_…` (when present) | phone hardening |
+| `0008_plans.sql` | plans and entitlements: the account's plan, its end, its workspace and override; hook pauses and `onLimit`; hook creations per day. Existing rows stay on the `default` plan |
 | `0009_hook_delivery.sql` | a hook's one-device delivery (`deliverTo`) and static response |
 
 Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
@@ -168,7 +169,8 @@ All in `wrangler.jsonc`:
   tag `v2`: the phone links' queue and sockets.
 - `DB`: D1. Accounts, devices, hooks with their sealed secrets, enrolments, API keys, the audit, and
   the routing from a hook id to its account.
-- Eight Rate Limiting bindings. The relay answers `503` rather than run without them.
+- Eight Rate Limiting bindings, and an optional ninth. The relay answers `503` rather than run
+  without the eight.
 
   | Binding | `namespace_id` in `wrangler.jsonc` | Limits |
   |---|---|---|
@@ -180,6 +182,7 @@ All in `wrangler.jsonc`:
   | `SIGNUP_IP_LIMIT` | 1006 | account creations per address, per minute |
   | `API_IP_LIMIT` | 1007 | management requests (`/v1/*`) per address, per 10 s, checked before any database read |
   | `PAIR_GLOBAL_LIMIT` | 1008 | phone pairing attempts in all, per minute |
+  | `HOOK_CREATE_IP_LIMIT` | 1009 | hook creations per address, per minute (optional: skipped when it isn't deployed) |
 
   Addresses are counted by IPv4 address or IPv6 /64. Cloudflare counts Rate Limiting per location
   (data centre), and the counts are eventually consistent: a limit "in all" is per location, not
@@ -206,6 +209,36 @@ Variables (`vars`), all optional unless noted:
 | `PHONE_NODE_QUEUE_MAX`, `PHONE_PHONE_QUEUE_MAX`, `PHONE_QUEUE_MAX_BYTES` | 1,000, 500, 16 MiB | how much a phone link's queue may hold (PROTOCOL §10.5) |
 | `PHONE_PUSH_PER_HOUR` | 30 | pushes one phone may be sent in a rolling hour (PROTOCOL §10.7) |
 | `HOSTED_EXTRAS` | unset | extras the operator offers, as JSON, announced as data in `/v1/info` `extras` (PROTOCOL §2). A self-hosted relay leaves it unset |
+| `PLANS` | unset | the plans accounts work under, as JSON (below; PROTOCOL §2a). Unset: one plan, `default`, which is exactly the behaviour of the settings above. Malformed: deliveries get `503` |
+| `PAUSE_AFTER_REFUSALS`, `PAUSE_WINDOW_MINUTES` | 500, 10 | refusals under a plan's rate or daily cap, within the window, that pause a hook for an hour (doubling on repeat, up to a day). `0` never pauses. Without plan limits nothing is refused, so nothing pauses |
+| `ENTITLEMENT_PUBLIC_KEYS` | unset | a JSON array of base64url raw Ed25519 public keys whose entitlements the relay takes (PROTOCOL §2b; several, for rotation). Unset: no entitlements, and `PUT /v1/account/plan` is `404` |
+| `ENTITLEMENT_GRACE_DAYS` | 7 | days an entitled plan keeps working past its `exp` |
+| `ENTITLEMENT_FALLBACK_PLAN` | `suspended` | the plan an account falls back to once its entitlement ran out. `suspended` (built in unless `PLANS` defines it) takes no new deliveries or hooks and keeps the backlog readable |
+| `HOSTED_PLAN` | unset | how to get the operator's hosted plan, as JSON `{ "plan", "title", "description"?, "url"? }` (an `https` URL), announced as data in `/v1/info` and `GET /v1/account`. A self-hosted relay leaves it unset |
+
+### Plans
+
+Every account works under a plan (PROTOCOL §2a). A self-hosted relay needs no configuration: without
+`PLANS` there is one plan, `default`, built from `ACCOUNT_MAX_EVENTS`, `ACCOUNT_MAX_BYTES`,
+`RETENTION_DAYS` and `ACCOUNT_MAX_DEVICES`, with no daily cap and no rates, which is how the relay
+behaved before plans. A relay that offers plans sets `PLANS` to a JSON object mapping a plan's name
+(lowercase letters, digits, `-`, `_`) to its limits: `hooks`, `devices`, `eventsPerDay`,
+`hookRatePerMin`, `hookBurst`, `accountRatePerMin`, `accountBurst`, `retentionHours`,
+`maxBodyBytes`, `backlogEvents`, `backlogBytes`, `hookCreatesPerDay`. A key left out takes the
+`default` plan's value (which `PLANS` may also redefine); `null` is no limit. Put it in
+`wrangler.deploy.jsonc`'s `vars` as a string.
+
+[`docs/plans.example.json`](../docs/plans.example.json) is an example: an `overblast` plan with
+**suggested** values for a hosted relay whose accounts come with the Overblast Plan (50 hooks, 10
+devices, 50,000 deliveries a day, 120 a minute per hook with bursts of 300, 600 a minute per account
+with bursts of 1,200, 7 days' retention, 1 MiB bodies, a backlog of 10,000 events or 256 MiB, 100
+hook creations a day). They are suggestions to measure against, not a contract.
+
+An account's plan is set by an entitlement (PROTOCOL §2b), when the relay pins
+`ENTITLEMENT_PUBLIC_KEYS`, or by the operator in D1 (`accounts.plan`, with `accounts.limits` for a
+per-account override). The limits are counted exactly in the account's Durable Object (token buckets
+and daily counters in its SQLite, no timers), except the hook and device caps and the daily hook
+creations, which are counted in the D1 insert itself.
 
 ### Push
 
@@ -251,6 +284,12 @@ before relying on it.
   The dedupe marks are written in the same Durable Object transaction as the event, so a crash
   can't lose an event that was marked. GitHub's `eventType` (`X-GitHub-Event`) is the sender's
   claim: PROTOCOL §3 lists what each preset signs.
+- **Plans and entitlements**: an entitlement is accepted only with a signature by a pinned key, for
+  this audience, a known plan and its own subject (the signing key at signup, the account on
+  refresh), unexpired; a workspace links to one account (a unique index). Tokens are never stored
+  or logged; the account keeps the plan, its end and the workspace id. A lapsed plan never deletes
+  anything: the backlog stays readable. A paused hook is answered from D1 without waking the
+  account's object, so a flood costs a database read, not a Durable Object request.
 - **Limits**: bodies are checked against the hook's limit (1 MiB by default) from `Content-Length`
   and again while streaming; each client address and each hook is rate limited at the edge, and so
   are signups, management requests and pairing attempts; each account's log has a quota, each hook

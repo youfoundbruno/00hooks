@@ -29,6 +29,10 @@
 //! It is marked as it is handed over (with [`SubscribeOptions::confirm`] too): a crash in between
 //! loses that one warning, never repeats it.
 //!
+//! A `limit` message (one of the plan's limits refusing deliveries) is handed over as
+//! [`StreamEvent::Limit`], also without a seq; the relay sends it again after each `ready` while it
+//! holds, so a consumer shows the newest per scope and hook rather than every one.
+//!
 //! An acknowledgement that fails is kept and retried with backoff while newer events keep flowing
 //! (acks are cumulative, so the next one covers it too). A `hook` message that can't be read is
 //! recorded raw in the store's quarantine and reported, never skipped silently.
@@ -44,7 +48,7 @@ use crate::api::Client;
 use crate::backoff::{Backoff, Clock, CloseAction, Jitter, TokioClock, close_action};
 use crate::sse::{SseItem, SseParser};
 use crate::store::{EventStore, QuarantineKind, Quarantined};
-use crate::types::{Closed, Event, Gap, HookChange, Ready, Resync};
+use crate::types::{Closed, Event, Gap, HookChange, Limit, Ready, Resync};
 use crate::{Error, Result};
 
 /// Tuning for [`subscribe`]. The defaults are the protocol's.
@@ -132,6 +136,10 @@ pub enum StreamEvent {
     /// an event of the log: never recorded, acknowledged or counted in the cursor, and sent at
     /// most once per device, so a consumer that wants to remember it keeps it itself.
     HookChange(HookChange),
+    /// One of the account plan's limits is refusing deliveries (`event: limit`, PROTOCOL §6): a
+    /// notice, at most once an hour per scope and hook and again after each `ready`, never
+    /// recorded or acknowledged.
+    Limit(Limit),
 }
 
 /// What to do once the current batch has been handed over.
@@ -720,6 +728,11 @@ impl Subscription {
                 "hook-change" => match serde_json::from_str::<HookChange>(&ev.data) {
                     Ok(c) => batch.push(StreamEvent::HookChange(c)),
                     Err(e) => batch.push(warn_unreadable("hook-change", ev.id.as_deref(), &e)),
+                },
+                // No `id:` either: a notice, handed over in stream order.
+                "limit" => match serde_json::from_str::<Limit>(&ev.data) {
+                    Ok(l) => batch.push(StreamEvent::Limit(l)),
+                    Err(e) => batch.push(warn_unreadable("limit", ev.id.as_deref(), &e)),
                 },
                 "gap" => match serde_json::from_str::<Gap>(&ev.data) {
                     // Gaps are unsigned: one past what the relay has shown to exist would move the

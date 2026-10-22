@@ -291,7 +291,8 @@ describe("the install", () => {
     const cfgText = w.written[DEPLOY_CONFIG];
     const cfg = parseJsonc(cfgText);
     assert.equal(cfg.d1_databases[0].database_id, DB_ID);
-    assert.deepEqual(cfg.ratelimits.map((r) => r.namespace_id), ["5000001", "5000002", "5000003", "5000004", "5000005", "5000006", "5000007", "5000008"]);
+    // One id per binding the template names, from the chosen base (new bindings get the next ones).
+    assert.deepEqual(cfg.ratelimits.map((r) => r.namespace_id), TEMPLATE.ratelimits.map((_, i) => String(5_000_001 + i)));
     assert.deepEqual(readSetupState(cfgText), { ratelimitBase: 5_000_000, url: "https://00hooks-relay.someone.workers.dev" });
     const printed = w.printed.join("\n");
     assert.match(printed, /00hooks login --relay https:\/\/00hooks-relay\.someone\.workers\.dev/);
@@ -476,7 +477,10 @@ describe("deploy config", () => {
     const next = structuredClone(TEMPLATE);
     next.durable_objects.bindings.push({ name: "NEWTHING", class_name: "NewObject" });
     next.migrations.push({ tag: "v3", new_sqlite_classes: ["NewObject"] });
-    next.ratelimits.push({ name: "NEW_LIMIT", namespace_id: "1009", simple: { limit: 5, period: 60 } });
+    // A binding the template gains later takes the next template id, and its id the next from the base.
+    const newNs = String(1001 + TEMPLATE.ratelimits.length);
+    const newId = String(42_001 + TEMPLATE.ratelimits.length);
+    next.ratelimits.push({ name: "NEW_LIMIT", namespace_id: newNs, simple: { limit: 5, period: 60 } });
     next.vars.NEW_SETTING = "1";
     next.compatibility_date = "2099-01-01";
 
@@ -486,7 +490,7 @@ describe("deploy config", () => {
     assert.equal(c.vars.RETENTION_DAYS, "3");
     assert.equal(c.ratelimits[0].simple.limit, 30);
     assert.deepEqual(c.routes, mine.routes);
-    assert.deepEqual(c.ratelimits.map((r) => r.namespace_id), [...mine.ratelimits.map((r) => r.namespace_id), "42009"]);
+    assert.deepEqual(c.ratelimits.map((r) => r.namespace_id), [...mine.ratelimits.map((r) => r.namespace_id), newId]);
     assert.ok(c.durable_objects.bindings.some((b) => b.name === "NEWTHING"));
     assert.deepEqual(c.migrations.map((m) => m.tag), ["v1", "v2", "v3"]);
     assert.equal(c.vars.NEW_SETTING, "1");
@@ -495,7 +499,7 @@ describe("deploy config", () => {
 
     // Without the state line, the base is read back from the ids.
     const inferred = mergeDeployConfig(next, parseJsonc(text), {});
-    assert.equal(inferred.config.ratelimits.at(-1).namespace_id, "42009");
+    assert.equal(inferred.config.ratelimits.at(-1).namespace_id, newId);
 
     // A base given explicitly re-derives them all.
     const moved = mergeDeployConfig(TEMPLATE, parseJsonc(text), { state: readSetupState(text), ratelimitBase: 9_000 });
