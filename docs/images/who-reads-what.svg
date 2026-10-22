@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420" width="900" height="420" role="img" aria-labelledby="title desc">
+  <title id="title">Who can read what</title>
+  <desc id="desc">The provider sees its own events. Your relay sees metadata, stores only ciphertext, and holds the payload in memory briefly while verifying and sealing; in strict mode the signing secret stays on your devices. Your devices read the full event after unsealing.</desc>
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; fill: #1f2328; }
+    .muted { fill: #59636e; font-size: 13px; }
+    .title { font-size: 16px; font-weight: 600; }
+    .label { font-size: 13px; font-weight: 600; fill: #59636e; letter-spacing: 0.02em; }
+    .blue-text { fill: #0969da; }
+    .green-text { fill: #1a7f37; }
+    .box { fill: rgba(140, 149, 159, 0.08); stroke: #8c959f; stroke-width: 1.5; }
+    .relay { fill: rgba(56, 139, 253, 0.08); stroke: #0969da; stroke-width: 1.75; }
+    .dev { fill: rgba(46, 160, 67, 0.10); stroke: #1a7f37; stroke-width: 1.75; }
+    .line { fill: none; stroke: #59636e; stroke-width: 1.75; }
+    .head { fill: #59636e; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .label { fill: #9198a1; }
+      .blue-text { fill: #4493f8; }
+      .green-text { fill: #3fb950; }
+      .box { fill: rgba(140, 149, 159, 0.10); stroke: #6e7681; }
+      .relay { fill: rgba(56, 139, 253, 0.10); stroke: #4493f8; }
+      .dev { fill: rgba(46, 160, 67, 0.14); stroke: #3fb950; }
+      .line { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="head"/>
+    </marker>
+  </defs>
+
+  <!-- Provider -->
+  <rect x="20" y="20" width="250" height="345" rx="14" class="box"/>
+  <text x="145" y="50" text-anchor="middle" class="title">The provider</text>
+  <text x="145" y="70" text-anchor="middle" class="muted">GitHub, Stripe, Shopify, …</text>
+  <text x="40" y="106" class="label">SEES</text>
+  <text x="40" y="128">its own events, in full</text>
+  <text x="40" y="148" class="muted">(it sent them)</text>
+  <text x="40" y="184" class="label">DOESN'T SEE</text>
+  <text x="40" y="206">other services' events</text>
+  <text x="40" y="228">what your devices do</text>
+  <text x="40" y="248">with them</text>
+
+  <!-- Arrow provider to relay -->
+  <path d="M272,120 H322" class="line" marker-end="url(#arrow)"/>
+  <text x="297" y="110" text-anchor="middle" class="muted">HTTPS</text>
+
+  <!-- Relay -->
+  <rect x="325" y="20" width="250" height="345" rx="14" class="relay"/>
+  <text x="450" y="50" text-anchor="middle" class="title blue-text">Your relay</text>
+  <text x="450" y="70" text-anchor="middle" class="muted">and whoever operates it</text>
+  <text x="345" y="106" class="label">SEES (METADATA)</text>
+  <text x="345" y="128">time, hook, size, event type,</text>
+  <text x="345" y="148">verified or not</text>
+  <text x="345" y="184" class="label">STORES</text>
+  <text x="345" y="206">ciphertext only</text>
+  <text x="345" y="242" class="label">IN MEMORY, BRIEFLY</text>
+  <text x="345" y="264">the payload, while it verifies</text>
+  <text x="345" y="284">and seals it; then forgets it</text>
+  <text x="345" y="320" class="label">STRICT MODE</text>
+  <text x="345" y="342">the secret stays on your devices</text>
+
+  <!-- Arrow relay to devices -->
+  <path d="M577,120 H627" class="line" marker-end="url(#arrow)"/>
+  <text x="602" y="110" text-anchor="middle" class="muted">sealed</text>
+
+  <!-- Devices -->
+  <rect x="630" y="20" width="250" height="345" rx="14" class="dev"/>
+  <text x="755" y="50" text-anchor="middle" class="title green-text">Your devices</text>
+  <text x="755" y="70" text-anchor="middle" class="muted">CLI or 00next</text>
+  <text x="650" y="106" class="label">SEES</text>
+  <text x="650" y="128">the full event (plaintext),</text>
+  <text x="650" y="148">after unsealing it</text>
+  <text x="650" y="184" class="label">HOLDS</text>
+  <text x="650" y="206">the private keys,</text>
+  <text x="650" y="226">in the OS keychain</text>
+  <text x="650" y="262" class="label">CHECKS</text>
+  <text x="650" y="284">the relay's envelope signature;</text>
+  <text x="650" y="304">verifies strict hooks itself</text>
+
+  <text x="450" y="398" text-anchor="middle" class="muted">You run the relay on your own Cloudflare account. There is no hosted one.</text>
+</svg>
