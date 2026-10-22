@@ -154,7 +154,7 @@ wrangler.deploy.jsonc`), and only then deploy: new code may need the new tables.
 | `0005_phone.sql` | phone links; needs the `PHONE` Durable Object binding, its `v2` migration and `PAIR_IP_LIMIT` |
 | `0006_…` | hook names unique within an account |
 | `0007_…` (when present) | phone hardening |
-| `0008_hook_delivery.sql` | a hook's one-device delivery (`deliverTo`) and static response |
+| `0009_hook_delivery.sql` | a hook's one-device delivery (`deliverTo`) and static response |
 
 Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
 
