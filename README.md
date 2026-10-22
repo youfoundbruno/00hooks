@@ -277,16 +277,17 @@ one webhook uses, read from the code and counted in the test runtime:
 | --- | --- | --- |
 | Worker requests (the delivery, the ack) | 2 | 1 |
 | Durable Object requests | 3 | 2 |
-| SQLite rows written | about 36 | about 11 |
+| SQLite rows written | about 18 | about 7 |
 | Worker CPU | about 2 to 5 ms | about 1 ms |
 | Durable Object awake time | about 15 ms (we plan with 0.1 s) | a few ms |
 
 - **The $5 covers about 300,000 webhooks a month** to one device (about 140,000 to three). Durable
   Object requests (1 million included) run out first; rows written (50 million) next, at about
-  1.4 million webhooks.
-- **After that, about $37 per extra million webhooks** to one device, almost all of it rows written
-  ($1 per million). Each extra device adds about $12 per million. For example: 100,000 a month,
-  $5; 1 million, about $5.30; 2 million, about $28; 10 million to 3 devices, about $555.
+  2.8 million webhooks.
+- **Past the allowances, about $19 per extra million webhooks** to one device, most of it rows
+  written ($1 per million). Each extra device adds about $7.60 per million. For example: 100,000 a
+  month, $5; 1 million, about $5.30; 2 million, about $5.75; 5 million, about $47; 10 million to 3
+  devices, about $295.
 - **Idle connections cost fractions of a cent a month.** The Worker writes the heartbeats, and the
   Durable Object answers the Worker's pings without waking, so it sleeps between events and isn't
   billed while it does. Measure yours with [`relay/docs/IDLE-COST.md`](relay/docs/IDLE-COST.md).
