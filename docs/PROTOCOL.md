@@ -255,7 +255,7 @@ characters); both sides compute it.
     can't have one (`400`, `field: "response"`); a due Slack notice (§4a) takes precedence.
 - `POST /v1/hooks/<id>/rotate` (a device, or `hooks:secrets`) → `{ "secret" }`; the previous secret
   keeps working for 24 h. Only for presets whose secret the relay generates; a provider-issued secret (Stripe, Slack,
-  Linear, Shopify, Twilio) is rotated at the provider, and a strict hook's secret is on the devices:
+  Linear, Shopify, Twilio, Meta, Paddle, Zoom, PagerDuty) is rotated at the provider, and a strict hook's secret is on the devices:
   both answer `409` `conflict`.
 - `DELETE /v1/hooks/<id>` (`hooks:write`) → `204`. Events already in the log stay until acknowledged.
 
@@ -302,11 +302,18 @@ scheme with Node's own crypto where they don't).
 | `shopify` | `secret` (required) | provider's | `X-Shopify-Hmac-Sha256: <base64 HMAC-SHA256(body)>` |
 | `meta` | `secret` (required: the app secret), `verifyToken`? (8 to 200 printable characters) | provider's; the verify token is generated when absent | `X-Hub-Signature-256: sha256=<hex HMAC-SHA256(body)>` under the app secret (WhatsApp Cloud API, Messenger, Instagram); answers the GET handshake (§4) |
 | `twilio` | `secret` (required: the auth token) | provider's | `X-Twilio-Signature: <base64 HMAC-SHA1>` over the **public URL the relay was reached at**, then, for a form body, every parameter name and value (names sorted by code point, each name's distinct values sorted); for a JSON body, the URL alone, whose `bodySHA256` query parameter must equal the body's hex SHA-256. Tried with the URL as reached, without its port, and with the scheme's default port, as Twilio's own libraries do |
+| `calendly` | `secret`? (Calendly's webhook signing key) | generated when absent | `Calendly-Webhook-Signature: t=<s>,v1=<hex>`: HMAC-SHA256 of `t.body`; `t` within **180 s** (Calendly's documented tolerance) |
+| `typeform` | `secret`? | generated when absent | `Typeform-Signature: sha256=<base64 HMAC-SHA256(body)>` |
+| `paddle` | `secret` (required: the destination's `pdl_ntfset_…` key) | provider's | Paddle Billing. `Paddle-Signature: ts=<s>;h1=<hex>[;h1=…]` (`;`-separated): HMAC-SHA256 of `ts:body`; any `h1` may match; `ts` within **5 s**, as Paddle's own SDKs check |
+| `twitch` | `secret`? (10 to 100 ASCII characters, Twitch's rule) | generated when absent | Twitch EventSub. `Twitch-Eventsub-Message-Signature: sha256=<hex HMAC-SHA256(message id ‖ timestamp ‖ body)>`, the `Twitch-Eventsub-Message-Timestamp` (RFC 3339) within **600 s**; answers `webhook_callback_verification` (below) |
+| `zoom` | `secret` (required: the app's secret token) | provider's | `x-zm-signature: v0=<hex HMAC-SHA256("v0:" ts ":" body)>`, `ts` from `x-zm-request-timestamp`. Zoom documents no window, and doesn't say whether its retries (up to 85 minutes later) are signed afresh, so the timestamp is signed but not checked; answers `endpoint.url_validation` (below). Can't be strict |
+| `pagerduty` | `secret` (required) | provider's | PagerDuty v3. `X-PagerDuty-Signature: v1=<hex HMAC-SHA256(body)>[,v1=…]`; any `v1` may match |
 | `hmac` | `header` (required), `algorithm` (`sha256` default, or `sha1`), `encoding` (`hex` default, or `base64`), `prefix`?, `secret`? | generated when absent | HMAC of the raw body |
 | `token` | `header` (default `Authorization`), `secret`? | generated when absent | constant-time compare with `Bearer <secret>` (or the raw value for other headers); medium strength; **no dedupe** |
 | `unverified` | — | — | accepts anything; events carry `verified: false`; **no dedupe** |
 
-Every preset except `unverified` and `token` also takes `"strict": true` (below). A strict `token`
+Every preset except `unverified`, `token` and `zoom` (its endpoint check needs the secret, below)
+also takes `"strict": true` (below). A strict `token`
 hook would prove nothing on the device (the token reaches the relay in the clear and signs no
 content), so the relay refuses it (`400`, `field: "verify.strict"`), as it refuses a strict
 `unverified` one, and a device refuses to verify one. A `secret` is 8 to 512
@@ -315,8 +322,8 @@ characters; the relay refuses to create a hook of a provider-issued preset witho
 
 What each preset's signature covers, what the relay uses besides, and its replay marks (a delivery is
 a duplicate when **any** mark was seen in the last 7 days; for the presets that sign no timestamp,
-`github`, `shopify`, `twilio`, `meta` and `hmac`, the body-hash mark is kept `REPLAY_MARK_DAYS`, 180
-days by default):
+`github`, `shopify`, `twilio`, `meta`, `typeform`, `zoom`, `pagerduty` and `hmac`, the body-hash
+mark is kept `REPLAY_MARK_DAYS`, 180 days by default):
 
 | `preset` | signed | used but **not** signed (the sender's claim) | replay marks | `eventType` |
 |---|---|---|---|---|
@@ -329,6 +336,12 @@ days by default):
 | `shopify` | the body | `X-Shopify-Webhook-Id`, `X-Shopify-Topic` | the webhook id, the body's hash | `X-Shopify-Topic` (claimed) |
 | `twilio` | the URL and the form parameters (or the URL, with the JSON body's hash in it) | `I-Twilio-Idempotency-Token` | the token, the body's hash | none |
 | `meta` | the body | — | the body's hash (Meta sends no delivery id, and retries the same body) | the body's `object` (signed): `whatsapp_business_account`, `page`, `instagram` |
+| `calendly` | `t`, the body (with its `event`) | — | the body's hash (no event id in the body) | the body's `event` (signed): `invitee.created`… |
+| `typeform` | the body (with `event_id` and `event_type`) | — | the body's `event_id`, the body's hash | the body's `event_type` (signed) |
+| `paddle` | `ts`, the body (with `event_id` and `event_type`) | — | the body's `event_id`, the body's hash | the body's `event_type` (signed) |
+| `twitch` | the message id, the timestamp, the body | `Twitch-Eventsub-Message-Type`, `-Retry`, `-Subscription-Type` and `-Version` (kept, not used) | the message id (a resend keeps it) | the body's `subscription.type` (signed) |
+| `zoom` | the timestamp, the body (with its `event`) | — | the body's hash | the body's `event` (signed) |
+| `pagerduty` | the body (with `event.id` and `event.event_type`) | `X-Webhook-Id`, `X-Webhook-Subscription` (kept, not used) | the body's `event.id`, the body's hash | the body's `event.event_type` (signed) |
 | `hmac` | the body | — | the body's hash | none |
 | `token` | nothing (the token proves the sender knows the secret; the body has no integrity) | — | none | none |
 | `unverified` | nothing | — | none | none |
@@ -336,8 +349,9 @@ days by default):
 Where the id a provider sends is **not** signed (GitHub, Linear, Shopify, Twilio), someone who
 captured one delivery could resend it under a new id; the body-hash mark answers that as a duplicate.
 The cost: two genuinely different deliveries with byte-identical bodies within 7 days are stored
-once. GitHub, Shopify, Twilio, Meta and the generic `hmac` preset sign no timestamp, so for them
-these marks are the only replay defence: a captured genuine delivery (GitHub shows recent ones, body
+once. GitHub, Shopify, Twilio, Meta, Typeform, PagerDuty and the generic `hmac` preset sign no
+timestamp (Zoom signs one the relay doesn't check), so for them these marks are the only replay
+defence: a captured genuine delivery (GitHub shows recent ones, body
 and signature, to a repository's admins) verifies forever. That is why their body-hash mark is kept
 for `REPLAY_MARK_DAYS` rather than a week. Past it, a replay is accepted as a new event with a new
 `evt_` id, so a client that acts on events should also dedupe by the content's hash, kept at least
@@ -349,6 +363,22 @@ id and the mark), never the ids themselves: an event id read from a body is cont
 `[A-Za-z0-9._~-]`, or it is treated as an ordinary event) **after** the signature verifies, and it is
 not stored: it carries no event. GitHub's `ping` (sent when a webhook is created) is verified, deduped
 and stored as a normal event with `eventType: "ping"`, so a new hook can be tested end to end.
+
+**Twitch's endpoint check.** A `twitch` delivery with `Twitch-Eventsub-Message-Type:
+webhook_callback_verification` whose body carries a `challenge` (at most 200 characters of
+`[A-Za-z0-9._~-]`, or it is treated as an ordinary event) is answered `200` `text/plain` with the
+challenge **after** the signature and timestamp verify, and it is not stored. A `revocation`
+(Twitch telling you why it ended a subscription) is verified and stored like any event; its type
+header is kept with it.
+
+**Zoom's endpoint check.** A `zoom` delivery whose body is `{"event":"endpoint.url_validation",
+"payload":{"plainToken":…}}` is answered `200` `application/json` with `{"plainToken",
+"encryptedToken"}`, the token's hex HMAC-SHA256 under the secret that verified the delivery, **after**
+the signature verifies; it is not stored. The token is read only from a body Zoom signed, so nobody
+else can make the relay compute it, and it must be at most 200 characters of `[A-Za-z0-9_-]`: with
+no `:` in it, the answer can never be a signature over a `v0:…` delivery. The answer needs the
+secret, so a strict `zoom` hook is refused (`400`, `field: "verify.strict"`): Zoom re-checks the
+endpoint every 72 hours and would switch the webhook off.
 
 **Meta's endpoint check.** Before Meta sends anything to a callback URL it asks
 `GET /h/<hookId>?hub.mode=subscribe&hub.verify_token=…&hub.challenge=…`. A `meta` hook keeps its
@@ -373,8 +403,8 @@ body together with the signature headers and the URL, and each device verifies t
 signature itself:
 
 - **At the edge**: size and rate as always; the preset's signature header must be present and well
-  formed; a timestamp the provider puts in a **header** (Stripe's `t`, Slack's, Standard Webhooks')
-  must be within its window. The body is never parsed. Replay marks are the **body hash only**:
+  formed; a timestamp the provider puts in a **header** (Stripe's `t`, Slack's, Standard Webhooks',
+  Calendly's `t`, Paddle's `ts`, Twitch's) must be within its window. The body is never parsed. Replay marks are the **body hash only**:
   an unverified sender must not be able to burn an id a genuine delivery will need later, and a
   forger can't predict a future genuine body. Events are stored `verified: false`, `strict: true`,
   with `eventType` only from a header (GitHub, Shopify) and otherwise null.
