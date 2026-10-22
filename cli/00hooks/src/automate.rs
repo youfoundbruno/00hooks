@@ -838,15 +838,18 @@ mod tests {
                         detail: None,
                         output: None,
                     }],
+                    batch: None,
                 },
                 AutomationRun {
                     name: "B".into(),
                     trigger: "kind".into(),
                     skipped: Some("only_if is false".into()),
                     actions: vec![],
+                    batch: None,
                 },
             ],
             held: None,
+            batch: None,
         };
         let lines = describe_run(&r);
         assert_eq!(

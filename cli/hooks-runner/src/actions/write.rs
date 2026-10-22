@@ -65,6 +65,30 @@ pub fn append(path: &Path, line: &Value) -> Outcome {
     Ok(format!("appended a line to {}", path.display()))
 }
 
+/// Append several JSON lines to `path` at once (a batch's events), in one write.
+pub fn append_lines(path: &Path, lines: &[Value]) -> Outcome {
+    if let Some(dir) = path.parent() {
+        ensure_dir(dir)
+            .map_err(|e| Failure::fatal(format!("couldn't create {}: {e}", dir.display())))?;
+    }
+    let mut bytes = Vec::new();
+    for line in lines {
+        serde_json::to_writer(&mut bytes, line).expect("json");
+        bytes.push(b'\n');
+    }
+    let mut f = open_append(path)
+        .map_err(|e| Failure::fatal(format!("couldn't open {}: {e}", path.display())))?;
+    f.write_all(&bytes)
+        .and_then(|_| f.sync_data())
+        .map_err(|e| Failure::fatal(format!("couldn't append to {}: {e}", path.display())))?;
+    Ok(format!(
+        "appended {} line{} to {}",
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" },
+        path.display()
+    ))
+}
+
 /// Write `content` (text as it is, anything else as JSON) to `folder/<safe name>`, atomically.
 pub fn write_file(folder: &Path, name: &str, content: &Value) -> Outcome {
     let Some(name) = safe_name(name) else {
