@@ -1,8 +1,7 @@
-// How a hook's deliveries are answered and to whom they go (PROTOCOL §3): a static response the
-// relay sends the provider instead of `{"received": …}`, and the one device that alone receives
-// the hook's events. Both are set with `PATCH /v1/hooks/<id>` and kept in the hook's D1 row.
+// How a hook's deliveries are answered (PROTOCOL §3): a static response the relay sends the
+// provider instead of `{"received": …}`, set with `PATCH /v1/hooks/<id>` and kept in the hook's D1
+// row. To whom they go is src/recipients.ts.
 
-import { isId } from "./encoding.ts";
 import { HttpError, invalid, json } from "./http.ts";
 import { SPECS, type Preset } from "./presets.ts";
 
@@ -92,20 +91,4 @@ export function deliveryAnswer(stored: string | null | undefined, fallback: Reco
       "Content-Security-Policy": "default-src 'none'; sandbox",
     },
   });
-}
-
-/**
- * Validates `deliverTo` from a PATCH: an active node device of the account with a sealing key (a
- * device without one could read nothing sealed to it), or null for every device.
- */
-export async function parseDeliverTo(env: Env, accountId: string, raw: unknown): Promise<string | null> {
-  if (raw === null) return null;
-  if (typeof raw !== "string" || !isId("dev", raw)) field("deliverTo", "deliverTo must be a device id, or null for every device.");
-  const row = await env.DB.prepare(
-    "SELECT id FROM devices WHERE id = ? AND account_id = ? AND kind = 'device' AND revoked_at IS NULL AND seal_key IS NOT NULL",
-  )
-    .bind(raw, accountId)
-    .first<{ id: string }>();
-  if (!row) field("deliverTo", "deliverTo must be an active device of this account that has a sealing key.");
-  return row.id;
 }

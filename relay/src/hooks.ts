@@ -17,7 +17,8 @@ import {
 } from "./presets.ts";
 import { openSecret, pepperedHash, sealSecret } from "./seal.ts";
 import { parseScreen, type EdgeScreen } from "./screen.ts";
-import { parseDeliverTo, parseStaticResponse, staticResponseOf } from "./hook-delivery.ts";
+import { parseStaticResponse, staticResponseOf } from "./hook-delivery.ts";
+import { auditName, deliverToOf, parseTarget, recipientsOf, syncRecipients } from "./recipients.ts";
 import { resolvePlan, secondsToMidnight, type AccountPlanColumns, type ResolvedPlan } from "./plans.ts";
 import { utcDay } from "./account-object.ts";
 
@@ -64,8 +65,12 @@ export interface HookRow {
   offline_notice: string | null;
   /** The screen's rules, as JSON (PROTOCOL §4b), or null. */
   screen?: string | null;
-  /** The one device the hook's events go to (PROTOCOL §3), or null for every device. */
+  /** The one device of a one-device target, kept in step with `recipients` (PROTOCOL §3). */
   deliver_to?: string | null;
+  /** The hook's target as JSON, `{ devices, tags }` (src/recipients.ts), or null for every device. */
+  recipients?: string | null;
+  /** `no_recipient` while the target matches no device that can be sealed to; otherwise null. */
+  paused_reason?: string | null;
   /** The static answer for the provider, as JSON (src/hook-delivery.ts), or null. */
   static_response?: string | null;
   /** Paused after a flood of refusals until then (PROTOCOL §4), or null. */
@@ -113,10 +118,12 @@ export function hookJson(row: HookRow, origin: string) {
     lastEventAt: row.last_event_at,
     offlineNotice: offlineNoticeOf(row),
     screenRules: screenOf(row)?.rules.length ?? 0,
-    deliverTo: row.deliver_to ?? null,
+    deliverTo: deliverToOf(recipientsOf(row)),
+    recipients: recipientsOf(row),
     response: staticResponseOf(row.static_response),
     onLimit: row.on_limit === "accept_and_drop" ? "accept_and_drop" : "refuse",
     pausedUntil: row.paused_until !== null && row.paused_until > Date.now() ? row.paused_until : null,
+    pausedReason: row.paused_reason === "no_recipient" ? "no_recipient" : row.paused_until !== null && row.paused_until > Date.now() ? "refusals" : null,
   };
 }
 
@@ -286,7 +293,10 @@ export async function patchHook(env: Env, caller: Principal, origin: string, id:
     notice = parsed ? JSON.stringify(parsed) : null;
   }
   // Who receives the hook's events, and what the provider is answered (src/hook-delivery.ts).
-  const deliverTo = input.deliverTo === undefined ? (row.deliver_to ?? null) : await parseDeliverTo(env, caller.accountId, input.deliverTo);
+  const before = recipientsOf(row);
+  const parsed = await parseTarget(env, caller.accountId, input);
+  const target = parsed === undefined ? before : parsed;
+  const targetChanged = parsed !== undefined && JSON.stringify(parsed) !== JSON.stringify(before);
   let response = row.static_response ?? null;
   if (input.response !== undefined) {
     const parsed = parseStaticResponse(input.response, (JSON.parse(row.verify) as VerifyConfig).preset);
@@ -294,15 +304,17 @@ export async function patchHook(env: Env, caller: Principal, origin: string, id:
   }
   if (name !== row.name) await assertNameFree(env, caller.accountId, name, id);
   await env.DB.prepare(
-    "UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ?, deliver_to = ?, static_response = ?, on_limit = ?, paused_until = CASE WHEN ? THEN NULL ELSE paused_until END WHERE id = ?",
+    "UPDATE hooks SET name = ?, enabled = ?, max_body_bytes = ?, offline_notice = ?, recipients = ?, deliver_to = ?, static_response = ?, on_limit = ?, paused_until = CASE WHEN ? THEN NULL ELSE paused_until END WHERE id = ?",
   )
-    .bind(name, enabled, maxBodyBytes, notice, deliverTo, response, onLimit, unpause ? 1 : 0, id)
+    .bind(name, enabled, maxBodyBytes, notice, target === null ? null : JSON.stringify(target), deliverToOf(target), response, onLimit, unpause ? 1 : 0, id)
     .run()
     .catch(uniqueName);
-  if (deliverTo !== (row.deliver_to ?? null)) {
-    // Who reads a hook's events is worth a line in the audit: the name is the device, or `*` for all.
-    await accountStub(env, caller.accountId).audit({ kind: "hook.delivery", actor: caller.actor, subject: id, name: deliverTo ?? "*" });
+  if (targetChanged) {
+    // Who reads a hook's events is worth a line in the audit: the devices and `#tags`, or `*` for all.
+    await accountStub(env, caller.accountId).audit({ kind: "hook.delivery", actor: caller.actor, subject: id, name: auditName(target) });
   }
+  // A new target applies to new events, and pauses or resumes the hook by whether it matches anyone.
+  if (parsed !== undefined) await syncRecipients(env, caller.accountId, caller.actor, id);
   if (unpause) await accountStub(env, caller.accountId).hookUnpaused(id, caller.actor);
   if (name !== row.name) {
     await accountStub(env, caller.accountId).hookChanged({ kind: "hook.renamed", hookId: id, name, previousName: row.name, actor: caller.actor });
@@ -320,6 +332,8 @@ export async function unpauseHook(env: Env, caller: Principal, origin: string, i
     await env.DB.prepare("UPDATE hooks SET paused_until = NULL WHERE id = ?").bind(id).run();
     await accountStub(env, caller.accountId).hookUnpaused(id, caller.actor);
   }
+  // A pause for want of a recipient lifts only when one matches: checked again now.
+  if (row.paused_reason === "no_recipient") await syncRecipients(env, caller.accountId, caller.actor, id);
   return json(hookJson(await load(env, caller, id), origin));
 }
 
