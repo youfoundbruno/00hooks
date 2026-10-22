@@ -25,6 +25,15 @@
 //!           body: { number: "{{payload.issue.number}}" }
 //!       - run: { command: /usr/bin/say, args: ["New issue {{payload.issue.number}}"] }
 //!       - write: { append: ~/hooks/issues.jsonl }
+//!   - name: Sensor readings
+//!     when: { hook: sensors, kinds: any }
+//!     batch:                  # hold matching events; run the actions once for all of them
+//!       idle: 2m              # once no new event has come for 2 minutes…
+//!       max_wait: 10m         # …or 10 minutes after the batch's first event, whichever is first
+//!       max_events: 500       # …or once this many are held (default 1000)
+//!     allow_commands: [/usr/local/bin/process-readings]
+//!     then:
+//!       - run: { command: process-readings }   # every held event, as JSON lines on stdin
 //! ```
 //!
 //! A hook may be named by id or by name, but events are matched **by id only**: a name is an alias
@@ -57,6 +66,19 @@ const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 const MAX_RETRIES: u32 = 10;
+
+/// The shortest `idle` or `max_wait` a batch may have.
+pub const BATCH_MIN_WAIT: Duration = Duration::from_secs(5);
+/// The longest `idle` or `max_wait` a batch may have: held events are payloads on disk, kept no
+/// longer than a day before they run.
+pub const BATCH_MAX_WAIT: Duration = Duration::from_secs(86_400);
+/// `max_events` when it isn't given.
+pub const DEFAULT_BATCH_EVENTS: u32 = 1000;
+/// The most `max_events` may be.
+pub const MAX_BATCH_EVENTS: u32 = 10_000;
+/// The most a batch holds on disk, in bytes (its events as JSON lines). Reaching it cuts the batch
+/// (reason `max_bytes`), so a flood can't fill the disk; it isn't configurable.
+pub const MAX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 /// One problem in the file.
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +206,17 @@ pub struct Action {
     pub line: usize,
 }
 
+/// `batch:`: matching events are held on disk and the actions run once for all of them, when the
+/// batch is cut: `idle` after its last event, `max_wait` after its first, or at `max_events` (or
+/// [`MAX_BATCH_BYTES`]), whichever comes first. At least one of `idle` and `max_wait` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Batch {
+    pub idle: Option<Duration>,
+    pub max_wait: Option<Duration>,
+    pub max_events: u32,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Automation {
     pub name: String,
@@ -199,6 +232,8 @@ pub struct Automation {
     pub allow_hosts: Vec<String>,
     pub allow_commands: Vec<PathBuf>,
     pub actions: Vec<Action>,
+    /// `batch:`; `None` runs the actions once per event.
+    pub batch: Option<Batch>,
 }
 
 #[derive(Debug, Clone)]
@@ -634,6 +669,7 @@ const AUTOMATION_KEYS: &[&str] = &[
     "pause_for",
     "allow_hosts",
     "allow_commands",
+    "batch",
     "then",
 ];
 
@@ -730,11 +766,15 @@ fn parse_automation(node: &Node, cx: &mut Ctx) -> Option<Automation> {
             .collect(),
         None => Vec::new(),
     };
+    let batch = f.get("batch").and_then(|n| parse_batch(n, &name, cx));
+    let batched = batch.is_some();
     let mut actions = Vec::new();
     match f.get("then") {
         Some(t) => {
             for item in list(t, &what("then"), cx).unwrap_or_default() {
-                if let Some(a) = parse_action(item, &name, &allow_hosts, &allow_commands, cx) {
+                if let Some(a) =
+                    parse_action(item, &name, &allow_hosts, &allow_commands, batched, cx)
+                {
                     actions.push(a);
                 }
             }
@@ -749,7 +789,7 @@ fn parse_automation(node: &Node, cx: &mut Ctx) -> Option<Automation> {
     if cx.problems.len() > before {
         return None;
     }
-    Some(Automation {
+    let auto = Automation {
         name,
         line,
         enabled,
@@ -763,7 +803,131 @@ fn parse_automation(node: &Node, cx: &mut Ctx) -> Option<Automation> {
         allow_hosts,
         allow_commands,
         actions,
+        batch,
+    };
+    if !batched {
+        // `{{batch.count}}` or `{{events}}` would always be empty here: say so now.
+        for (line, path) in field_refs(&auto) {
+            if crate::path::is_batch_root(path.root()) {
+                cx.err(
+                    line,
+                    format!(
+                        "{:?}: `{path}` is only set for an automation with `batch:` (the \
+                         held events run together)",
+                        auto.name
+                    ),
+                );
+            }
+        }
+        if cx.problems.len() > before {
+            return None;
+        }
+    }
+    Some(auto)
+}
+
+/// `batch: { idle: 2m, max_wait: 10m, max_events: 500 }`.
+fn parse_batch(node: &Node, name: &str, cx: &mut Ctx) -> Option<Batch> {
+    let what = format!("{name:?}: batch");
+    let before = cx.problems.len();
+    let mut f = Fields::of(node, &what, cx)?;
+    let wait = |key: &str, n: &Node, cx: &mut Ctx| -> Option<Duration> {
+        let s = string(n, &format!("{what}: {key}"), cx)?;
+        match parse_duration(&s) {
+            Some(d) if (BATCH_MIN_WAIT..=BATCH_MAX_WAIT).contains(&d) => Some(d),
+            Some(_) => {
+                cx.err(
+                    n.line,
+                    format!(
+                        "{what}: {key} must be from {} to {} (not {s:?})",
+                        describe_duration(BATCH_MIN_WAIT),
+                        describe_duration(BATCH_MAX_WAIT)
+                    ),
+                );
+                None
+            }
+            None => {
+                cx.err(
+                    n.line,
+                    format!("{what}: {key}: write a duration such as 30s, 2m or 1h (not {s:?})"),
+                );
+                None
+            }
+        }
+    };
+    let idle = f.get("idle").and_then(|n| wait("idle", n, cx));
+    let max_wait = f.get("max_wait").and_then(|n| wait("max_wait", n, cx));
+    let max_events = match f.get("max_events") {
+        Some(n) => match string(n, &format!("{what}: max_events"), cx)?.parse::<u32>() {
+            Ok(v) if (2..=MAX_BATCH_EVENTS).contains(&v) => v,
+            _ => {
+                cx.err(
+                    n.line,
+                    format!(
+                        "{what}: max_events should be a whole number from 2 to {MAX_BATCH_EVENTS}"
+                    ),
+                );
+                DEFAULT_BATCH_EVENTS
+            }
+        },
+        None => DEFAULT_BATCH_EVENTS,
+    };
+    let has_idle = f.entries.iter().any(|e| e.0 == "idle");
+    let has_max_wait = f.entries.iter().any(|e| e.0 == "max_wait");
+    let line = f.line;
+    f.finish(&["idle", "max_wait", "max_events"], &what, cx);
+    if !has_idle && !has_max_wait {
+        cx.err(
+            line,
+            format!(
+                "{what} needs `idle`, `max_wait` or both: say when the held events run (idle: \
+                 once no new event has come for that long; max_wait: at most that long after the \
+                 batch's first event)"
+            ),
+        );
+    }
+    if let (Some(i), Some(m)) = (idle, max_wait)
+        && m < i
+    {
+        cx.err(
+            line,
+            format!(
+                "{what}: max_wait ({}) is shorter than idle ({}), so idle would never cut the \
+                 batch; make max_wait at least as long as idle, or leave idle out",
+                describe_duration(m),
+                describe_duration(i)
+            ),
+        );
+    }
+    if cx.problems.len() > before {
+        return None;
+    }
+    Some(Batch {
+        idle,
+        max_wait,
+        max_events,
+        line,
     })
+}
+
+/// `90s`, `2m`, `1h30m`: a duration for messages.
+pub fn describe_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s == 0 {
+        return format!("{}ms", d.as_millis());
+    }
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if sec > 0 || out.is_empty() {
+        out.push_str(&format!("{sec}s"));
+    }
+    out
 }
 
 fn parse_when(node: &Node, name: &str, cx: &mut Ctx) -> Option<When> {
@@ -877,6 +1041,7 @@ fn parse_action(
     name: &str,
     hosts: &[String],
     commands: &[PathBuf],
+    batched: bool,
     cx: &mut Ctx,
 ) -> Option<Action> {
     let Kind::Map(entries) = &node.kind else {
@@ -903,9 +1068,9 @@ fn parse_action(
             retries: 2,
             line,
         }),
-        "call" => parse_call(body, &what, hosts, cx),
+        "call" => parse_call(body, &what, hosts, batched, cx),
         "run" => parse_run(body, &what, commands, cx),
-        "write" => parse_write(body, &what, cx),
+        "write" => parse_write(body, &what, batched, cx),
         other => {
             let hint = closest(other, ACTIONS)
                 .map(|s| format!("; did you mean `{s}`?"))
@@ -996,7 +1161,13 @@ fn check_url(raw: &str, hosts: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_call(node: &Node, what: &str, hosts: &[String], cx: &mut Ctx) -> Option<Action> {
+fn parse_call(
+    node: &Node,
+    what: &str,
+    hosts: &[String],
+    batched: bool,
+    cx: &mut Ctx,
+) -> Option<Action> {
     let mut f = Fields::of(node, what, cx)?;
     let url = f.get("url").and_then(|n| {
         let raw = string(n, &format!("{what}: url"), cx)?;
@@ -1061,6 +1232,8 @@ fn parse_call(node: &Node, what: &str, hosts: &[String], cx: &mut Ctx) -> Option
         .and_then(|n| json_template(n, &format!("{what}: body"), cx));
     let idempotency_key = match f.get("idempotency_key") {
         Some(n) => template(n, &format!("{what}: idempotency_key"), Scope::Event, cx),
+        // A batch's run is one call: the batch's id keys it.
+        None if batched => Template::parse("{{batch.id}}", Scope::Event).ok(),
         None => Template::parse("{{event.id}}", Scope::Event).ok(),
     };
     let timeout = f
@@ -1108,8 +1281,9 @@ fn env_name_ok(n: &str) -> Result<(), String> {
     let upper = n.to_ascii_uppercase();
     if matches!(
         upper.as_str(),
-        "PATH" | "HOME" | "LANG" | "HOOKS_EVENT_FILE"
-    ) || upper.starts_with("LD_")
+        "PATH" | "HOME" | "LANG" | "HOOKS_EVENT_FILE" | "HOOKS_EVENTS_FILE"
+    ) || upper.starts_with("HOOKS_BATCH_")
+        || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
     {
         return Err(format!(
@@ -1274,9 +1448,10 @@ fn parse_run(node: &Node, what: &str, commands: &[PathBuf], cx: &mut Ctx) -> Opt
     })
 }
 
-fn parse_write(node: &Node, what: &str, cx: &mut Ctx) -> Option<Action> {
+fn parse_write(node: &Node, what: &str, batched: bool, cx: &mut Ctx) -> Option<Action> {
     let mut f = Fields::of(node, what, cx)?;
-    let default_content = || {
+    // An appended line is written once per event, batched or not.
+    let default_line = || {
         JsonTemplate::parse(&serde_json::json!({
             "event": "{{event}}",
             "headers": "{{headers}}",
@@ -1284,13 +1459,25 @@ fn parse_write(node: &Node, what: &str, cx: &mut Ctx) -> Option<Action> {
         }))
         .expect("constant")
     };
+    // A file per run: a batch's holds the batch and all its events.
+    let default_content = || {
+        if batched {
+            JsonTemplate::parse(&serde_json::json!({
+                "batch": "{{batch}}",
+                "events": "{{events}}"
+            }))
+            .expect("constant")
+        } else {
+            default_line()
+        }
+    };
     let retries_node = f.get("retries");
     let (kind, retries) = match (f.get("append"), f.get("folder")) {
         (Some(a), None) => {
             let path = local_path(a, &format!("{what}: append"), cx);
             let line = match f.get("line") {
                 Some(n) => json_template(n, &format!("{what}: line"), cx),
-                None => Some(default_content()),
+                None => Some(default_line()),
             };
             if let Some(r) = retries_node {
                 cx.err(
@@ -1313,6 +1500,7 @@ fn parse_write(node: &Node, what: &str, cx: &mut Ctx) -> Option<Action> {
             let folder = local_path(d, &format!("{what}: folder"), cx);
             let name = match f.get("name") {
                 Some(n) => template(n, &format!("{what}: name"), Scope::Event, cx),
+                None if batched => Template::parse("{{batch.id}}.json", Scope::Event).ok(),
                 None => Template::parse("{{event.id}}.json", Scope::Event).ok(),
             };
             let content = match f.get("content") {
@@ -1686,6 +1874,104 @@ automations:
         assert!(host_allowed("::1", &["[::1]".into()]));
     }
 
+    fn batch_yaml(batch: &str) -> String {
+        format!(
+            "automations:\n  - name: b\n    when: {{ hook: gh, kinds: any }}\n    batch: {batch}\n    allow_commands: [/bin/cat]\n    then:\n      - run: {{ command: cat }}\n"
+        )
+    }
+
+    #[test]
+    fn a_batch_needs_a_time_and_sane_values() {
+        let a = p(&batch_yaml("{ idle: 2m, max_wait: 10m, max_events: 500 }")).unwrap();
+        assert_eq!(
+            a.automations[0].batch,
+            Some(Batch {
+                idle: Some(Duration::from_secs(120)),
+                max_wait: Some(Duration::from_secs(600)),
+                max_events: 500,
+                line: 4,
+            })
+        );
+        let a = p(&batch_yaml("{ idle: 30s }")).unwrap();
+        let b = a.automations[0].batch.unwrap();
+        assert_eq!((b.max_wait, b.max_events), (None, DEFAULT_BATCH_EVENTS));
+        let a = p(&batch_yaml("{ max_wait: 1h }")).unwrap();
+        assert_eq!(a.automations[0].batch.unwrap().idle, None);
+        assert!(p(GOOD).unwrap().automations[0].batch.is_none(), "optional");
+
+        for (batch, want) in [
+            ("{ max_events: 10 }", "needs `idle`, `max_wait` or both"),
+            ("{}", "needs `idle`, `max_wait` or both"),
+            ("{ idle: 1s }", "idle must be from 5s to 24h"),
+            ("{ idle: 0s }", "idle must be from 5s to 24h"),
+            ("{ max_wait: 2d }", "write a duration"),
+            ("{ max_wait: 25h }", "max_wait must be from 5s to 24h"),
+            (
+                "{ idle: 5m, max_wait: 2m }",
+                "max_wait (2m) is shorter than idle (5m)",
+            ),
+            ("{ idle: 1m, max_events: 1 }", "from 2 to 10000"),
+            ("{ idle: 1m, max_events: 20000 }", "from 2 to 10000"),
+            ("{ idle: 1m, max_events: lots }", "from 2 to 10000"),
+            ("{ idel: 1m }", "did you mean `idle`"),
+            ("2m", "should be a mapping"),
+        ] {
+            let e = errs(&batch_yaml(batch));
+            assert!(e.iter().any(|m| m.contains(want)), "{batch}: {e:?}");
+            assert!(e.iter().all(|m| m.starts_with("line 4:")), "{batch}: {e:?}");
+        }
+        // Equal is fine: both cut at the same time.
+        assert!(p(&batch_yaml("{ idle: 2m, max_wait: 2m }")).is_ok());
+    }
+
+    #[test]
+    fn batch_fields_belong_to_batched_automations() {
+        let e = errs(
+            "automations:\n  - name: x\n    when: { kinds: [a] }\n    then:\n      - notify: \"{{batch.count}} events\"\n",
+        );
+        assert!(
+            e[0].starts_with("line 5:")
+                && e[0].contains("only set for an automation with `batch:`"),
+            "{e:?}"
+        );
+        let e = errs(
+            "automations:\n  - name: x\n    when: { kinds: [a] }\n    batch: { idle: 1m }\n    only_if: batch.count > 1\n    then: [{notify: x}]\n",
+        );
+        assert!(e[0].contains("before it joins a batch"), "{e:?}");
+        let a = p(
+            "automations:\n  - name: x\n    when: { kinds: [a] }\n    batch: { idle: 1m }\n    allow_hosts: [a.example]\n    then:\n      - notify: \"{{batch.count}} events ({{batch.reason}}), first {{batch.first}}: {{events | json | truncate:200}}\"\n      - call: { url: \"https://a.example/x\" }\n      - write: { folder: /tmp/out }\n",
+        )
+        .unwrap();
+        let acts = &a.automations[0].actions;
+        match (&acts[1].kind, &acts[2].kind) {
+            (
+                ActionKind::Call {
+                    idempotency_key, ..
+                },
+                ActionKind::WriteFile { name, content, .. },
+            ) => {
+                let ctx = serde_json::json!({"batch": {"id": "bat_1"}, "events": [1, 2]});
+                assert_eq!(
+                    idempotency_key.render(&ctx),
+                    "bat_1",
+                    "a batch keys its call"
+                );
+                assert_eq!(name.render(&ctx), "bat_1.json");
+                assert_eq!(
+                    content.render(&ctx),
+                    serde_json::json!({"batch": {"id": "bat_1"}, "events": [1, 2]})
+                );
+            }
+            _ => panic!(),
+        }
+        let e = errs(&batch_yaml("{ idle: 1m }\n    env_check: x"));
+        assert!(!e.is_empty());
+        let e = errs(
+            "automations:\n  - name: x\n    when: { kinds: [a] }\n    batch: { idle: 1m }\n    allow_commands: [/bin/cat]\n    then:\n      - run: { command: cat, env: { HOOKS_BATCH_COUNT: x, HOOKS_EVENTS_FILE: y } }\n",
+        );
+        assert_eq!(e.len(), 2, "{e:?}");
+    }
+
     #[test]
     fn the_readme_example_is_valid() {
         // The README's first example (a first hook) and its full one (the Automations section).
@@ -1703,6 +1989,23 @@ automations:
         let full = p(block(2)).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(full.automations.len(), 1);
         assert_eq!(full.automations[0].actions.len(), 4);
+        // The batch example, as written under `automations:`.
+        let batch = readme
+            .split("```yaml\n")
+            .find(|b| b.contains("batch:"))
+            .and_then(|s| s.split("```").next())
+            .expect("the README has a batch example");
+        let indented: String = batch.lines().map(|l| format!("  {l}\n")).collect();
+        let b = p(&format!("automations:\n{indented}")).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(
+            b.automations[0].batch,
+            Some(Batch {
+                idle: Some(Duration::from_secs(120)),
+                max_wait: Some(Duration::from_secs(600)),
+                max_events: 500,
+                line: 5,
+            })
+        );
     }
 
     #[test]

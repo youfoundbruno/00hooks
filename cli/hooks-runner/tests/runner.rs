@@ -517,6 +517,7 @@ async fn a_dropped_run_kills_what_it_started() {
         env: Vec::new(),
         event: hooks_runner::config::EventInput::None,
         timeout: Duration::from_secs(30),
+        batch: None,
     };
     let ctx = json!({});
     let fut = hooks_runner::actions::command::run(run, &ctx);

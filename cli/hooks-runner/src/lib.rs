@@ -12,6 +12,11 @@
 //!    retries for what's safe to repeat, per-automation rate limits and a circuit breaker;
 //! 6. records the result ([`runs`]), so any event can be replayed.
 //!
+//! An automation with `batch:` holds its matching events on disk instead ([`batch`]), after the
+//! filters, and runs its actions once for all of them when the batch is cut (idle, max_wait,
+//! max_events, or the size cap). [`Runner::tick`] runs the batches that are due; a host calls it
+//! every second or so.
+//!
 //! Duplicates are dropped by event id (at least once from the relay, at most once here). For the
 //! presets whose provider signs no timestamp, a delivery whose content (hook and body) the runner
 //! already took under another id is dropped as a replay too ([`contentmarks`]).
@@ -32,6 +37,7 @@
 
 pub mod actions;
 pub mod ask;
+pub mod batch;
 pub mod catalogue;
 pub mod check;
 pub mod config;

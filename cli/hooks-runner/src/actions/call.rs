@@ -16,6 +16,10 @@ use crate::secrets::SecretStore;
 use crate::template::{JsonTemplate, Template};
 use crate::{HOP_HEADER, ORIGIN_HEADER};
 
+/// The largest body a call sends: a batch's events beyond it fail the call (nothing is cut
+/// silently; the batch is kept for `00hooks replay`).
+pub const MAX_BODY: usize = 10 * 1024 * 1024;
+
 /// An HTTP client for actions: no redirects, a user agent, ring for TLS.
 pub fn http_client() -> reqwest::Client {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -130,6 +134,12 @@ pub async fn call(
         .map_err(|_| Failure::fatal(format!("{} isn't an HTTP method", c.method)))?;
     let body = match c.body {
         Some(t) => Some(t.render(ctx)),
+        // A batch's run sends its events, as a JSON array.
+        None if matches!(c.method, "POST" | "PUT" | "PATCH") && ctx.get("batch").is_some() => Some(
+            ctx.get("events")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new())),
+        ),
         None if matches!(c.method, "POST" | "PUT" | "PATCH") => Some(serde_json::json!({
             "event": ctx.get("event"),
             "headers": ctx.get("headers"),
@@ -142,9 +152,16 @@ pub async fn call(
         .headers(headers)
         .timeout(c.timeout);
     if let Some(b) = body {
-        req = req
-            .header("content-type", "application/json")
-            .body(serde_json::to_vec(&b).expect("json"));
+        let bytes = serde_json::to_vec(&b).expect("json");
+        if bytes.len() > MAX_BODY {
+            return Err(Failure::fatal(format!(
+                "the body would be {} MiB, more than the {} MiB a call sends; nothing was sent \
+                 (for a batch, lower max_events, or use run or write)",
+                bytes.len().div_ceil(1024 * 1024),
+                MAX_BODY / (1024 * 1024)
+            )));
+        }
+        req = req.header("content-type", "application/json").body(bytes);
     }
     let resp = req.send().await.map_err(|e| {
         let what = if e.is_timeout() {

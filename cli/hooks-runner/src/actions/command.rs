@@ -5,7 +5,9 @@
 //! for `PATH`, `HOME` and `LANG` and the automation's own `env`. The event goes on stdin as JSON,
 //! or into a private file named by `HOOKS_EVENT_FILE`. Each run gets its own private folder
 //! ([`RunDir`]: random name, 0700, removed afterwards) as its working directory, with the event
-//! file in it. The command runs in its own process group; the group is killed (with everything the
+//! file in it. A batch's run (`batch:`) gets every held event as JSON lines on stdin and in the file
+//! named by `HOOKS_EVENTS_FILE`, with `HOOKS_EVENT_FILE` naming its last event, and the batch's
+//! `HOOKS_BATCH_*` variables ([`BatchFiles`]). The command runs in its own process group; the group is killed (with everything the
 //! command started) when the command exits, at its time limit, or when the run is dropped, so a
 //! background child holding the output open can't keep the runner waiting.
 
@@ -35,6 +37,19 @@ pub struct Run<'a> {
     pub env: Vec<(String, String)>,
     pub event: EventInput,
     pub timeout: Duration,
+    /// A batch's run: what it gets instead of a single event.
+    pub batch: Option<BatchFiles>,
+}
+
+/// What a batch's command gets.
+pub struct BatchFiles {
+    /// Every held event, one JSON object per line (each as a single event's command gets it).
+    pub jsonl: Vec<u8>,
+    /// The last event, as a single event's command gets it (`HOOKS_EVENT_FILE`).
+    pub last: Value,
+    /// `HOOKS_BATCH_ID`, `HOOKS_BATCH_COUNT`, `HOOKS_BATCH_FIRST`, `HOOKS_BATCH_LAST`,
+    /// `HOOKS_BATCH_REASON`.
+    pub env: Vec<(String, String)>,
 }
 
 /// A NUL can't be passed to a program; drop it rather than fail.
@@ -184,7 +199,13 @@ async fn read_into<R: AsyncRead + Unpin>(mut r: R, keep: Arc<Mutex<Vec<u8>>>) {
 }
 
 pub async fn run(r: Run<'_>, ctx: &Value) -> Outcome {
-    let event_json = serde_json::to_vec(ctx).expect("json");
+    let (event_json, stdin_bytes) = match &r.batch {
+        Some(b) => (serde_json::to_vec(&b.last).expect("json"), b.jsonl.clone()),
+        None => {
+            let one = serde_json::to_vec(ctx).expect("json");
+            (one.clone(), one)
+        }
+    };
     // Removed at the end, or when the run is dropped, after the process group is killed.
     let dir = RunDir::create()
         .map_err(|e| Failure::fatal(format!("couldn't make the run's private folder: {e}")))?;
@@ -205,7 +226,25 @@ pub async fn run(r: Run<'_>, ctx: &Value) -> Outcome {
     }
     #[cfg(unix)]
     cmd.process_group(0);
+    if let Some(b) = &r.batch {
+        for (k, v) in &b.env {
+            cmd.env(k, no_nul(v.clone()));
+        }
+        if r.event != EventInput::None {
+            let all = dir
+                .write_file("events.jsonl", &b.jsonl)
+                .map_err(|e| Failure::fatal(format!("couldn't write the events file: {e}")))?;
+            let last = dir
+                .write_file("event.json", &event_json)
+                .map_err(|e| Failure::fatal(format!("couldn't write the event file: {e}")))?;
+            cmd.env("HOOKS_EVENTS_FILE", all);
+            cmd.env("HOOKS_EVENT_FILE", last);
+        }
+    }
     match r.event {
+        EventInput::File if r.batch.is_some() => {
+            cmd.stdin(Stdio::null());
+        }
         EventInput::File => {
             let f = dir
                 .write_file("event.json", &event_json)
@@ -233,7 +272,7 @@ pub async fn run(r: Run<'_>, ctx: &Value) -> Outcome {
     let feed = child.stdin.take().map(|mut stdin| {
         tokio::spawn(async move {
             // A program that doesn't read its input is fine.
-            let _ = stdin.write_all(&event_json).await;
+            let _ = stdin.write_all(&stdin_bytes).await;
             let _ = stdin.shutdown().await;
         })
     });

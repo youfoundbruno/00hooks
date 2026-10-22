@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use hooks_client::Event;
 use serde::{Deserialize, Serialize};
 
+use crate::batch::Reason;
 use crate::catalogue::ShapeChange;
 use crate::jsonl::{self, Jsonl};
 use crate::{Result, now_ms};
@@ -73,12 +74,31 @@ pub struct AutomationRun {
     pub skipped: Option<String>,
     #[serde(default)]
     pub actions: Vec<ActionResult>,
+    /// The batch the event joined (`batch:`): its actions run later, once, for the whole batch,
+    /// in a run of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<String>,
 }
 
 impl AutomationRun {
     pub fn failed(&self) -> bool {
         self.actions.iter().any(|a| !a.ok)
     }
+}
+
+/// What a batch's run ran on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSummary {
+    pub id: String,
+    pub automation: String,
+    pub count: u32,
+    pub first_at: i64,
+    pub last_at: i64,
+    pub reason: Reason,
+    /// Events its full batch couldn't take while the automation couldn't run.
+    #[serde(default)]
+    pub refused: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,13 +128,26 @@ pub struct RunRecord {
     /// The quarantine list's id for it, when the screen held it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<String>,
+    /// A batch's run (its `event_id` is the batch's id; `seq`, `hook_id` and `kind` are its last
+    /// event's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchSummary>,
 }
 
 impl RunRecord {
+    /// Automations that ran their actions for this record (not skipped, not held for a batch).
     pub fn ran(&self) -> usize {
         self.automations
             .iter()
-            .filter(|a| a.skipped.is_none())
+            .filter(|a| a.skipped.is_none() && a.batch.is_none())
+            .count()
+    }
+
+    /// Automations that held the event for a batch.
+    pub fn batched(&self) -> usize {
+        self.automations
+            .iter()
+            .filter(|a| a.batch.is_some())
             .count()
     }
 
@@ -139,7 +172,7 @@ enum Line {
         replay: bool,
     },
     End {
-        record: RunRecord,
+        record: Box<RunRecord>,
     },
 }
 
@@ -187,7 +220,7 @@ impl RunLog {
                     if open.remove(&record.run).is_none() {
                         order.push(record.run.clone());
                     }
-                    done.insert(record.run.clone(), record);
+                    done.insert(record.run.clone(), *record);
                 }
             }
         }
@@ -226,9 +259,10 @@ impl RunLog {
                     shape_change: None,
                     automations: Vec::new(),
                     held: None,
+                    batch: None,
                 };
                 runs_file.append(&Line::End {
-                    record: rec.clone(),
+                    record: Box::new(rec.clone()),
                 })?;
                 interrupted.push(rec.clone());
                 done.insert(run, rec);
@@ -237,7 +271,9 @@ impl RunLog {
         let mut runs: VecDeque<RunRecord> = order.iter().filter_map(|r| done.remove(r)).collect();
         if runs.len() > KEEP_RUNS {
             runs.drain(..runs.len() - KEEP_RUNS);
-            runs_file.compact(runs.iter().map(|r| Line::End { record: r.clone() }))?;
+            runs_file.compact(runs.iter().map(|r| Line::End {
+                record: Box::new(r.clone()),
+            }))?;
         }
 
         // The archive: the newest KEEP_EVENTS events, each once.
@@ -289,10 +325,38 @@ impl RunLog {
         Ok(run)
     }
 
+    /// Record the start of a batch's run, durably, under the batch's id (`seq`, `hook_id`, `kind`
+    /// and `verified` are its last event's). Returns the run id.
+    pub fn begin_batch(
+        &mut self,
+        batch_id: &str,
+        seq: u64,
+        hook_id: &str,
+        kind: &str,
+        verified: bool,
+        replay: bool,
+    ) -> Result<String> {
+        let run = format!("run_{}", crate::random_hex());
+        self.runs_file.append(&Line::Start {
+            run: run.clone(),
+            event_id: batch_id.to_string(),
+            seq,
+            hook_id: hook_id.to_string(),
+            kind: kind.to_string(),
+            verified,
+            at: now_ms(),
+            replay,
+        })?;
+        if !replay {
+            self.seen.insert(batch_id.to_string());
+        }
+        Ok(run)
+    }
+
     /// Record a finished run.
     pub fn finish(&mut self, record: RunRecord) -> Result<()> {
         self.runs_file.append(&Line::End {
-            record: record.clone(),
+            record: Box::new(record.clone()),
         })?;
         if !record.replay && record.status != RunStatus::Dropped {
             self.seen.insert(record.event_id.clone());
@@ -303,7 +367,9 @@ impl RunLog {
             let keep: Vec<Line> = self
                 .runs
                 .iter()
-                .map(|r| Line::End { record: r.clone() })
+                .map(|r| Line::End {
+                    record: Box::new(r.clone()),
+                })
                 .collect();
             self.runs_file.compact(keep)?;
         }
@@ -347,7 +413,7 @@ pub fn read_runs(dir: &Path) -> Result<Vec<RunRecord>> {
     Ok(lines
         .into_iter()
         .filter_map(|l| match l {
-            Line::End { record } => Some(record),
+            Line::End { record } => Some(*record),
             Line::Start { .. } => None,
         })
         .collect())
@@ -388,6 +454,7 @@ mod tests {
             shape_change: None,
             automations: vec![],
             held: None,
+            batch: None,
         }
     }
 

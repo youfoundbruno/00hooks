@@ -10,14 +10,16 @@ use hooks_screen::{Screen, SourceKind, Verdict};
 use serde_json::{Value, json};
 
 use crate::actions::{self, Failure, Notifier, NullNotifier, SystemNotifier};
-use crate::ask::{AskRequest, Asker};
+use crate::ask::{AskBatch, AskRequest, Asker};
+use crate::batch::{BatchStore, OpenBatch, Reason};
 use crate::catalogue::{Catalogue, Observation};
 use crate::config::{
-    Action, ActionKind, Automation, Automations, NotifyMode, Trigger, describe_rate,
+    Action, ActionKind, Automation, Automations, Batch, MAX_BATCH_BYTES, NotifyMode, Trigger,
+    describe_rate,
 };
 use crate::contentmarks::{self, ContentMarks};
 use crate::hookrefs::{self, HookRefs, Pin, Pins};
-use crate::runs::{ActionResult, AutomationRun, RunLog, RunRecord, RunStatus};
+use crate::runs::{ActionResult, AutomationRun, BatchSummary, RunLog, RunRecord, RunStatus};
 use crate::secrets::SecretStore;
 use crate::state::{Admit, Breaker, States};
 use crate::text::sanitize;
@@ -44,6 +46,9 @@ pub struct RunnerOptions {
     /// The screen (PLAN §6a): every event meets it before any automation runs. A host shares one
     /// screen across its sources; `None` runs without one.
     pub screen: Option<Arc<Screen>>,
+    /// Now, in Unix milliseconds: batches' timers and the rate limits read it. The system's clock
+    /// by default; tests set their own.
+    pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl RunnerOptions {
@@ -59,6 +64,7 @@ impl RunnerOptions {
             retry_base: Duration::from_secs(1),
             asker: None,
             screen: None,
+            clock: Arc::new(now_ms),
         }
     }
 }
@@ -94,6 +100,98 @@ pub struct Runner {
     log: Vec<String>,
     /// Hooks whose kinds reached the catalogue's cap, already said.
     capped_hooks: HashSet<String>,
+    /// The open batches (`batch:`), on disk.
+    batches: BatchStore,
+    /// Batch runs that happened while an event was handled, for the caller (`take_batch_runs`).
+    batch_runs: Vec<RunRecord>,
+    /// Batches whose automation can't run now, already said.
+    waiting_told: HashSet<String>,
+}
+
+/// A batch's events and what they were, for its run.
+struct BatchInput {
+    id: String,
+    count: u32,
+    first_at: i64,
+    last_at: i64,
+    reason: Reason,
+    refused: u32,
+    events: Vec<Value>,
+    file: PathBuf,
+}
+
+impl BatchInput {
+    fn summary(&self, automation: &str) -> BatchSummary {
+        BatchSummary {
+            id: self.id.clone(),
+            automation: automation.to_string(),
+            count: self.count,
+            first_at: self.first_at,
+            last_at: self.last_at,
+            reason: self.reason,
+            refused: self.refused,
+        }
+    }
+
+    /// `batch` as templates read it.
+    fn fields(&self) -> Value {
+        json!({
+            "id": self.id,
+            "count": self.count,
+            "first": rfc3339(self.first_at),
+            "last": rfc3339(self.last_at),
+            "reason": self.reason.as_str(),
+            "refused": self.refused,
+        })
+    }
+
+    /// What a batch's actions read: its last event (`payload`, `headers`, `event`), `batch` and
+    /// `events`.
+    fn context(&self) -> Value {
+        let mut ctx = self.events.last().cloned().unwrap_or_else(|| json!({}));
+        if let Value::Object(m) = &mut ctx {
+            m.insert("batch".into(), self.fields());
+            m.insert("events".into(), Value::Array(self.events.clone()));
+        }
+        ctx
+    }
+
+    /// One event of the batch with `batch` beside it (an appended line).
+    fn context_of(&self, event: &Value) -> Value {
+        let mut ctx = event.clone();
+        if let Value::Object(m) = &mut ctx {
+            m.insert("batch".into(), self.fields());
+        }
+        ctx
+    }
+
+    /// The most hops any of its events had come through.
+    fn hop(&self) -> u32 {
+        self.events
+            .iter()
+            .filter_map(|e| e["headers"].as_object())
+            .filter_map(|h| {
+                h.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(HOP_HEADER))
+                    .and_then(|(_, v)| v.as_str()?.trim().parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// When an open batch is due, and why: `idle` after its last event or `max_wait` after its first,
+/// whichever comes first.
+pub fn batch_due(b: &OpenBatch, cfg: &Batch) -> (i64, Reason) {
+    let ms = |d: Duration| d.as_millis() as i64;
+    let idle = cfg.idle.map(|d| b.last_at + ms(d));
+    let max = cfg.max_wait.map(|d| b.first_at + ms(d));
+    match (idle, max) {
+        (Some(i), Some(m)) if m < i => (m, Reason::MaxWait),
+        (Some(i), _) => (i, Reason::Idle),
+        (None, Some(m)) => (m, Reason::MaxWait),
+        (None, None) => (b.first_at, Reason::MaxWait),
+    }
 }
 
 fn stamp(p: &Path) -> Option<SystemTime> {
@@ -149,9 +247,13 @@ impl Runner {
             catch_up: None,
             log: Vec::new(),
             capped_hooks: HashSet::new(),
+            batches: BatchStore::open(&opts.dir)?,
+            batch_runs: Vec::new(),
+            waiting_told: HashSet::new(),
             config,
             opts,
         };
+        r.settle_batches();
         for rec in r.runs.interrupted.clone() {
             r.say(format!(
                 "Run {} of event {} was interrupted when the runner last stopped; it wasn't run \
@@ -166,6 +268,511 @@ impl Runner {
 
     pub fn config(&self) -> &Automations {
         &self.config
+    }
+
+    /// Now, by the runner's clock.
+    fn now(&self) -> i64 {
+        (self.opts.clock)()
+    }
+
+    /// Batches a crash stopped while they were being cut: one whose run had begun is closed (the
+    /// run log reports that run as interrupted, and `00hooks replay <batch>` runs it again); one
+    /// whose run hadn't begun stays open, to run at the next tick.
+    fn settle_batches(&mut self) {
+        let cutting: Vec<OpenBatch> = self
+            .batches
+            .all()
+            .filter(|b| b.cutting.is_some())
+            .cloned()
+            .collect();
+        for b in cutting {
+            let reason = b.cutting.expect("filtered");
+            let done = if self.runs.seen(&b.id) {
+                let now = self.now();
+                self.batches.finish(&b.automation, reason, now).map(|_| {
+                    format!(
+                        "Batch {} of {:?} was being run when the runner last stopped; it wasn't \
+                         run again. `00hooks replay {}` runs it.",
+                        b.id, b.automation, b.id
+                    )
+                })
+            } else {
+                self.batches
+                    .unmark_cutting(&b.automation)
+                    .map(|_| String::new())
+            };
+            match done {
+                Ok(m) if m.is_empty() => {}
+                Ok(m) => self.say(m),
+                Err(e) => self.say(format!("Couldn't settle batch {}: {e}", b.id)),
+            }
+        }
+    }
+
+    /// The open batches (`batch:`), one per automation at most.
+    pub fn open_batches(&self) -> Vec<OpenBatch> {
+        self.batches.all().cloned().collect()
+    }
+
+    /// When the next open batch is due (Unix ms), by the current automations. A host sleeps until
+    /// then (or ticks every second or so) and calls [`Runner::tick`].
+    pub fn next_batch_due(&self) -> Option<i64> {
+        self.batches
+            .all()
+            .filter_map(|b| {
+                let a = self
+                    .config
+                    .automations
+                    .iter()
+                    .find(|a| a.name == b.automation && a.enabled)?;
+                Some(match &a.batch {
+                    Some(cfg) => batch_due(b, cfg).0,
+                    None => b.last_at,
+                })
+            })
+            .min()
+    }
+
+    /// Batch runs that happened while an event was handled (a batch cut by `max_events` or
+    /// `max_bytes`), oldest first. They're in the run log too; [`Runner::tick`] returns them as well.
+    pub fn take_batch_runs(&mut self) -> Vec<RunRecord> {
+        std::mem::take(&mut self.batch_runs)
+    }
+
+    /// Why `a` couldn't run now, if it couldn't: paused, or over its rate limit.
+    fn blocked(&self, a: &Automation, now: i64) -> Option<String> {
+        match self.states.peek(&a.name, a.rate_limit, now) {
+            Admit::Run => None,
+            Admit::Paused { until } => Some(format!(
+                "paused after repeated failures until {}",
+                crate::text::sanitize(&clock(until))
+            )),
+            Admit::RateLimited { .. } => Some(format!(
+                "over its rate limit ({})",
+                describe_rate(a.rate_limit)
+            )),
+        }
+    }
+
+    /// Run the batches that are due: `idle` or `max_wait` passed (a batch already overdue after a
+    /// restart runs now). A batch whose automation can't run now (paused, over its rate limit) stays
+    /// open and keeps holding events until it can. Returns the batch runs, with any that happened
+    /// while events were handled since the last call.
+    pub async fn tick(&mut self) -> Vec<RunRecord> {
+        self.reload_if_changed();
+        if self.batches.all().next().is_none() {
+            return self.take_batch_runs();
+        }
+        if let Err(err) = self.states.reload() {
+            self.say(format!("Couldn't read the automations' state: {err}"));
+        }
+        let now = self.now();
+        let open: Vec<OpenBatch> = self.batches.all().cloned().collect();
+        for b in open {
+            let Some(a) = self
+                .config
+                .automations
+                .iter()
+                .find(|a| a.name == b.automation)
+                .cloned()
+            else {
+                continue;
+            };
+            if !a.enabled {
+                continue;
+            }
+            if b.count == 0 {
+                // A crash between opening it and its first event: nothing to run.
+                let _ = self.batches.discard(&b.automation);
+                continue;
+            }
+            let (due, reason) = match &a.batch {
+                Some(cfg) => batch_due(&b, cfg),
+                None => (now, Reason::Unbatched),
+            };
+            if now < due {
+                continue;
+            }
+            if let Some(why) = self.blocked(&a, now) {
+                if self.waiting_told.insert(b.id.clone()) {
+                    self.say(format!(
+                        "Batch {} of {:?} is due, but the automation can't run now ({why}); it \
+                         stays open and keeps holding events (up to its max_events or {} MiB; \
+                         past that, new events aren't held and are counted).",
+                        b.id,
+                        a.name,
+                        MAX_BATCH_BYTES / (1024 * 1024)
+                    ));
+                }
+                continue;
+            }
+            let rec = self.cut(&a, reason).await;
+            self.batch_runs.push(rec);
+        }
+        if let Err(err) = self.states.save() {
+            self.say(format!("Couldn't save the automations' state: {err}"));
+        }
+        self.take_batch_runs()
+    }
+
+    /// Run an automation's open batch now (`00hooks batches flush`). Refused while the automation
+    /// can't run (paused, over its rate limit): the batch stays open.
+    pub async fn flush_batch(&mut self, automation: &str) -> Result<RunRecord> {
+        self.reload_if_changed();
+        let a = self
+            .config
+            .automations
+            .iter()
+            .find(|a| a.name == automation)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "no automation is named {automation:?} in the automations; `00hooks batches \
+                     drop` discards its batch"
+                ))
+            })?;
+        match self.batches.get(automation) {
+            Some(b) if b.count > 0 => {}
+            _ => return Err(Error::Other(format!("{automation:?} has no open batch"))),
+        }
+        self.states.reload()?;
+        if let Some(why) = self.blocked(&a, self.now()) {
+            return Err(Error::Other(format!(
+                "{automation:?} can't run now ({why}), so its batch stays open; `00hooks \
+                 automations resume` lifts a pause"
+            )));
+        }
+        let rec = self.cut(&a, Reason::Flush).await;
+        self.states.save()?;
+        Ok(rec)
+    }
+
+    /// Throw an automation's open batch away, with its events (`00hooks batches drop`). The events
+    /// stay in the event archive, so `00hooks replay <event>` can still run one.
+    pub fn drop_batch(&mut self, automation: &str) -> Result<OpenBatch> {
+        let b = self
+            .batches
+            .discard(automation)?
+            .ok_or_else(|| Error::Other(format!("{automation:?} has no open batch")))?;
+        self.waiting_told.remove(&b.id);
+        self.say(format!(
+            "Dropped batch {} of {automation:?}: {} events weren't run.",
+            b.id, b.count
+        ));
+        Ok(b)
+    }
+
+    /// Hold one event in `a`'s batch. A full batch is cut first (`max_events`, `max_bytes`), unless
+    /// the automation can't run now: then the event isn't held, and is counted, with a note in its
+    /// record saying how to run it later. Nothing is ever dropped silently.
+    async fn hold(
+        &mut self,
+        a: &Automation,
+        cfg: &Batch,
+        ctx: &Value,
+        e: &Event,
+        mut run: AutomationRun,
+    ) -> AutomationRun {
+        let now = self.now();
+        let line = serde_json::to_vec(ctx).expect("json");
+        let size = line.len() as u64 + 1;
+        let blocked = self.blocked(a, now);
+        if let Some(open) = self.batches.get(&a.name).cloned() {
+            let full = if open.count >= cfg.max_events {
+                Some(Reason::MaxEvents)
+            } else if open.bytes + size > MAX_BATCH_BYTES {
+                Some(Reason::MaxBytes)
+            } else {
+                None
+            };
+            match (full, &blocked) {
+                (None, _) => {}
+                (Some(_), Some(why)) => {
+                    if let Err(err) = self.batches.refuse(&a.name) {
+                        self.say(format!("Couldn't count a refused event: {err}"));
+                    }
+                    run.skipped = Some(format!(
+                        "its batch {} is full ({} events, {} KiB) and it can't run now ({why}), \
+                         so this event wasn't held; `00hooks replay {}` runs it later",
+                        open.id,
+                        open.count,
+                        open.bytes.div_ceil(1024),
+                        e.id
+                    ));
+                    return run;
+                }
+                (Some(reason), None) => {
+                    let rec = self.cut(a, reason).await;
+                    self.batch_runs.push(rec);
+                }
+            }
+        }
+        if size > MAX_BATCH_BYTES {
+            run.skipped = Some(format!(
+                "the event alone is more than a batch holds ({} MiB), so it wasn't held; \
+                 `00hooks replay {}` runs it",
+                MAX_BATCH_BYTES / (1024 * 1024),
+                e.id
+            ));
+            return run;
+        }
+        match self.batches.hold(&a.name, &line, now) {
+            Ok(open) => {
+                run.batch = Some(open.id.clone());
+                if let Some(why) = &blocked
+                    && self.waiting_told.insert(open.id.clone())
+                {
+                    self.say(format!(
+                        "{:?} can't run now ({why}); its events are held in batch {} until it \
+                         can (up to {} events or {} MiB; past that, new events aren't held and \
+                         are counted).",
+                        a.name,
+                        open.id,
+                        cfg.max_events,
+                        MAX_BATCH_BYTES / (1024 * 1024)
+                    ));
+                }
+                if open.count >= cfg.max_events && blocked.is_none() {
+                    let rec = self.cut(a, Reason::MaxEvents).await;
+                    self.batch_runs.push(rec);
+                }
+            }
+            Err(err) => run.actions.push(ActionResult {
+                action: "batch".into(),
+                ok: false,
+                attempts: 1,
+                ms: 0,
+                error: Some(format!("couldn't hold the event in its batch: {err}")),
+                detail: None,
+                output: None,
+            }),
+        }
+        run
+    }
+
+    /// Cut `a`'s open batch and run its actions once, for all its events. At most once: the batch
+    /// is marked, its run's start recorded (fsynced), and only then moved to `done`.
+    async fn cut(&mut self, a: &Automation, reason: Reason) -> RunRecord {
+        let now = self.now();
+        let open = self.batches.get(&a.name).cloned().expect("an open batch");
+        let failed = |this: &mut Runner, note: String| {
+            this.say(format!("Batch {} of {:?}: {note}", open.id, a.name));
+            let at = now_ms();
+            RunRecord {
+                run: format!("run_{}", crate::random_hex()),
+                event_id: open.id.clone(),
+                seq: 0,
+                hook_id: String::new(),
+                hook: None,
+                kind: String::new(),
+                verified: false,
+                started_at: at,
+                finished_at: at,
+                replay: false,
+                status: RunStatus::Failed,
+                note: Some(note),
+                new_kind: false,
+                shape_change: None,
+                automations: Vec::new(),
+                held: None,
+                batch: Some(BatchSummary {
+                    id: open.id.clone(),
+                    automation: a.name.clone(),
+                    count: open.count,
+                    first_at: open.first_at,
+                    last_at: open.last_at,
+                    reason,
+                    refused: open.refused,
+                }),
+            }
+        };
+        let events = match self.batches.events(&a.name) {
+            Ok(v) => v,
+            Err(err) => {
+                return failed(
+                    self,
+                    format!("couldn't read its events, so nothing ran; it stays open: {err}"),
+                );
+            }
+        };
+        if let Err(err) = self.batches.mark_cutting(&a.name, reason) {
+            return failed(
+                self,
+                format!("couldn't record the cut, so nothing ran; it stays open: {err}"),
+            );
+        }
+        let last = events.last().cloned().unwrap_or_else(|| json!({}));
+        let ev = &last["event"];
+        let run_id = match self.runs.begin_batch(
+            &open.id,
+            ev["seq"].as_u64().unwrap_or(0),
+            ev["hookId"].as_str().unwrap_or_default(),
+            ev["kind"].as_str().unwrap_or_default(),
+            ev["verified"].as_bool().unwrap_or(false),
+            false,
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                let _ = self.batches.unmark_cutting(&a.name);
+                return failed(
+                    self,
+                    format!("couldn't record its run, so nothing ran; it stays open: {err}"),
+                );
+            }
+        };
+        if let Err(err) = self.batches.finish(&a.name, reason, now) {
+            self.say(format!(
+                "Couldn't move batch {} to the kept batches: {err}",
+                open.id
+            ));
+        }
+        self.waiting_told.remove(&open.id);
+        let input = BatchInput {
+            id: open.id.clone(),
+            count: events.len() as u32,
+            first_at: open.first_at,
+            last_at: open.last_at,
+            reason,
+            refused: open.refused,
+            file: self.batches.done_path(&open.id),
+            events,
+        };
+        self.run_batch(a, input, run_id, false).await
+    }
+
+    /// Run a batch's actions and record the run.
+    async fn run_batch(
+        &mut self,
+        a: &Automation,
+        input: BatchInput,
+        run_id: String,
+        replay: bool,
+    ) -> RunRecord {
+        let started_at = now_ms();
+        let ctx = input.context();
+        let ev = ctx["event"].clone();
+        let e = self.last_event(&ctx);
+        let run = AutomationRun {
+            name: a.name.clone(),
+            trigger: "batch".into(),
+            skipped: None,
+            actions: Vec::new(),
+            batch: None,
+        };
+        let hop = input.hop();
+        let run = self.run_actions(a, &ctx, &e, Some(&input), hop, run).await;
+        let status = if run.failed() {
+            RunStatus::Failed
+        } else {
+            RunStatus::Ok
+        };
+        let rec = RunRecord {
+            run: run_id,
+            event_id: input.id.clone(),
+            seq: ev["seq"].as_u64().unwrap_or(0),
+            hook_id: ev["hookId"].as_str().unwrap_or_default().to_string(),
+            hook: ev["hook"].as_str().map(str::to_string),
+            kind: ev["kind"].as_str().unwrap_or_default().to_string(),
+            verified: ev["verified"].as_bool().unwrap_or(false),
+            started_at,
+            finished_at: now_ms(),
+            replay,
+            status,
+            note: Some(format!(
+                "a batch of {} event{} ({})",
+                input.count,
+                if input.count == 1 { "" } else { "s" },
+                input.reason.as_str()
+            )),
+            new_kind: false,
+            shape_change: None,
+            automations: vec![run],
+            held: None,
+            batch: Some(input.summary(&a.name)),
+        };
+        self.finish(rec)
+    }
+
+    /// The batch's last event, for an agent: from the event archive, else rebuilt from what the
+    /// batch kept of it.
+    fn last_event(&self, ctx: &Value) -> Event {
+        let ev = &ctx["event"];
+        if let Some(id) = ev["id"].as_str()
+            && let Ok(Some(e)) = self.runs.event(id)
+        {
+            return e;
+        }
+        use base64::Engine;
+        let body = match &ctx["payload"] {
+            Value::String(s) => s.clone().into_bytes(),
+            Value::Null => Vec::new(),
+            v => serde_json::to_vec(v).expect("json"),
+        };
+        serde_json::from_value(json!({
+            "seq": ev["seq"].as_u64().unwrap_or(0),
+            "id": ev["id"].as_str().unwrap_or_default(),
+            "hookId": ev["hookId"].as_str().unwrap_or_default(),
+            "receivedAt": ev["receivedAt"].as_i64().unwrap_or(0),
+            "verified": ev["verified"].as_bool().unwrap_or(false),
+            "preset": ev["preset"].as_str().unwrap_or_default(),
+            "eventType": ev["eventType"],
+            "contentType": ev["contentType"],
+            "headers": ctx["headers"].as_object().cloned().unwrap_or_default(),
+            "body": base64::engine::general_purpose::STANDARD.encode(body),
+        }))
+        .expect("an event")
+    }
+
+    /// Run a kept batch again (`00hooks replay <batch id>`), against the current automations.
+    async fn replay_batch(&mut self, id: &str) -> Result<RunRecord> {
+        self.reload_if_changed();
+        let Some((meta, events)) = self.batches.done(id)? else {
+            if self.batches.all().any(|b| b.id == id) {
+                return Err(Error::Other(format!(
+                    "batch {id} is still open; `00hooks batches flush` runs it now"
+                )));
+            }
+            return Err(Error::Other(format!(
+                "batch {id} isn't kept any more (the newest {} batches that ran are)",
+                crate::batch::KEEP_DONE
+            )));
+        };
+        let a = self
+            .config
+            .automations
+            .iter()
+            .find(|a| a.name == meta.automation)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "batch {id} belongs to {:?}, which isn't in the automations now",
+                    meta.automation
+                ))
+            })?;
+        self.states.reload()?;
+        let last = events.last().cloned().unwrap_or_else(|| json!({}));
+        let ev = &last["event"];
+        let run_id = self.runs.begin_batch(
+            id,
+            ev["seq"].as_u64().unwrap_or(0),
+            ev["hookId"].as_str().unwrap_or_default(),
+            ev["kind"].as_str().unwrap_or_default(),
+            ev["verified"].as_bool().unwrap_or(false),
+            true,
+        )?;
+        let input = BatchInput {
+            id: id.to_string(),
+            count: events.len() as u32,
+            first_at: meta.first_at,
+            last_at: meta.last_at,
+            reason: meta.reason,
+            refused: meta.refused,
+            file: self.batches.done_path(id),
+            events,
+        };
+        let rec = self.run_batch(&a, input, run_id, true).await;
+        self.states.save()?;
+        Ok(rec)
     }
 
     /// Replace the automations (a host that keeps them as data).
@@ -433,6 +1040,9 @@ impl Runner {
         if event_id.starts_with("hld_") {
             return self.release(event_id).await;
         }
+        if crate::batch::is_batch_id(event_id) {
+            return self.replay_batch(event_id).await;
+        }
         self.reload_if_changed();
         let e = self.runs.event(event_id)?.ok_or_else(|| {
             Error::Other(format!(
@@ -527,6 +1137,7 @@ impl Runner {
             shape_change: None,
             automations: Vec::new(),
             held: None,
+            batch: None,
         }
     }
 
@@ -728,6 +1339,7 @@ impl Runner {
                 shape_change: observation.change.clone(),
                 automations: Vec::new(),
                 held,
+                batch: None,
             };
             match decision.verdict {
                 Verdict::Pass => {}
@@ -815,6 +1427,7 @@ impl Runner {
             shape_change: observation.change,
             automations: autos,
             held: None,
+            batch: None,
         };
         self.finish(rec)
     }
@@ -865,6 +1478,7 @@ impl Runner {
             trigger: trigger.to_string(),
             skipped: None,
             actions: Vec::new(),
+            batch: None,
         };
         if a.verified_only && !e.verified {
             run.skipped =
@@ -877,7 +1491,25 @@ impl Runner {
             run.skipped = Some("only_if is false".into());
             return run;
         }
-        let now = now_ms();
+        // Batched: the filters passed, so it joins the batch; the actions run when it's cut.
+        if let Some(cfg) = &a.batch {
+            return self.hold(a, cfg, ctx, e, run).await;
+        }
+        self.run_actions(a, ctx, e, None, hop, run).await
+    }
+
+    /// Admit a run (rate limit, pause) and run the actions, recording the result for the circuit
+    /// breaker. A batch's run counts once.
+    async fn run_actions(
+        &mut self,
+        a: &Automation,
+        ctx: &Value,
+        e: &Event,
+        batch: Option<&BatchInput>,
+        hop: u32,
+        mut run: AutomationRun,
+    ) -> AutomationRun {
+        let now = self.now();
         match self.states.admit(&a.name, a.rate_limit, now) {
             Admit::Run => {}
             Admit::RateLimited { tell } => {
@@ -886,7 +1518,11 @@ impl Runner {
                 if tell {
                     self.tell(
                         "00hooks: rate limit",
-                        format!("{:?} reached its rate limit ({rate}); matching events are skipped until it frees up.", a.name),
+                        if a.batch.is_some() {
+                            format!("{:?} reached its rate limit ({rate}); its batches wait until it frees up.", a.name)
+                        } else {
+                            format!("{:?} reached its rate limit ({rate}); matching events are skipped until it frees up.", a.name)
+                        },
                     )
                     .await;
                 }
@@ -903,7 +1539,7 @@ impl Runner {
         // Each automation reads the event, plus what its own "ask an agent" actions answered.
         let mut ctx = ctx.clone();
         for action in &a.actions {
-            let (result, answer) = self.run_action(a, action, &ctx, e, hop).await;
+            let (result, answer) = self.run_action(a, action, &ctx, e, batch, hop).await;
             let ok = result.ok;
             run.actions.push(result);
             if !ok {
@@ -914,9 +1550,10 @@ impl Runner {
             }
         }
         let ok = !run.failed();
+        let now = self.now();
         match self
             .states
-            .record(&a.name, ok, a.pause_after, a.pause_for, now_ms())
+            .record(&a.name, ok, a.pause_after, a.pause_for, now)
         {
             Breaker::Paused { failures, until } => {
                 self.tell(
@@ -947,6 +1584,7 @@ impl Runner {
         action: &Action,
         ctx: &Value,
         e: &Event,
+        batch: Option<&BatchInput>,
         hop: u32,
     ) -> (ActionResult, Option<Value>) {
         let started = Instant::now();
@@ -970,6 +1608,14 @@ impl Runner {
                     .unwrap_or_default()
                     .to_string(),
                 payload: ctx["payload"].clone(),
+                batch: batch.map(|b| AskBatch {
+                    id: b.id.clone(),
+                    count: b.count,
+                    first_at: b.first_at,
+                    last_at: b.last_at,
+                    reason: b.reason.as_str().to_string(),
+                    file: b.file.clone(),
+                }),
             };
             let outcome = self.ask(req).await;
             let ms = started.elapsed().as_millis() as u64;
@@ -1007,7 +1653,7 @@ impl Runner {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let outcome = self.exec(a, action, ctx, hop).await;
+            let outcome = self.exec(a, action, ctx, batch, hop).await;
             match outcome {
                 Ok(detail) => {
                     return (
@@ -1075,6 +1721,7 @@ impl Runner {
         a: &Automation,
         action: &Action,
         ctx: &Value,
+        batch: Option<&BatchInput>,
         hop: u32,
     ) -> actions::Outcome {
         match &action.kind {
@@ -1138,10 +1785,39 @@ impl Runner {
                         .collect(),
                     event: *event,
                     timeout: *timeout,
+                    batch: batch.map(|b| {
+                        let mut jsonl = Vec::new();
+                        for ev in &b.events {
+                            serde_json::to_writer(&mut jsonl, ev).expect("json");
+                            jsonl.push(b'\n');
+                        }
+                        actions::command::BatchFiles {
+                            jsonl,
+                            last: b.events.last().cloned().unwrap_or(Value::Null),
+                            env: vec![
+                                ("HOOKS_BATCH_ID".into(), b.id.clone()),
+                                ("HOOKS_BATCH_COUNT".into(), b.count.to_string()),
+                                ("HOOKS_BATCH_FIRST".into(), rfc3339(b.first_at)),
+                                ("HOOKS_BATCH_LAST".into(), rfc3339(b.last_at)),
+                                ("HOOKS_BATCH_REASON".into(), b.reason.as_str().into()),
+                            ],
+                        }
+                    }),
                 };
                 actions::command::run(run, ctx).await
             }
-            ActionKind::Append { path, line } => actions::write::append(path, &line.render(ctx)),
+            // A batch appends a line per event, in one write.
+            ActionKind::Append { path, line } => match batch {
+                Some(b) => {
+                    let lines: Vec<Value> = b
+                        .events
+                        .iter()
+                        .map(|ev| line.render(&b.context_of(ev)))
+                        .collect();
+                    actions::write::append_lines(path, &lines)
+                }
+                None => actions::write::append(path, &line.render(ctx)),
+            },
             ActionKind::WriteFile {
                 folder,
                 name,
@@ -1277,6 +1953,21 @@ fn list_or_none(v: &[String]) -> String {
 
 /// `2026-10-17 10:40 UTC`.
 pub fn clock(ms: i64) -> String {
+    let (y, m, d, h, min, _) = civil(ms);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02} UTC")
+}
+
+/// `2026-10-17T10:40:05.123Z` (RFC 3339, UTC): a batch's first and last times.
+pub fn rfc3339(ms: i64) -> String {
+    let (y, m, d, h, min, s) = civil(ms);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}.{:03}Z",
+        ms.rem_euclid(1000)
+    )
+}
+
+/// Year, month, day, hour, minute, second (UTC).
+fn civil(ms: i64) -> (i64, i64, i64, i64, i64, i64) {
     let secs = ms.div_euclid(1000);
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -1290,9 +1981,5 @@ pub fn clock(ms: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
-        rem / 3600,
-        (rem % 3600) / 60
-    )
+    (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
 }

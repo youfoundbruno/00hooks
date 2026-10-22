@@ -151,6 +151,16 @@ enum Cmd {
         #[arg(long, env = "HOOKS_AUTOMATIONS", value_name = "FILE")]
         automations: Option<PathBuf>,
     },
+    /// Open batches (automations with `batch:`): how many events each holds and when it runs.
+    Batches {
+        #[command(subcommand)]
+        cmd: Option<BatchesCmd>,
+        /// One JSON line per open batch.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, env = "HOOKS_AUTOMATIONS", value_name = "FILE", global = true)]
+        automations: Option<PathBuf>,
+    },
     /// Run `00hooks run` at login (launchd on macOS, systemd --user on Linux).
     Service {
         #[command(subcommand)]
@@ -254,6 +264,21 @@ enum AutomationsCmd {
     },
     /// Lift the pause the circuit breaker put on an automation.
     Resume { name: String },
+}
+
+#[derive(Subcommand)]
+enum BatchesCmd {
+    /// List the open batches (the default).
+    List,
+    /// Run an automation's open batch now.
+    Flush { automation: String },
+    /// Throw an automation's open batch away; its events don't run.
+    Drop {
+        automation: String,
+        /// Don't ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -668,6 +693,19 @@ async fn dispatch(cmd: Cmd) -> CliResult {
         },
         Cmd::Runs { limit, event, json } => automate::runs(limit, event, json),
         Cmd::Replay { event, automations } => automate::replay(event, automations).await,
+        Cmd::Batches {
+            cmd,
+            json,
+            automations,
+        } => match cmd.unwrap_or(BatchesCmd::List) {
+            BatchesCmd::List => automate::batches(automations, json),
+            BatchesCmd::Flush { automation } => {
+                automate::batches_flush(automation, automations).await
+            }
+            BatchesCmd::Drop { automation, yes } => {
+                automate::batches_drop(automation, yes, automations).await
+            }
+        },
         Cmd::Service { cmd } => match cmd {
             ServiceCmd::Install { automations, print } => service::install(automations, print),
             ServiceCmd::Uninstall => service::uninstall(),

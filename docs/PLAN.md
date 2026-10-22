@@ -411,6 +411,52 @@ AI actions, only in a program that embeds the runner and runs agents:
     for the actions after it, and the run record keeps it (`output`). The CLI has no agents, so
     there the action fails and says why; `automations.yaml` doesn't write it.
 
+Batches, optional, for any automation (`batch:` in `automations.yaml`):
+- **What it does**: instead of running once per event, the automation holds its matching events and
+  runs its actions once for all of them, when the batch is *cut*: `idle` after its last event (no
+  new one came for that long), `max_wait` after its first (even if events keep coming), at
+  `max_events` (default 1000, at most 10,000), or at 8 MiB held (`max_bytes`, fixed), whichever
+  comes first. At least one of `idle` and `max_wait` is given, each from 5 s to 24 h, and
+  `max_wait` is at least `idle`; `automations check` says so in words when it isn't. Timers run on
+  the runner's clock from when an event joined, not from the provider's time, so a catch-up after
+  being offline is one batch rather than an instant cut.
+- **Per event first**: filters (`only_if`, which can't read `batch` or `events`), `verified_only`
+  and the screen decide for each event before it joins; an event that doesn't pass never joins.
+  The event's own run record says which batch it joined.
+- **Held in a file**: the batch lives in the runner's folder (`batches/`, 0700), one JSON line per
+  event (the same object a command gets for a single event), each fsynced as it joins; 0600, like
+  the event archive. A restart reads the open batches back with their first-event times; a batch
+  that came due while the runner was stopped runs at its first tick. Cutting is at most once: the
+  batch is marked, its run's start is recorded under the batch's id (fsynced), and only then is the
+  file moved aside; a crash after the start closes the run as interrupted, and `00hooks replay
+  <batch>` runs it again. The cut batches are kept for replay, the newest 200 and 256 MiB at most;
+  `structure_only` is unaffected (the catalogue still keeps no values for such a hook).
+- **When it runs**: a command gets the events as JSON lines on stdin and in `HOOKS_EVENTS_FILE`,
+  `HOOKS_EVENT_FILE` naming the last one, and `HOOKS_BATCH_ID`, `HOOKS_BATCH_COUNT`,
+  `HOOKS_BATCH_FIRST`, `HOOKS_BATCH_LAST` (RFC 3339, UTC) and `HOOKS_BATCH_REASON` (`idle`,
+  `max_wait`, `max_events`, `max_bytes`, `flush`, or `unbatched` when `batch:` was removed with
+  events still held). Templates read `batch.id`, `batch.count`, `batch.first`, `batch.last`,
+  `batch.reason`, `batch.refused` and `events` (a list; `{{events | json}}`, or `"{{events}}"` as a
+  whole JSON value), with `payload`, `headers` and `event` the last event's; there are no loops.
+  `write: { append }` writes a line per event in one write; `write: { folder }` writes one file per
+  batch (`<batch id>.json`, the batch and its events); a `call` sends the events as a JSON array by
+  default, keyed by the batch's id, and fails rather than send more than 10 MiB; `ask` hands the
+  host the batch's file (`AskRequest::batch`, `ask::describe_batch`), its content quoted as
+  untrusted like any event.
+- **Limits count runs**: the rate limit and the circuit breaker count batch runs, not events. A
+  batch that comes due while its automation is paused or over its limit isn't run and isn't thrown
+  away: it stays open and keeps holding events up to its `max_events` or 8 MiB; past that, a new
+  event isn't held, the batch counts it (`refused`, shown in `00hooks batches` and in the batch
+  run), and the event's own run record says so and how to run it (`00hooks replay <event>`, while
+  the event archive keeps it). The person is told once per batch. Nothing is dropped silently.
+- **By hand**: `00hooks batches` lists the open batches (automation, events, size, first event,
+  when it runs or why it waits), `batches flush <automation>` runs one now (refused while paused),
+  `batches drop <automation>` throws one away after a confirmation, and `00hooks runs` shows batch
+  runs with their count and reason.
+- **Hosts** that embed the runner call `Runner::tick` every second or so (or sleep until
+  `Runner::next_batch_due`), pick up batch runs that happened during `handle` with
+  `take_batch_runs`, and may offer `flush_batch`, `drop_batch` and `open_batches`.
+
 ### 5.3 Reliability
 
 - Every event gets a **run record**: matched automations, each action's result, timings, errors.
@@ -430,7 +476,7 @@ AI actions, only in a program that embeds the runner and runs agents:
   automations that list that kind, and stay out of the catalogue.
 - **Retries** with backoff for failed actions that are safe to retry (notify, call a URL with an
   idempotency key); never for commands unless the automation says they're idempotent.
-- **Replay** any recorded event from the run history.
+- **Replay** any recorded event from the run history, or a batch's run from its kept batch file.
 - **Rate limits** per automation (default 30 runs an hour) and a **circuit breaker** that pauses an
   automation after repeated failures and tells you.
 - **Loop prevention**: actions that call out carry an `00hooks-origin` header and a hop count; an event
@@ -446,7 +492,8 @@ AI actions, only in a program that embeds the runner and runs agents:
 00hooks hooks create --preset github  prints the URL and, once, the signing secret
 00hooks listen                        stream events to the terminal (or --json)
 00hooks run                           run automations from ~/.config/00hooks/automations.yaml
-00hooks replay <event>                run an event again
+00hooks replay <event>                run an event again (or a batch, by its id)
+00hooks batches                       open batches; `flush <automation>` runs one now, `drop` discards it
 00hooks doctor                        check keys, clock skew, connectivity, the relay version
 00hooks service install               run `00hooks run` at login (launchd / systemd --user)
 ```

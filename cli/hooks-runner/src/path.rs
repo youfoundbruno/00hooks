@@ -6,7 +6,18 @@ use std::fmt;
 use serde_json::Value;
 
 /// Where a path may start.
-pub const ROOTS: &[&str] = &["payload", "headers", "event", "change", "agent"];
+pub const ROOTS: &[&str] = &[
+    "payload", "headers", "event", "change", "agent", "batch", "events",
+];
+
+/// The fields of `batch.*`, in an automation with `batch:` (`events` is the list of held events,
+/// each as `payload`, `headers` and `event`).
+pub const BATCH_FIELDS: &[&str] = &["id", "count", "first", "last", "reason", "refused"];
+
+/// The roots only an automation with `batch:` has.
+pub fn is_batch_root(root: &str) -> bool {
+    matches!(root, "batch" | "events")
+}
 
 /// The fields of `agent.*`: the reply of the last "ask an agent" action before this one.
 pub const AGENT_FIELDS: &[&str] = &["reply", "id", "name"];
@@ -232,6 +243,22 @@ pub fn check_root(p: &Path, secrets: bool) -> Result<(), String> {
             EVENT_FIELDS.join(", ")
         ));
     }
+    if root == "batch" {
+        match (p.segs.len(), p.segs.get(1)) {
+            (1, _) => {}
+            (2, Some(Seg::Key(f))) if BATCH_FIELDS.contains(&f.as_str()) => {}
+            _ => {
+                return Err(format!(
+                    "`{p}`: a batch has {}",
+                    BATCH_FIELDS
+                        .iter()
+                        .map(|f| format!("batch.{f}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    }
     if root == "agent" {
         match (p.segs.len(), p.segs.get(1)) {
             (2, Some(Seg::Key(f))) if AGENT_FIELDS.contains(&f.as_str()) => {}
@@ -289,5 +316,10 @@ mod tests {
         assert!(check_root(&parse("secret.TOKEN").unwrap(), false).is_err());
         assert!(check_root(&parse("secret.TOKEN").unwrap(), true).is_ok());
         assert!(check_root(&parse("secret.TOKEN.x").unwrap(), true).is_err());
+        assert!(check_root(&parse("batch.count").unwrap(), false).is_ok());
+        assert!(check_root(&parse("events").unwrap(), false).is_ok());
+        assert!(check_root(&parse("events[0].payload.x").unwrap(), false).is_ok());
+        let e = check_root(&parse("batch.size").unwrap(), false).unwrap_err();
+        assert!(e.contains("batch.count"), "{e}");
     }
 }
