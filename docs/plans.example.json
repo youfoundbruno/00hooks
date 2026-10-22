@@ -1,0 +1,16 @@
+{
+  "overblast": {
+    "hooks": 50,
+    "devices": 10,
+    "eventsPerDay": 50000,
+    "hookRatePerMin": 120,
+    "hookBurst": 300,
+    "accountRatePerMin": 600,
+    "accountBurst": 1200,
+    "retentionHours": 168,
+    "maxBodyBytes": 1048576,
+    "backlogEvents": 10000,
+    "backlogBytes": 268435456,
+    "hookCreatesPerDay": 100
+  }
+}
