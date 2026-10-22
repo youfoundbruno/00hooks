@@ -39,7 +39,7 @@ export const DEFAULT_REPLAY_MARK_DAYS = 180;
 /** Alarms are rounded up to this, so a busy account wakes at most hourly just to prune. */
 export const ALARM_BUCKET_MS = 3600_000;
 /** The object's storage layout; the schema statements run only when the stored one is older. */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 /** One offline notice per sender per hook in this long (PROTOCOL §4a). */
 export const NOTICE_TTL_MS = 24 * 3600_000;
 /**
@@ -408,7 +408,6 @@ export class AccountObject extends DurableObject<Env> {
         tryExec("ALTER TABLE events ADD COLUMN route TEXT");
         tryExec("ALTER TABLE held_events ADD COLUMN route TEXT");
       }
-      this.sql.exec("CREATE INDEX IF NOT EXISTS events_route ON events(route, seq)");
       // Schema 7: events for a list of devices (a hook's recipients), and each device's tags. An
       // event schema 6 routed to one device becomes a one-device list.
       if (version < 7) {
@@ -422,6 +421,8 @@ export class AccountObject extends DurableObject<Env> {
       // apart from the log; long replay marks; hook changes announced to devices. (Schema 5 only
       // adds tables, which SCHEMA creates; schemas 6 and 7 are the route columns above.)
       if (version < 4) this.migrateTo4(tryExec);
+      // Schema 8: fewer rows written per webhook (docs/COSTS.md).
+      if (version < 8) this.migrateTo8();
       this.sql.exec(
         "INSERT INTO meta (key, value) VALUES ('schema', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         SCHEMA_VERSION,
@@ -450,6 +451,22 @@ export class AccountObject extends DurableObject<Env> {
         `UPDATE held_usage SET bytes = (SELECT coalesce(sum(length(e.ct) + ${ENVELOPE_OVERHEAD}), 0)
            FROM held_envelopes e JOIN held_events h ON h.id = e.id WHERE h.hook_id = held_usage.hook_id)`,
       );
+    }
+  }
+
+  /**
+   * Schema 8 drops the indexes no query needs, each a row written with every insert (Cloudflare
+   * bills index entries as rows): `events_received`, `events_hook` and `events_route` (no query
+   * reads events by arrival time, hook or route; schema 7 stopped writing `route`); `seen_at` (the
+   * alarm and its schedule read marks by `long, at`, which `seen_long_at` serves); `envelopes_device`
+   * (an ack deletes its device's envelopes by seq range, which `envelopes_seq_device` serves);
+   * `held_hook` (dropping a hook's holds scans the hold, at most a few hundred rows per hook);
+   * `nonces_at` (a row written per signed request: the hourly alarm scans the nonces, which are
+   * at most the last hour's requests, and `ensureAlarm` doesn't read them between alarms).
+   */
+  private migrateTo8(): void {
+    for (const index of ["events_received", "events_hook", "events_route", "seen_at", "envelopes_device", "held_hook", "nonces_at"]) {
+      this.sql.exec(`DROP INDEX IF EXISTS ${index}`);
     }
   }
 
@@ -742,7 +759,7 @@ export class AccountObject extends DurableObject<Env> {
       );
       return true;
     });
-    if (ok) await this.ensureAlarm();
+    if (ok) await this.ensureAlarm(false, now);
     return ok;
   }
 
@@ -1597,8 +1614,10 @@ export class AccountObject extends DurableObject<Env> {
     const next = Math.max(current, Math.min(through, head));
     if (next !== current) {
       this.sql.exec("UPDATE devices SET acked = ? WHERE id = ?", next, deviceId);
-      // This device's envelopes are of no use to anyone once it has them.
-      this.deleteEnvelopes("e.device_id = ? AND e.seq <= ?", deviceId, next);
+      // This device's envelopes are of no use to anyone once it has them. Those up to `current`
+      // went with its earlier acks, so the range is the newly acknowledged seqs alone (read by
+      // `envelopes_seq_device`, without scanning other devices' backlog).
+      this.deleteEnvelopes("e.seq > ? AND e.seq <= ? AND e.device_id = ?", current, next, deviceId);
       this.pruneRecipients(deviceId, current, next);
       this.pruneAcknowledged();
       await this.ensureAlarm();
@@ -2130,11 +2149,19 @@ export class AccountObject extends DurableObject<Env> {
   /**
    * Schedules the alarm for the next time something expires, or clears it when nothing will.
    * An account with nothing pending has no alarm, so idle accounts never wake.
+   *
+   * Nonces have no index on `at` (it would be a row written per signed request), so their earliest
+   * expiry is read (a scan of at most the last hour's nonces) only in the alarm, or when no alarm is
+   * set. Otherwise the alarm already covers every nonce stored (each one spent lowered it if needed,
+   * and the alarm reschedules from the exact earliest), so only the nonce just spent (`nonceAt`)
+   * can need it sooner. The alarm is only ever moved earlier between alarms, never later.
    */
-  private async ensureAlarm(fromAlarm = false): Promise<void> {
+  private async ensureAlarm(fromAlarm = false, nonceAt: number | null = null): Promise<void> {
     const q = (sql: string) => this.sql.exec<{ t: number | null }>(sql).one().t;
+    const current = await this.ctx.storage.getAlarm();
+    const exactNonces = fromAlarm || current === null;
     const due: [number | null, number][] = [
-      [q("SELECT min(at) AS t FROM nonces"), NONCE_TTL_MS],
+      [exactNonces ? q("SELECT min(at) AS t FROM nonces") : nonceAt, NONCE_TTL_MS],
       [q("SELECT min(stored_at) AS t FROM events"), this.retentionMs()],
       [q("SELECT min(at) AS t FROM seen WHERE long = 0"), DEDUPE_TTL_MS],
       [q("SELECT min(at) AS t FROM seen WHERE long = 1"), this.replayMarkMs()],
@@ -2143,9 +2170,9 @@ export class AccountObject extends DurableObject<Env> {
     ];
     let next = Infinity;
     for (const [t, ttl] of due) if (t !== null) next = Math.min(next, t + ttl + 1);
-    const current = await this.ctx.storage.getAlarm();
     if (next === Infinity) {
-      if (current !== null && !fromAlarm) await this.ctx.storage.deleteAlarm();
+      // Nothing else expires: the alarm goes only when no nonce is left for it either.
+      if (current !== null && !fromAlarm && q("SELECT min(at) AS t FROM nonces") === null) await this.ctx.storage.deleteAlarm();
       return;
     }
     // Rounded up to the hour, and never sooner than a minute from now: expiry can wait, and wakes
@@ -2199,21 +2226,17 @@ const SCHEMA = [
      verified INTEGER NOT NULL, preset TEXT NOT NULL, event_type TEXT, content_type TEXT,
      headers TEXT NOT NULL, body BLOB NOT NULL, strict INTEGER NOT NULL DEFAULT 0,
      held INTEGER NOT NULL DEFAULT 0, stored_at INTEGER, route TEXT, recipients TEXT)`,
-  "CREATE INDEX IF NOT EXISTS events_received ON events(received_at)",
   `CREATE TABLE IF NOT EXISTS envelopes (seq INTEGER NOT NULL, device_id TEXT NOT NULL, kid TEXT NOT NULL,
      enc TEXT NOT NULL, ct BLOB NOT NULL, sig TEXT NOT NULL)`,
   "CREATE UNIQUE INDEX IF NOT EXISTS envelopes_seq_device ON envelopes(seq, device_id)",
-  "CREATE INDEX IF NOT EXISTS envelopes_device ON envelopes(device_id, seq)",
   `CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, acked INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
      seal_key BLOB, seal_kid TEXT, changes_seen INTEGER NOT NULL DEFAULT 0, tags TEXT)`,
   `CREATE TABLE IF NOT EXISTS nonces (device_id TEXT NOT NULL, nonce TEXT NOT NULL, at INTEGER NOT NULL,
      PRIMARY KEY (device_id, nonce)) WITHOUT ROWID`,
-  "CREATE INDEX IF NOT EXISTS nonces_at ON nonces(at)",
   // Replay marks; `long` ones (body hashes of presets that sign no timestamp) are kept for
   // REPLAY_MARK_DAYS rather than a week.
   `CREATE TABLE IF NOT EXISTS seen (hook_id TEXT NOT NULL, key TEXT NOT NULL, at INTEGER NOT NULL,
      long INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (hook_id, key)) WITHOUT ROWID`,
-  "CREATE INDEX IF NOT EXISTS seen_at ON seen(at)",
   // Offline notices sent (PROTOCOL §4a): the sender only as a keyed hash, never the address.
   `CREATE TABLE IF NOT EXISTS notices (hook_id TEXT NOT NULL, mark TEXT NOT NULL, at INTEGER NOT NULL,
      PRIMARY KEY (hook_id, mark)) WITHOUT ROWID`,
@@ -2240,7 +2263,6 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS hook_changes (n INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL,
      hook_id TEXT NOT NULL, name TEXT NOT NULL, previous_name TEXT, actor TEXT)`,
   "CREATE INDEX IF NOT EXISTS hook_changes_at ON hook_changes(at)",
-  "CREATE INDEX IF NOT EXISTS held_hook ON held_events(hook_id, rule)",
   // Plans (PROTOCOL §2a), schema 5: token buckets (`h:<hook>` and `a`), today's counts (`a` taken,
   // `h:<hook>` taken by a hook, `ar` refused, `r:<hook>` refused at a hook, `ad` dropped), each
   // hook's refusal window and pauses, the `limit` notices, and when each hook last took a delivery.
@@ -2256,7 +2278,6 @@ const SCHEMA = [
 /** Indexes on columns schema 4 added: created after the columns exist, on old objects too. */
 const SCHEMA_4_INDEXES = [
   "CREATE INDEX IF NOT EXISTS events_stored ON events(stored_at)",
-  "CREATE INDEX IF NOT EXISTS events_hook ON events(hook_id)",
   "CREATE INDEX IF NOT EXISTS seen_long_at ON seen(long, at)",
 ];
 
