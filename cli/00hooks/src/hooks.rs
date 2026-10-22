@@ -749,9 +749,10 @@ pub async fn deliver_to(which: String, device: Option<String>) -> CliResult {
 
 /// A static answer, checked as the relay checks it, so a mistake is said before the call.
 pub fn response_spec(status: u16, content_type: &str, body: String) -> CliResult<HookResponse> {
-    if !(200..=299).contains(&status) {
+    // 204 and 205 carry no body, so the relay refuses them for an answer that has one.
+    if !(200..=299).contains(&status) || status == 204 || status == 205 {
         return Err(Failure::new(
-            "--status must be a success status, 200 to 299 (the provider would retry anything else).",
+            "--status must be a success status with a body, 200 to 299 but not 204 or 205 (the provider would retry anything else).",
         ));
     }
     if !RESPONSE_CONTENT_TYPES.contains(&content_type) {
@@ -1120,6 +1121,7 @@ mod tests {
     fn a_static_answer_is_checked_before_it_is_sent() {
         assert!(response_spec(200, "text/plain", "ok".into()).is_ok());
         assert!(response_spec(299, "text/xml", "<x/>".into()).is_ok());
+        assert!(response_spec(204, "text/plain", "".into()).is_err());
         assert!(
             response_spec(302, "text/plain", "".into())
                 .unwrap_err()

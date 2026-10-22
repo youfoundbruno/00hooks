@@ -445,7 +445,7 @@ enum HooksCmd {
     /// Set the static answer the relay gives the provider for each accepted delivery, or --clear it.
     Response {
         hook: String,
-        /// 200 to 299.
+        /// 200 to 299, but not 204 or 205.
         #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
         status: Option<u16>,
         /// text/plain, application/json, application/xml or text/xml.

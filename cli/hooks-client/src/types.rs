@@ -231,7 +231,7 @@ pub struct Hook {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HookResponse {
-    /// 200 to 299.
+    /// 200 to 299, but not 204 or 205.
     pub status: u16,
     /// `text/plain`, `application/json`, `application/xml` or `text/xml`.
     pub content_type: String,
