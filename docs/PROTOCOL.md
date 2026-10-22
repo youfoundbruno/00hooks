@@ -858,8 +858,8 @@ Every error body is `{ "error": "<code>", "message": "<one plain sentence>" }`. 
 `clock_skew`, `not_found`, `too_large`, `rate_limited`, `quota` (a `429`: the account's log is full),
 `signature`, `invalid` (with `field`), `conflict`, `forbidden` (a `403`: an API key without the
 scope, or a route only a device may use), `unavailable` (a `503`: the relay is missing a safety
-binding or its signing key and refuses rather than run without it), `push_failed` (a `502`: Apple's
-push service didn't take a push, §10.7), `internal` (a `500`; the relay logs the
+binding or its signing key and refuses rather than run without it), `push_failed` (a `502`: the push
+service, Apple's or Google's, didn't take a push, §10.7), `internal` (a `500`; the relay logs the
 cause, never the payload). Messages never contain secrets, signatures or payload content.
 
 ## 9. API keys, the audit log and the events list

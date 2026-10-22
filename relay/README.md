@@ -17,7 +17,9 @@ CLI ◀──── SSE /v1/stream ─── Worker (SSE bridge) ◀── hiber
 ```
 
 - `src/index.ts`: routes. `src/auth.ts`: signed requests. `src/keys.ts`: API keys.
-  `src/accounts.ts`: accounts, devices, enrolments, sealing keys. `src/hooks.ts`: the hook API.
+  `src/accounts.ts`: accounts, devices, enrolments, sealing keys. `src/hooks.ts`: the hook API;
+  `src/hook-delivery.ts`: a hook's static response and one-device delivery; `src/test-event.ts`: the
+  signed test event (`POST /v1/test/<hook>`); `src/devices.ts`: renaming a device.
   `src/presets.ts`: the preset table and its interpreter. `src/envelope.ts`: sealing and the relay's
   envelope signature. `src/receive.ts`: `/h/<id>`. `src/stream.ts` and `src/bridge.ts`: the SSE
   bridge. `src/audit.ts`: the audit log and events list. `src/account-object.ts`: the Durable
@@ -102,6 +104,7 @@ wrangler.deploy.jsonc`), and only then deploy: new code may need the new tables.
 | `0005_phone.sql` | phone links; needs the `PHONE` Durable Object binding, its `v2` migration and `PAIR_IP_LIMIT` |
 | `0006_…` | hook names unique within an account |
 | `0007_…` (when present) | phone hardening |
+| `0008_hook_delivery.sql` | a hook's one-device delivery (`deliverTo`) and static response |
 
 Then measure what idle streams cost on your deployment: [`docs/IDLE-COST.md`](docs/IDLE-COST.md).
 
